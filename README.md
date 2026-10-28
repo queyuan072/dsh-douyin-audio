@@ -146,6 +146,11 @@
 | `asrThreads` | number（正整数） | `8` | SenseVoice 本地推理线程数，范围 1–64，实际建议不超过本机逻辑核（设置页按 `GET /sysinfo` 读到的核数夹取，读不到就按 1–64）。`douyin_transcribe` 与「刷完自动转写」都把它透传成 `--threads`（1–64 夹取，0/非法值就不带） |
 | `autoTranscribe` | boolean | `false` | **关（默认，推荐）= 刷完只给清单，由你决定转哪条（返回体 `autoTranscribe: null`）；开 = 刷完立刻转清单里最新的 1 条**。转写结果放在 `autoTranscribe` 字段里；找不到 sherpa_onnx 的 Python、脚本报错、没有任何已下载文件时只把原因写进该字段，**scroll 本身仍照旧返回 `ok`** |
 | `loginMode` | string（`window`\|`qr`） | `window` | 登录方式：`window` = 前台弹真窗口人工扫码（推荐，最稳）；`qr` = 后台驻留抓二维码到设置页扫。`douyin_login_start` 不传 `mode` 时用它，设置页「登录」区块的两个单选也读写它 |
+| `autoRun` | boolean | `false` | **谷时自动刷**：开 = 插件自己按 60 秒 tick 检查，满足「谷时窗口内 + 今日额度未满 + 距上次 ≥ `dutyIntervalMin` 分钟 + 没有正在跑的 run」才自己刷一轮；默认关 |
+| `dutyWindow` | string | `12:00-14:00,18:00-23:59` | 谷时窗口，逗号分隔多个 `HH:MM-HH:MM`；支持跨零点（如 `23:00-02:00`） |
+| `dailyLimit` | number | `5` | 每天最多刷几屏（单位是屏，不是视频条数）；`0` = 不自动跑（仍可手动） |
+| `dutyIntervalMin` | number | `30` | 两次自动刷之间至少隔多少分钟 |
+| `uiLayout` | string | `classic` | 设置页布局：`classic` = 一长条平铺；`tabs` = 四标签页（采集 / 转写 / 权限与登录 / 环境与诊断） |
 | `tierRead` | boolean | `true` | **① 只读**：解锁 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` |
 | `tierNotify` | boolean | `false` | **② 通知**：解锁 `douyin_notes` / `douyin_messages`（读通知摘要、私信会话列表；仍然只读，不发消息、不标已读） |
 | `tierReact` | boolean | `false` | **③A 轻互动**：点赞 / 收藏 / 取消（预留；会动你账号的互动记录，但可撤回） |

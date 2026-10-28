@@ -5,6 +5,8 @@
  * 通知（② 通知级闸门）：douyin_notes / douyin_messages —— 同样只读，只读页面不发消息、不标已读
  * 登录（基础能力，不设等级闸门）：douyin_login_start / douyin_login_poll
  *   两种模式：window = 弹真窗口人工扫码/过验证；qr = 后台派生脚本抓二维码给设置页扫
+ * 谷时自动刷（基础能力，不设等级闸门）：douyin_duty —— status / run / history，
+ *   运行痕迹写 <stateDir>/duty.json；apply() 里起一个 60 秒的调度器，五条全中才自己跑一轮
  */
 import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -13,6 +15,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { ensureDirs, loadCfg, saveCfg, stateDir, log as logLine } from './lib/state.mjs'
+import { decide, dutyPath, readDuty, recordRun, statusOf } from './lib/duty.mjs'
 import { findPython, runPython, SCRIPT_READ, SCRIPT_SCROLL, SCRIPT_TRANSCRIBE } from './lib/runner.mjs'
 
 export const name = 'douyin-audio'
@@ -34,12 +37,24 @@ export const Config = !z ? undefined : z.object({
   loginMode: z.string().default('window').extra('volatile', true),
   readHeadless: z.boolean().default(true).extra('volatile', true),
   verifyWait: z.number().default(0).extra('volatile', true),
+  // 谷时自动刷（契约见 lib/duty.mjs）：autoRun 默认 false —— 不开启就绝不自己定时跑
+  autoRun: z.boolean().default(false).extra('volatile', true),
+  dutyWindow: z.string().default('12:00-14:00,18:00-23:59').extra('volatile', true),
+  dailyLimit: z.natural().default(5).extra('volatile', true),
+  dutyIntervalMin: z.natural().default(30).extra('volatile', true),
+  // 界面布局：classic = 平铺（默认，保持现状）/ tabs = 四标签页；取值不限制，未知值由前端按 classic 处理
+  uiLayout: z.string().default('classic').extra('volatile', true),
 })
 
 /** asrThreads / autoTranscribe / readHeadless / verifyWait 的缺省值：lib/state.mjs 的 DEFAULTS 里没有这些键，白名单在这一层补齐；
  *  loginMode 两边都有，这里再留一份，防止旧 config.json / 旧 lib 读不到。
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
-const EXTRA_DEFAULTS = { asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0 }
+const EXTRA_DEFAULTS = {
+  asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
+  // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
+  autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
+  uiLayout: 'classic',
+}
 
 /** 读全配置：插件自己的这两把键在当前层补默认值，其余仍以 config.json / DEFAULTS 为准 */
 const cfgAll = () => ({ ...EXTRA_DEFAULTS, ...loadCfg() })
@@ -318,7 +333,8 @@ export function apply(ctx, config = {}) {
   const merged = () => {
     const base = cfgAll()
     const over = {}
-    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait']) {
+    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait',
+      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
       if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') over[k] = v
@@ -371,6 +387,29 @@ export function apply(ctx, config = {}) {
     return ctx.tools.register(wrapped)
   }
 
+  /**
+   * 刷一轮的核心（douyin_scroll 与谷时自动刷共用）。
+   * 参数优先级：工具入参 > 配置 > 硬默认值；返回体与 douyin_scroll 一直以来的形状完全一致。
+   */
+  async function runScroll(args, cfg) {
+    const python = await findPython(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
+    if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
+    const count = Math.max(1, Math.min(Number(args.count) || cfg.count || 3, 200))
+    const delay = Math.max(0.5, Math.min(Number(args.delay) || cfg.delay || 1.5, 30))
+    const headless = args.headless !== undefined ? !!args.headless : !!cfg.headless
+    const saveAll = args.saveAll !== undefined ? !!args.saveAll : !!cfg.saveAll
+    const argv = ['--tab', 'recommend', '--count', String(count), '--delay', String(delay),
+      '--download-timeout', String(cfg.downloadTimeout || 300)]
+    if (headless) argv.push('--headless')
+    if (saveAll) argv.push('--save-all')
+    argv.push('--work-dir', workRoot())
+    const budget = count * (delay + 12) + 120
+    const r = await runPython(python, SCRIPT_SCROLL, argv, { timeoutSec: budget, log })
+    log('scroll 结束 code=' + r.code)
+    // 返回体由 scrollResult 统一拼：清单 + autoTranscribe（关着是 null）
+    return scrollResult({ ok: r.ok, code: r.code, stdout: r.stdout, stderr: r.stderr, count, cfg, log })
+  }
+
   // ── 1. 刷抖音 ─────────────────────────────────────────────
   tool({
     name: 'douyin_scroll',
@@ -383,22 +422,7 @@ export function apply(ctx, config = {}) {
     },
     async execute(args) {
       const cfg = merged()
-      const python = await findPython(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
-      if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
-      const count = Math.max(1, Math.min(Number(args.count) || cfg.count || 3, 200))
-      const delay = Math.max(0.5, Math.min(Number(args.delay) || cfg.delay || 1.5, 30))
-      const headless = args.headless !== undefined ? !!args.headless : !!cfg.headless
-      const saveAll = args.saveAll !== undefined ? !!args.saveAll : !!cfg.saveAll
-      const argv = ['--tab', 'recommend', '--count', String(count), '--delay', String(delay),
-        '--download-timeout', String(cfg.downloadTimeout || 300)]
-      if (headless) argv.push('--headless')
-      if (saveAll) argv.push('--save-all')
-      argv.push('--work-dir', workRoot())
-      const budget = count * (delay + 12) + 120
-      const r = await runPython(python, SCRIPT_SCROLL, argv, { timeoutSec: budget, log })
-      log('scroll 结束 code=' + r.code)
-      // 返回体由 scrollResult 统一拼：清单 + autoTranscribe（关着是 null）
-      return scrollResult({ ok: r.ok, code: r.code, stdout: r.stdout, stderr: r.stderr, count, cfg, log })
+      return runScroll(args, cfg)
     },
   })
 
@@ -803,6 +827,64 @@ export function apply(ctx, config = {}) {
     },
   })
 
+  // ── 谷时自动刷（基础能力，不设等级闸门）────────────────────────────
+  // 「跑不跑」的判定是 lib/duty.mjs 的纯函数 decide()，这里只管：加锁 -> 真刷一轮 -> 记账。
+  let dutyRunning = false                     // 正在跑的 run（调度器和手动 run 共用这把锁）
+
+  /** 立刻跑一轮并在 duty.json 记账（工具 action=run 与定时触发共用）。绝不抛。 */
+  async function runDutyOnce() {
+    const t0 = Date.now()
+    const cfg = merged()
+    if (dutyRunning) {
+      return { ok: false, busy: true, screens: 0, dir: workRoot(), elapsedMs: 0,
+        reason: '已经有一轮在跑了，等它跑完', duty: statusOf({ cfg, duty: readDuty(), running: true, compact: true }) }
+    }
+    dutyRunning = true
+    let dir = workRoot()
+    try {
+      const r = await runScroll({}, cfg)                    // 屏数/停留/后台/下载全部取配置
+      const ok = !!(r && r.ok)
+      const screens = ok ? Math.max(0, Number(r.screens) || 0) : 0
+      if (r && r.dirs && r.dirs.root) dir = r.dirs.root
+      const error = ok ? null : String((r && (r.reason || r.output)) || '刷一轮失败')
+      const rec = recordRun({ screens, dir, ok, error, at: Date.now() })
+      if (rec.ok === false) log('duty.json 写不进去: ' + rec.error)
+      log('谷时一轮结束 ok=' + ok + ' screens=' + screens + ' 今天累计 ' + rec.duty.todayScreens + ' 屏')
+      return { ok, screens, dir, elapsedMs: Date.now() - t0,
+        duty: statusOf({ cfg, duty: rec.duty, running: false, compact: true }) }
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e)
+      log('谷时一轮异常: ' + msg)
+      let duty = readDuty()
+      try { duty = recordRun({ screens: 0, dir, ok: false, error: msg, at: Date.now() }).duty } catch { /* 记不上账也不许崩 */ }
+      return { ok: false, screens: 0, dir, elapsedMs: Date.now() - t0, reason: msg,
+        duty: statusOf({ cfg, duty, running: false, compact: true }) }
+    } finally {
+      dutyRunning = false
+    }
+  }
+
+  tool({
+    name: 'douyin_duty',
+    description: '谷时自动刷的开关与运行痕迹（基础能力，不设等级闸门）。action=status 看今天刷了几屏 / 在不在谷时窗口 / 下一次窗口几点；action=run 立刻按配置刷一轮并把结果记进 duty.json；action=history 看最近 20 条运行记录。',
+    parameters: {
+      action: { type: 'string', description: 'status（默认，看状态）/ run（立刻刷一轮）/ history（看运行记录）' },
+    },
+    async execute(args) {
+      const action = String(args.action || 'status').trim().toLowerCase()
+      const cfg = merged()
+      if (action === 'history') {
+        const d = readDuty()
+        return { ok: true, items: d.history, total: d.history.length, stateFile: dutyPath() }
+      }
+      if (action === 'run') return runDutyOnce()
+      if (action !== 'status') {
+        return { ok: false, reason: '未知 action: ' + action + '（只认 status / run / history）', stateFile: dutyPath() }
+      }
+      return statusOf({ cfg, duty: readDuty(), running: dutyRunning })
+    },
+  })
+
   // ── HTTP 接口（给 Web UI 设置页用）─────────────────────────
   try {
     ctx.effect(() => ctx.webServer.register({
@@ -842,6 +924,13 @@ export function apply(ctx, config = {}) {
             } catch { /* 连接已经断了 */ }
             return undefined
           }
+          // 谷时自动刷的只读查询：设置页「日常」页拿状态 / 运行记录（等价 douyin_duty）
+          if (req.method === 'GET' && sub === '/duty') {
+            const dutyTool = byName.get('douyin_duty')
+            if (!dutyTool) return send(500, { ok: false, error: 'douyin_duty 没注册上' })
+            const action = new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('action') || 'status'
+            return send(200, await dutyTool.execute({ action }))
+          }
           const body = req.method === 'POST' ? await readJson(req) : {}
           if (req.method === 'POST' && sub === '/config') {
             const cfg = cfgAll()
@@ -857,6 +946,13 @@ export function apply(ctx, config = {}) {
           }
           if (req.method === 'POST' && sub === '/run') {
             const action = String(body.action || '')
+            // duty_* 是 douyin_duty 的三个 action（POST /run {action:'duty_status'|'duty_run'|'duty_history'}）
+            const DUTY_ACTIONS = { duty_status: 'status', duty_run: 'run', duty_history: 'history' }
+            if (Object.prototype.hasOwnProperty.call(DUTY_ACTIONS, action)) {
+              const dutyTool = byName.get('douyin_duty')
+              if (!dutyTool) return send(500, { ok: false, error: 'douyin_duty 没注册上' })
+              return send(200, await dutyTool.execute({ action: DUTY_ACTIONS[action] }))
+            }
             const t = byName.get('douyin_' + action)
             if (!t) return send(400, { ok: false, error: '未知 action: ' + action })
             return send(200, await t.execute(body))
@@ -867,8 +963,34 @@ export function apply(ctx, config = {}) {
         }
       },
     }), 'douyin-audio: /api/douyin-audio 路由')
-    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr}')
+    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr,duty}')
   } catch (e) { log('HTTP 路由没挂上: ' + (e && e.message ? e.message : e)) }
+
+  // ── 谷时自动刷调度：每 60 秒判定一次（apply 时启动，dispose 时清掉）──────
+  // 五条全中才触发一轮后台刷：autoRun && 在窗口内 && 额度未满 && 间隔够 && 没有正在跑的 run。
+  // 判定用 lib/duty.mjs 的纯函数 decide()；触发失败只写日志，绝不让调度器把插件带崩。
+  const DUTY_TICK_MS = 60000
+  try {
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        try {
+          const cfg = merged()
+          const now = Date.now()
+          const verdict = decide({ cfg, duty: readDuty(now), now, running: dutyRunning })
+          if (!verdict.shouldRun) return
+          log('谷时自动刷触发：' + verdict.reasons.join('；'))
+          Promise.resolve(runDutyOnce())
+            .then((r) => log('谷时自动刷结束 ok=' + r.ok + ' screens=' + r.screens + ' elapsedMs=' + r.elapsedMs + (r.reason ? ' reason=' + r.reason : '')))
+            .catch((e) => log('谷时自动刷异常: ' + (e && e.message ? e.message : e)))
+        } catch (e) {
+          log('调度判定异常（定时器继续跑）: ' + (e && e.message ? e.message : e))
+        }
+      }, DUTY_TICK_MS)
+      try { timer.unref?.() } catch { /* 没有 unref 也不影响 */ }
+      return () => { try { clearInterval(timer) } catch { /* ignore */ } }
+    }, 'douyin-audio: 谷时自动刷调度')
+    log('谷时自动刷调度已就绪（每 ' + DUTY_TICK_MS / 1000 + ' 秒判定一次；autoRun=false 时永不触发）')
+  } catch (e) { log('谷时自动刷调度没起来: ' + (e && e.message ? e.message : e)) }
 
   // ── 4. 配置 ───────────────────────────────────────────────
   tool({
@@ -876,7 +998,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

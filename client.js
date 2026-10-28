@@ -108,6 +108,31 @@ window.__ModuleLoader__.load({
 [data-dy-badge][data-good]{color:#22c55e;border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.12);}
 [data-dy-badge][data-warn]{color:#f59e0b;border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.12);}
 [data-dy-badge][disabled]{opacity:.5;cursor:default;}
+/* ── 标签栏：跟 [data-dy-btn] 同一套变量，只是选中态换成「页签」形状 ── */
+[data-dy-tabs]{display:flex;align-items:flex-end;gap:4px;flex-wrap:wrap;
+  border-bottom:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.12));}
+[data-dy-tab]{padding:6px 13px;border-radius:8px 8px 0 0;font-size:12px;cursor:pointer;font-family:inherit;
+  white-space:nowrap;color:var(--dsw-alias-label-tertiary,#9aa0a6);background:transparent;
+  border:1px solid transparent;border-bottom:0;margin-bottom:-1px;}
+[data-dy-tab]:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18));}
+[data-dy-tab][data-active]{color:inherit;cursor:default;
+  border-color:var(--dsw-alias-bg-layer-3,rgba(255,255,255,.16));
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));}
+[data-dy-tab][data-active]:hover{background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));}
+[data-dy-tabbody]{display:flex;flex-direction:column;gap:18px;}
+[data-dy-layout]{display:flex;align-items:center;gap:4px;}
+[data-dy-layout] [data-dy-btn]{padding:5px 9px;font-size:11px;}
+[data-dy-quota]{font-size:13px;line-height:18px;}
+[data-dy-progress]{font-size:11px;line-height:16px;color:#3b82f6;}
+[data-dy-hist]{display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto;padding:7px 9px;
+  border-radius:8px;border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.10));
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.10));}
+[data-dy-hist-item]{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:11px;line-height:16px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+[data-dy-hist-at]{color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+[data-dy-hist-dir]{color:var(--dsw-alias-label-secondary,#c9ccd1);word-break:break-all;flex:1;min-width:0;}
+[data-dy-hist-ok]{color:#22c55e;}
+[data-dy-hist-bad]{color:#f59e0b;}
 `
 
     function Switch({ on, onChange, disabled }) {
@@ -152,6 +177,16 @@ window.__ModuleLoader__.load({
     /* 结果区：等宽字体，接口原样回什么就贴什么（出错时的原因也一起贴，别只剩一句"失败了"） */
     const show = (r) => {
       try { return JSON.stringify(r, null, 2) } catch (e) { return String(r) }
+    }
+
+    /* 运行痕迹里的时间：ms 数或 ISO 串都吃；认不出来就原样贴，别显示 Invalid Date */
+    const fmtAt = (at) => {
+      if (at === null || at === undefined || at === '') return '—'
+      const d = new Date(typeof at === 'number' ? at : String(at))
+      if (isNaN(d.getTime())) return String(at)
+      const p = (n) => (n < 10 ? '0' + n : String(n))
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+        + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
     }
 
     /* ── 顶栏徽章：只从 douyin_status 的返回里推，不猜 ──────────────────────────
@@ -203,6 +238,12 @@ window.__ModuleLoader__.load({
       const [qrTick, setQrTick] = React.useState(0)     // 二维码时间戳：每轮询一次换一个，绕过浏览器缓存
       const [st, setSt] = React.useState(null)          // douyin_status 的原样返回（顶栏徽章的数据源）
       const [stErr, setStErr] = React.useState('')      // 状态没拿到时的原因（拿到了就空串）
+      const [tab, setTab] = React.useState('collect')   // 当前标签页（默认「采集」）
+      const [duty, setDuty] = React.useState(null)      // douyin_duty status 的原样返回（「采集」页额度行的数据源）
+      const [dutyErr, setDutyErr] = React.useState('')  // duty 状态没拿到时的原因
+      const [hist, setHist] = React.useState(null)      // 「它刷过什么」= 运行记录（null = 没展开）
+      const [histBusy, setHistBusy] = React.useState(false)
+      const [dutyRunning, setDutyRunning] = React.useState(false)  // 「现在刷一轮」跑着的时候禁用按钮
       const loginRef = React.useRef(null)               // 「登录」区块：点登录徽章要滚到这里
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
@@ -282,6 +323,9 @@ window.__ModuleLoader__.load({
             pythonPath: cfg.pythonPath == null ? '' : String(cfg.pythonPath),
             // 旧宿主可能没有 asrThreads（/config 里缺这个键）→ 回落到 8，别渲染成 NaN
             asrThreads: Number.isFinite(Number(cfg.asrThreads)) ? Number(cfg.asrThreads) : 8,
+            // 谷时自动刷的两个新键：旧宿主没有就退回契约里的默认值，别渲染成 NaN / undefined
+            dutyWindow: cfg.dutyWindow == null ? '12:00-14:00,18:00-23:59' : String(cfg.dutyWindow),
+            dailyLimit: Number.isFinite(Number(cfg.dailyLimit)) ? Number(cfg.dailyLimit) : 5,
           })
         }
       }, [cfg, form])
@@ -325,6 +369,55 @@ window.__ModuleLoader__.load({
       }
       /* 挂载就把徽章填上，别等用户去点「自检」 */
       React.useEffect(() => { refreshStatus() }, [])
+
+      /* 「采集」页额度行的数据源 = douyin_duty 的 action=status（走 /run 泛化路由，不另开路由）
+         旧宿主没有这个工具时会 404 / 回 {ok:false,error} —— 只把原因记下来，额度行退回 0，不报错 */
+      const refreshDuty = async () => {
+        try {
+          const r = await jpost('/run', { action: 'duty_status' })
+          if (r && typeof r === 'object' && ('todayScreens' in r || 'dailyLimit' in r)) {
+            setDuty(r); setDutyErr('')
+          } else setDutyErr((r && (r.error || r.reason)) || '宿主没回 todayScreens')
+        } catch (e) { setDutyErr(errText(e)) }
+      }
+      React.useEffect(() => { refreshDuty() }, [])
+
+      /* 「它刷过什么」：再点一次收起（列表开着的时候按钮文案就变成「收起记录」） */
+      const loadHistory = async () => {
+        if (hist !== null) { setHist(null); return }
+        setHistBusy(true)
+        try {
+          const r = await jpost('/run', { action: 'duty_history' })
+          if (r && Array.isArray(r.items)) {
+            setHist(r.items)
+            if (!r.ok) say('运行记录：' + ((r.error || r.reason) || '宿主说没好'), 'warn')
+          } else {
+            say('运行记录读不到：' + ((r && (r.error || r.reason)) || '宿主没回 items'), 'warn')
+          }
+        } catch (e) { say('运行记录读不到：' + errText(e), 'warn') }
+        finally { setHistBusy(false) }
+      }
+
+      /* 「现在刷一轮」：等价 douyin_duty 的 action=run（内部按配置里的 count 刷）
+         跑起来禁用按钮 + 显示进度文案；跑完刷新顶栏徽章和额度行（刷过之后这两处都会变） */
+      const runDuty = async () => {
+        setDutyRunning(true)
+        say('正在刷一轮…')
+        try {
+          const r = await jpost('/run', { action: 'duty_run' })
+          setOut(show(r))
+          if (r && r.ok) {
+            const n = Number(r.screens)
+            say('刷一轮：完成 —— ' + (Number.isFinite(n) ? n : 0) + ' 屏'
+              + (r.dir ? '，存到 ' + r.dir : ''), 'good')
+          } else say('刷一轮：失败 —— ' + ((r && (r.error || r.reason)) || '看「环境与诊断」页的结果'), 'warn')
+        } catch (e) {
+          setOut(String((e && e.message) || e))
+          say('刷一轮：' + errText(e), 'warn')
+        } finally { setDutyRunning(false) }
+        await refreshStatus()
+        await refreshDuty()
+      }
 
       /* 点「登录」徽章：滚到登录区块并聚焦（滚动参数不被认就退化成默认滚动） */
       const focusLogin = () => {
@@ -437,28 +530,335 @@ window.__ModuleLoader__.load({
         patch('asrThreads', clamped)
       }
 
-      return h('div', { 'data-dy-page': '' },
-        /* ── 顶栏：四枚徽章 + 刷一轮（在面板最顶上，前面不放任何东西）── */
-        h('div', { 'data-dy-bar': '' },
-          h('div', { 'data-dy-bar-badges': '' },
-            st
-              ? statusBadges(st).map((b, i) => h('button', {
-                key: 'badge' + i,
-                'data-dy-badge': '',
-                'data-good': b.tone === 'good' ? '' : undefined,
-                'data-warn': b.tone === 'warn' ? '' : undefined,
-                'data-static': b.act ? undefined : '',
-                title: b.title || b.text,
-                disabled: b.act === 'env' && busy === 'status',
-                onClick: b.act === 'env' ? () => run('status', {}, '自检')
-                  : b.act === 'login' ? focusLogin : undefined,
-              }, b.text))
-              : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…')),
+      /* ── 四个标签页：只是「怎么分区看」，状态全在 Panel 外层 ───────────────────
+         cfg / form / out / msg 都不在页里，所以切页既不丢没提交的草稿，也不丢上次结果。 */
+      const tabs = [
+        { key: 'collect', label: '采集' },
+        { key: 'transcribe', label: '转写' },
+        { key: 'perms', label: '权限与登录' },
+        { key: 'diag', label: '环境与诊断' },
+      ]
+
+      const autoRunOn = Boolean(cfg.autoRun)
+      const todayScreens = duty && Number.isFinite(Number(duty.todayScreens)) ? Number(duty.todayScreens) : 0
+      const dailyLimit = Number.isFinite(Number(cfg.dailyLimit)) ? Number(cfg.dailyLimit) : 5
+      /* 额度行文案（契约原文）：autoRun 关着时补一句「自动刷已关，只能手动跑」 */
+      const quotaText = '今天已刷 ' + todayScreens + ' / ' + dailyLimit + ' 屏'
+        + (autoRunOn ? '' : '；自动刷已关，只能手动跑')
+      const dutyNote = dutyErr
+        ? 'duty 状态读不到：' + dutyErr + '（宿主这版可能还没有 douyin_duty；额度行按 0 屏显示）'
+        : duty && duty.inWindow
+          ? '现在就在谷时窗口里'
+          : duty && duty.nextWindowAt
+            ? '下一个窗口 ' + duty.nextWindowAt
+            : '现在不在谷时窗口'
+
+      /* 数字输入框：本地草稿 + 失焦提交（别每敲一个字符就 POST 一次） */
+      const numField = (key, label, extra) => h('div', { 'data-dy-sec': '', key: 'nf-' + key },
+        h('div', { 'data-dy-label': '' }, label),
+        h('input', { ...{
+          'data-dy-input': '', 'data-dy-num': '', 'data-dy-field': key, type: 'number',
+          value: f[key] == null ? '' : String(f[key]), disabled: busy === key,
+          onChange: (e) => editNum(key, e.target.value, true),
+          onBlur: (e) => editNum(key, e.target.value, false),
+        }, ...(extra || {}) }))
+
+      /* 记录里的单条：时间 / 屏数 / 目录 / 成功与否（失败时把原因也贴出来） */
+      const histRow = (it, i) => h('div', { 'data-dy-hist-item': '', key: 'hist' + i },
+        h('span', { 'data-dy-hist-at': '' }, fmtAt(it && it.at)),
+        h('span', null, (Number(it && it.screens) || 0) + ' 屏'),
+        h('span', { 'data-dy-hist-dir': '', title: it && it.dir ? String(it.dir) : '' },
+          it && it.dir ? String(it.dir) : '—'),
+        h('span', {
+          'data-dy-hist-ok': it && it.ok ? '' : undefined,
+          'data-dy-hist-bad': it && it.ok ? undefined : '',
+        }, it && it.ok ? '成功' : '失败'),
+        it && !it.ok && it.error ? h('span', null, '（' + String(it.error) + '）') : null)
+
+      /* 转写页要的两条只读环境信息：都从 douyin_status 的返回里取，取不到就去诊断页自检 */
+      const MISS_ENV = '未检测到，去「环境与诊断」页点自检'
+      const modelDirText = st && st.modelDir && st.modelDir.exists
+        ? '已就位' + (st.modelDir.path ? '（' + String(st.modelDir.path) + '）' : '')
+        : MISS_ENV
+      const ffmpegText = st && hasEnvValue(st.ffmpeg) ? String(st.ffmpeg) : MISS_ENV
+
+      /* ── 1 采集：屏数/怎么刷 + 谷时自动刷三件套 + 今天刷了多少 + 立刻刷一轮 ── */
+      const pageCollect = () => [
+        h('div', { 'data-dy-sec': '', key: 'collect-scroll' },
+          h('div', { 'data-dy-h': '' }, '刷几屏、怎么刷'),
+          h('div', { 'data-dy-row': '' },
+            numField('count', '屏数 count', { min: 1 }),
+            numField('delay', '每屏停留 delay', { min: 0, step: '0.1' }),
+            numField('downloadTimeout', '下载超时 downloadTimeout', { min: 1 })),
+          h('div', { 'data-dy-note': '' },
+            'count = 下滑几屏；delay = 每屏停几秒（可带小数）；downloadTimeout = 单个视频下载的超时（毫秒）'),
+          h(ToggleRow, {
+            label: '后台跑 headless',
+            note: '开着就不弹浏览器窗口（看不见过程，但不会抢焦点）',
+            on: on('headless'), disabled: busy === 'headless',
+            onChange: (v) => patch('headless', v, '后台跑'),
+          }),
+          h(ToggleRow, {
+            label: '逐屏下载 saveAll',
+            note: '关掉只截图、不下载视频（那就没有音频可转写了）',
+            on: on('saveAll'), disabled: busy === 'saveAll',
+            onChange: (v) => patch('saveAll', v, '逐屏下载'),
+          })),
+        h('div', { 'data-dy-sec': '', key: 'collect-duty' },
+          h('div', { 'data-dy-h': '' }, '谷时自动刷'),
+          h(ToggleRow, {
+            label: '谷时自动刷 autoRun',
+            note: '开着才由插件自己定时跑（只在下面的谷时窗口里跑）；关着就只能手动点「现在刷一轮」',
+            on: autoRunOn, disabled: busy === 'autoRun',
+            onChange: (v) => patch('autoRun', v, '谷时自动刷'),
+          }),
+          h('div', { 'data-dy-sec': '' },
+            h('div', { 'data-dy-label': '' }, '谷时窗口 dutyWindow'),
+            h('input', {
+              'data-dy-input': '', 'data-dy-duty-window': '', type: 'text', spellCheck: false,
+              placeholder: '12:00-14:00,18:00-23:59',
+              value: f.dutyWindow == null ? '' : String(f.dutyWindow), disabled: busy === 'dutyWindow',
+              onChange: (e) => editPath('dutyWindow', e.target.value, true),
+              onBlur: (e) => editPath('dutyWindow', e.target.value, false),
+            }),
+            h('div', { 'data-dy-note': '' },
+              '逗号分隔多个 HH:MM-HH:MM 时段（例：12:00-14:00,18:00-23:59）—— 只有这些时段里才会自动刷')),
+          h('div', { 'data-dy-sec': '' },
+            h('div', { 'data-dy-label': '' }, '每天最多刷几屏 dailyLimit'),
+            h('input', {
+              'data-dy-input': '', 'data-dy-num': '', 'data-dy-duty-limit': '', type: 'number', min: 0,
+              value: f.dailyLimit == null ? '' : String(f.dailyLimit), disabled: busy === 'dailyLimit',
+              onChange: (e) => editNum('dailyLimit', e.target.value, true),
+              onBlur: (e) => editNum('dailyLimit', e.target.value, false),
+            }),
+            h('div', { 'data-dy-note': '' },
+              '填 0 = 不自动刷（「现在刷一轮」照样能手动跑）；单位是「屏」，不是视频条数'))),
+        h('div', { 'data-dy-sec': '', key: 'collect-today' },
+          h('div', { 'data-dy-h': '' }, '今天'),
+          h('div', { 'data-dy-quota': '' }, quotaText),
+          h('div', { 'data-dy-note': '' }, dutyNote),
+          h('div', { 'data-dy-note': '' }, '每天刷够 dailyLimit 屏就停；额度没用完之前，只在谷时窗口里自动跑'),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-dy-duty': 'history', disabled: histBusy,
+              onClick: loadHistory,
+            }, histBusy ? '读着呢…' : (hist === null ? '它刷过什么' : '收起记录')),
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', 'data-dy-duty': 'run', disabled: dutyRunning,
+              onClick: runDuty,
+            }, dutyRunning ? '刷着呢…' : '现在刷一轮')),
+          dutyRunning
+            ? h('div', { 'data-dy-progress': '' }, '正在刷一轮…（后台跑着，跑完这里和顶上那排徽章都会更新）')
+            : null,
+          hist === null
+            ? null
+            : hist.length === 0
+              ? h('div', { 'data-dy-note': '' }, '还没刷过')
+              : h('div', { 'data-dy-hist': '' }, hist.map((it, i) => histRow(it, i)))),
+      ]
+
+      /* ── 2 转写：线程数 + 自动转写 + 转一条 + 转写环境的只读说明 ── */
+      const pageTranscribe = () => [
+        h('div', { 'data-dy-sec': '', key: 'trans-speed' },
+          h('div', { 'data-dy-h': '' }, '提速'),
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-sec': '' },
+              h('div', { 'data-dy-label': '' }, '线程数 asrThreads'),
+              h('input', {
+                'data-dy-input': '', 'data-dy-num': '', 'data-dy-field': 'asrThreads', type: 'number',
+                min: 1, max: maxThreads,
+                value: f.asrThreads == null ? '' : String(f.asrThreads), disabled: busy === 'asrThreads',
+                onChange: (e) => setForm((old) => ({ ...(old || {}), asrThreads: e.target.value })),
+                onBlur: (e) => editThreads(e.target.value),
+              })),
+            h('div', { 'data-dy-grow': '' },
+              h('div', { 'data-dy-note': '' },
+                sys && sys.cores > 0
+                  ? '本机 ' + sys.cores + ' 逻辑核；建议 8–16（越大越快，但会占满 CPU）'
+                  : '没读到本机核数（宿主这版没有 /sysinfo 路由）：按 1–64 填，建议 8–16（越大越快，但会占满 CPU）'))),
+          h(ToggleRow, {
+            label: '刷完自动转写 autoTranscribe',
+            note: '关 = 刷完只给清单，由你决定转哪条（推荐）；开 = 刷完自动转最近 N 条',
+            on: on('autoTranscribe'), disabled: busy === 'autoTranscribe',
+            onChange: (v) => patch('autoTranscribe', v, '自动转写'),
+          })),
+        h('div', { 'data-dy-sec': '', key: 'trans-run' },
+          h('div', { 'data-dy-h': '' }, '转写'),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', disabled: busy === 'transcribe',
+              onClick: () => run('transcribe', { limit: 1 }, '转写最近一条'),
+            }, '转写最近一条'),
+            h('div', { 'data-dy-note': '' },
+              '把最新下载的那条转成文字（本地 SenseVoice，不联网）；批量转换屏用工具 douyin_transcribe'))),
+        h('div', { 'data-dy-sec': '', key: 'trans-env' },
+          h('div', { 'data-dy-h': '' }, '转写要用到的环境（只读）'),
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-label': '', 'data-dy-grow': '' }, '转写模型目录'),
+            h('div', { 'data-dy-note': '', 'data-dy-models': '' }, modelDirText)),
+          h('div', { 'data-dy-row': '' },
+            h('div', { 'data-dy-label': '', 'data-dy-grow': '' }, 'ffmpeg'),
+            h('div', { 'data-dy-note': '', 'data-dy-ffmpeg': '' }, ffmpegText)),
+          h('div', { 'data-dy-note': '' }, '这两项都是点顶栏「环境」徽章（= 自检）时一起取回来的，本页只读')),
+      ]
+
+      /* ── 3 权限与登录：五个等级开关 + 等级说明 + 登录方式与登录区块 ── */
+      const pagePerms = () => [
+        h('div', { 'data-dy-sec': '', key: 'perms-tiers' },
+          h('div', { 'data-dy-h': '' }, '能力等级'),
+          TIERS.map((t) => h(TierRow, {
+            key: t.key,
+            title: t.title,
+            note: t.note,
+            on: Boolean(cfg[t.key]),
+            disabled: busy === t.key,
+            /* ③④ 依赖 ①：只提示「需要先开启」，开关照旧可点 */
+            hint: t.needRead && !cfg.tierRead ? '需要先开启 ① 只读' : null,
+            /* ① 本身关着、但 ③ 或 ④ 开着时：① 实际已生效 —— 只标注，不改用户的值 */
+            badge: t.key === 'tierRead' && !cfg.tierRead && (cfg.tierReact || cfg.tierComment || cfg.tierPublish)
+              ? '上级已开：③A / ③B / ④ 打开时，只读自动生效（你的存值仍是关）'
+              : null,
+            onChange: (v) => patch(t.key, v, t.title),
+          })),
+          h('div', { 'data-dy-note': '' },
+            '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这五个开关只负责把选择存进配置，'
+            + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
+        h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
+          h('div', { 'data-dy-h': '' }, '登录'),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-dy-loginmode': 'window',
+              'data-primary': loginModeCfg === 'window' ? '' : undefined,
+              disabled: busy === 'loginMode',
+              onClick: () => { if (loginModeCfg !== 'window') patch('loginMode', 'window', '登录方式') },
+            }, '真窗口（推荐）'),
+            h('button', {
+              'data-dy-btn': '', 'data-dy-loginmode': 'qr',
+              'data-primary': loginModeCfg === 'qr' ? '' : undefined,
+              disabled: busy === 'loginMode',
+              onClick: () => { if (loginModeCfg !== 'qr') patch('loginMode', 'qr', '登录方式') },
+            }, '抓二维码到设置页'),
+            h('div', { 'data-dy-note': '' },
+              loginModeCfg === 'window'
+                ? '弹一个真的 Edge 窗口，你在窗口里扫码/过验证 —— 最稳，推荐'
+                : '后台无窗口跑，二维码抓到本页显示，用手机抖音扫 —— 不弹窗、不抢焦点')),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', disabled: busy === 'login_start',
+              onClick: startLogin,
+            }, '开始登录'),
+            login ? h('div', {
+              'data-dy-msg': '',
+              'data-good': loginPhase === 'ok' ? '' : undefined,
+              'data-warn': loginPhase === 'error' || loginPhase === 'expired' ? '' : undefined,
+            }, (LOGIN_PHASE[loginPhase] || loginPhase || '?')
+              + (loginPhase !== 'ok' && login.message ? '（' + login.message + '）' : '')) : null),
+          showQr ? h('img', {
+            'data-dy-qr': '', src: API + '/qr?t=' + qrTick, alt: '抖音登录二维码', width: 200, height: 200,
+          }) : null,
+          h('div', { 'data-dy-note': '' },
+            '登录方式选好后点「开始登录」。登录成功后 cookie 写到 ~/.dsh/cookies/douyin_cookies.txt，'
+            + '只读 / 通知 / 私信这些工具就开始能用。登录本身不受「能力等级」限制'
+            + '（读不到登录态，上面那些开关都白开）。')),
+      ]
+
+      /* ── 4 环境与诊断：pythonPath + 自检/刷 1 屏 + 结果区 ── */
+      const pageDiag = () => [
+        h('div', { 'data-dy-sec': '', key: 'diag-py' },
+          h('div', { 'data-dy-h': '' }, 'Python（转写要用）'),
+          h('div', { 'data-dy-label': '' }, 'pythonPath'),
+          h('input', {
+            'data-dy-input': '', 'data-dy-field': 'pythonPath', type: 'text', spellCheck: false,
+            value: f.pythonPath == null ? '' : String(f.pythonPath), disabled: busy === 'pythonPath',
+            onChange: (e) => editPath('pythonPath', e.target.value, true),
+            onBlur: (e) => editPath('pythonPath', e.target.value, false),
+          }),
+          h('div', { 'data-dy-note': '' }, '留空就用插件自己找的那个 —— 有没有找到，点「自检」会直接说')),
+        h('div', { 'data-dy-sec': '', key: 'diag-run' },
+          h('div', { 'data-dy-h': '' }, '诊断'),
+          h('div', { 'data-dy-row': '' },
+            h('button', { 'data-dy-btn': '', disabled: busy === 'status', onClick: () => run('status', {}, '自检') }, '自检'),
+            h('button', { 'data-dy-btn': '', 'data-primary': '', disabled: busy === 'scroll', onClick: () => run('scroll', { count: 1 }, '刷 1 屏') }, '刷 1 屏'),
+            h('div', { 'data-dy-note': '' }, busy ? '跑着呢…' : '自检 = 查环境（顶上「环境」徽章点一下也是它）；刷 1 屏 = 下滑一屏并下载'))),
+        h('div', { 'data-dy-sec': '', key: 'diag-out' },
+          h('div', { 'data-dy-h': '' }, '结果'),
+          out === null
+            ? h('div', { 'data-dy-note': '' }, '还没跑过 —— 点上面任意一个按钮，这里会贴宿主返回的原始摘要')
+            : h('pre', { 'data-dy-out': '' }, out),
+          out === null ? null : h('div', { 'data-dy-row': '' },
+            h('button', { 'data-dy-btn': '', 'data-primary': '', onClick: copyOut }, '复制结果'),
+            h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))),
+      ]
+
+      const PAGE = { collect: pageCollect, transcribe: pageTranscribe, perms: pagePerms, diag: pageDiag }
+
+      /* ── 布局开关：uiLayout = 'classic'（默认，一长条平铺）| 'tabs'（四标签页）
+             两版共用同一个顶栏、同一份 cfg/form 状态和同一批 patch/run，只有第三层分支渲染。 ── */
+      const useTabs = cfg.uiLayout === 'tabs'
+      const setLayout = async (v) => {
+        setCfg((c) => (c ? { ...c, uiLayout: v } : c))   // 当场切，别等宿主回话
+        await patch('uiLayout', v, '界面布局')
+        /* 宿主还没把 uiLayout 放进白名单时，回来的 config 里没这个键 —— 再压一次，
+           免得点了「新版」当场弹回旧版（有没有真存进去，msg 里会说） */
+        setCfg((c) => (c ? { ...c, uiLayout: v } : c))
+      }
+
+      /* ── 第一层：顶栏（两版共用）：四枚徽章 + 旧版/新版 + 刷一轮 ── */
+      const topBar = h('div', { 'data-dy-bar': '' },
+        h('div', { 'data-dy-bar-badges': '' },
+          st
+            ? statusBadges(st).map((b, i) => h('button', {
+              key: 'badge' + i,
+              'data-dy-badge': '',
+              'data-good': b.tone === 'good' ? '' : undefined,
+              'data-warn': b.tone === 'warn' ? '' : undefined,
+              'data-static': b.act ? undefined : '',
+              title: b.title || b.text,
+              disabled: b.act === 'env' && busy === 'status',
+              onClick: b.act === 'env' ? () => run('status', {}, '自检')
+                : b.act === 'login' ? focusLogin : undefined,
+            }, b.text))
+            : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…')),
+        h('div', { 'data-dy-layout': '' },
           h('button', {
-            'data-dy-btn': '', 'data-primary': '', 'data-dy-run-one': '',
-            disabled: busy === 'scroll',
-            onClick: () => run('scroll', { count: runCount }, '刷一轮'),
-          }, busy === 'scroll' ? '刷着呢…' : '刷一轮')),
+            'data-dy-btn': '', 'data-dy-layout-btn': 'classic', 'data-primary': useTabs ? undefined : '',
+            disabled: busy === 'uiLayout', title: '一长条平铺的设置页（默认）',
+            onClick: () => { if (useTabs) setLayout('classic') },
+          }, '旧版'),
+          h('button', {
+            'data-dy-btn': '', 'data-dy-layout-btn': 'tabs', 'data-primary': useTabs ? '' : undefined,
+            disabled: busy === 'uiLayout', title: '顶部状态栏 + 四个标签页',
+            onClick: () => { if (!useTabs) setLayout('tabs') },
+          }, '新版')),
+        h('button', {
+          'data-dy-btn': '', 'data-primary': '', 'data-dy-run-one': '',
+          disabled: busy === 'scroll',
+          onClick: () => run('scroll', { count: runCount }, '刷一轮'),
+        }, busy === 'scroll' ? '刷着呢…' : '刷一轮'))
+
+      const renderTabs = () => h('div', { 'data-dy-page': '' },
+        topBar,
+        /* ── 第二层：四个标签 ── */
+        h('div', { 'data-dy-tabs': '' }, tabs.map((t) => h('button', {
+          key: 'tab-' + t.key,
+          'data-dy-tab': t.key,
+          'data-active': tab === t.key ? '' : undefined,
+          title: '切到「' + t.label + '」页',
+          onClick: () => setTab(t.key),
+        }, t.label))),
+        /* 保存反馈放标签栏底下：不管在哪个页都看得见 */
+        msg ? h('div', {
+          'data-dy-msg': '',
+          'data-good': msgTone === 'good' ? '' : undefined,
+          'data-warn': msgTone === 'warn' ? '' : undefined,
+        }, msg) : null,
+        /* ── 第三层：当前页 ── */
+        h('div', { 'data-dy-tabbody': '' }, (PAGE[tab] || pageCollect)()))
+
+      /* ── 旧版：一长条平铺（跟 HEAD 逐行一致，只是顶栏换成共用的那个）── */
+      const renderClassic = () => {
+      return h('div', { 'data-dy-page': '' },
+        topBar,
 
         /* ── 刷几屏、怎么刷 ── */
         h('div', { 'data-dy-sec': '' },
@@ -612,6 +1012,9 @@ window.__ModuleLoader__.load({
           out === null ? null : h('div', { 'data-dy-row': '' },
             h('button', { 'data-dy-btn': '', 'data-primary': '', onClick: copyOut }, '复制结果'),
             h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))))
+      }
+
+      return useTabs ? renderTabs() : renderClassic()
     }
 
     return {

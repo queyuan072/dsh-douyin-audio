@@ -4,10 +4,11 @@
  * 那类错误提前在本地暴露出来（宿主只会留一句 warning，日志里看不出根因）。
  *
  * 查什么：
- *   a. 恰好注册 13 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
+ *   a. 恰好注册 14 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  *      + douyin_hot / douyin_search / douyin_video / douyin_comments / douyin_note（只读查询）
  *      + douyin_notes / douyin_messages（② 通知，只读）
  *      + douyin_login_start / douyin_login_poll（登录，基础能力不设等级闸门）
+ *      + douyin_duty（谷时自动刷，基础能力不设等级闸门）
  *   b. 每个工具都有 description(string) / parameters(对象) / execute(function)
  *   c. 参数 schema 里 type:'object' 的节点必须显式写 additionalProperties
  *      （宿主的 defineTool 会抛 JsonSchemaError ⇒ 整条插件不激活）
@@ -16,6 +17,9 @@
  *      开回来后放行；tierReact/tierComment=true 时 tierRead 视为生效；基础四工具不受限；
  *      tierNotify=false 时 douyin_notes / douyin_messages 返回 TIER_DISABLED(tier=notify)，
  *      打开后放行（② 通知与 ① 只读互相独立）
+ *   f. 谷时自动刷 douyin_duty：只认一个 action 参数；**没有任何等级闸门**
+ *      （五个等级全关时 action=status 也照常返回 ok:true）；没有 duty.json 时 todayScreens=0、
+ *      autoRun 默认 false、windows 按默认窗口解析；action=history 返回 items 数组
  *
  * 用法：node selfcheck.mjs [入口文件，默认 ./index.js]
  * 退出码：0 = 全通过；1 = 有问题（宿主里就是 "entry did not activate"）
@@ -31,6 +35,7 @@ const EXPECTED_TOOLS = [
   'douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note',
   'douyin_notes', 'douyin_messages',
   'douyin_login_start', 'douyin_login_poll',
+  'douyin_duty',
 ]
 const EXPECTED_NAME = 'douyin-audio'
 
@@ -259,7 +264,44 @@ else {
   else ok('douyin_login_poll 存在（无参数）')
 }
 
-/* ───────── ⑧ 结论 ───────── */
+/* ───────── ⑧ 谷时自动刷（douyin_duty）：无等级闸门 + action 参数 ───────── */
+const dutyTool = byName.get('douyin_duty')
+if (!dutyTool || typeof dutyTool.execute !== 'function') problem('少了工具：douyin_duty')
+else {
+  const fields = Object.keys(dutyTool.parameters || {})
+  if (fields.join(',') !== 'action') problem('douyin_duty 的参数应只有 action，现在是 ' + JSON.stringify(fields))
+  else ok('douyin_duty 存在（参数 action）')
+
+  // 五个等级全关：基础能力照常可用（闸门不该覆盖它）
+  writeCfg({ tierRead: false, tierNotify: false, tierReact: false, tierComment: false, tierPublish: false })
+  const dst = await callTool('douyin_duty', { action: 'status' })
+  if (dst && dst.ok === true && dst.code !== 'TIER_DISABLED') ok('douyin_duty 无等级闸门（五个等级全关也能 status）')
+  else problem('douyin_duty 被等级闸门挡住了：' + JSON.stringify(dst))
+
+  // 没有 duty.json 也要给默认值：todayScreens=0 / autoRun=false / 默认窗口解析正确
+  if (dst && dst.todayScreens === 0 && dst.autoRun === false) ok('没有 duty.json 时 todayScreens=0 / autoRun=false')
+  else problem('duty_status 的默认值不对：' + JSON.stringify(dst))
+  if (dst && Array.isArray(dst.windows) && dst.windows.length === 2 && dst.windows[0] === '12:00-14:00' && typeof dst.inWindow === 'boolean') {
+    ok('默认谷时窗口解析正确：' + JSON.stringify(dst.windows) + '（inWindow=' + dst.inWindow + '）')
+  } else problem('谷时窗口解析不对：' + JSON.stringify(dst && dst.windows))
+
+  const dhi = await callTool('douyin_duty', { action: 'history' })
+  if (dhi && dhi.ok === true && Array.isArray(dhi.items)) ok('douyin_duty history 返回 items 数组（' + dhi.items.length + ' 条）')
+  else problem('douyin_duty history 形状不对：' + JSON.stringify(dhi))
+}
+
+/* ───────── ⑨ 界面布局键：uiLayout（字符串，默认 classic）───────── */
+const cfgLayoutSet = await callTool('douyin_config', { action: 'set', key: 'uiLayout', value: 'tabs' })
+if (cfgLayoutSet && cfgLayoutSet.ok === true) ok('douyin_config 认得 uiLayout 这个键')
+else problem('douyin_config 不认 uiLayout：' + JSON.stringify(cfgLayoutSet))
+// get 走 cfgAll() → loadCfg()：读回来是 tabs 才说明真的落盘且读得回
+const cfgLayoutGet = await callTool('douyin_config', { action: 'get' })
+if (cfgLayoutGet && cfgLayoutGet.ok === true && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout === 'tabs') {
+  ok('set uiLayout=tabs 后 loadCfg 读回来是 tabs')
+} else problem('uiLayout 存/读不一致：' + JSON.stringify(cfgLayoutGet && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout))
+writeCfg({})
+
+/* ───────── ⑩ 结论 ───────── */
 if (problems.length > failCountBefore) {
   console.error('')
   console.error('✗ 预检失败：' + (problems.length - failCountBefore) + ' 处问题（上面的 ✗ 行）')
