@@ -1,0 +1,33 @@
+name: selfcheck
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selfcheck:
+    name: 插件自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: JS 语法检查
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check selfcheck.mjs
+
+      - name: 插件自检（工具数 / 等级闸门 / 参数契约）
+        run: node selfcheck.mjs
+
+      - name: Python 脚本语法检查
+        run: |
+          python3 -m py_compile scripts/*.py
+          echo "scripts OK"
