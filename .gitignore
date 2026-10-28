@@ -1,0 +1,11 @@
+﻿node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.verify-tmp/
+undefined/
+.DS_Store
+Thumbs.db
+*.log
+.env
+*.tgz

@@ -1,0 +1,28 @@
+# ============================================================================
+# dsh-douyin-audio —— DSH bundle patch（插件**自带**的挂载声明）
+# ============================================================================
+# 这就是"标准 DSH 插件"的样子：包自己声明要往 profile 的配置树里插什么。
+# 装上之后，profile 只要在 `dsh.profile.bundles` 里列出本包名即生效，
+# 不用再手改 profile 自己的 cordis.patch.yml：
+#
+#   dsh plugin --profile web add dsh-douyin-audio
+#   （本地开发时用：dsh plugin --profile web add link:<你自己的插件目录>）
+#
+# 组成顺序：每个 bundle 的 patch 按 `dsh.profile.bundles` 顺序叠
+#          → 再叠 profile 自己那一层的 cordis.patch.yml（只有那层是热重载）
+#
+# ⚠️ 关于 `id`：loader entry 的 id 必须与配置命名空间一致 ——
+#    entry 的 id 就是它在这份配置树里的 key，profile 里按同一个 key
+#    去写命名空间配置（`<id>: { ... }`）、设置页也按它归档。
+#    这里取 `douyin-audio`：
+#      · 与包名 `dsh-douyin-audio` 语义对应（去掉 dsh- 前缀 → douyin-audio）；
+#      · 与状态目录 `$DSH_HOME/douyin-duty` 同源（douyin-*）；
+#      · 不含 `dsh-` 前缀，避免与包名混淆成两个不同的命名空间。
+# ============================================================================
+
+- insert:
+    - id: douyin-audio
+      name: dsh-douyin-audio
+      config:
+        # 真正的用户配置在插件自己的 config.json（见 lib/state.mjs 的 loadCfg），这里只放默认值
+        enabled: true
