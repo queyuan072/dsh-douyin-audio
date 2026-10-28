@@ -10,3 +10,5 @@ Thumbs.db
 .env
 .npmrc
 *.tgz
+venv/
+.venv/

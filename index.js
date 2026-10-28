@@ -4,6 +4,7 @@
  * 只读查询：douyin_hot / douyin_search / douyin_video / douyin_comments（都走 scripts/douyin_read.py）
  * 通知（② 通知级闸门）：douyin_notes / douyin_messages —— 同样只读，只读页面不发消息、不标已读
  * 轻互动（③A 轻互动级闸门，默认关）：douyin_react —— 点赞 / 取消赞 / 收藏 / 取消收藏，走 scripts/douyin_action.py
+ * 装入配置环境（基础能力，不设等级闸门）：douyin_setup —— mode=auto 扫描→复用或装 venv，装完写 pythonPath
  * 登录（基础能力，不设等级闸门）：douyin_login_start / douyin_login_poll
  *   两种模式：window = 弹真窗口人工扫码/过验证；qr = 后台派生脚本抓二维码给设置页扫
  * 谷时自动刷（基础能力，不设等级闸门）：douyin_duty —— status / run / history，
@@ -559,6 +560,422 @@ const LOGIN_WAIT = 300
 /** qr 模式：派生脚本后最多等多久让 qr.png 出现（毫秒），等不到就把日志路径告诉人 */
 const LOGIN_QR_READY_MS = 15000
 
+// ── 装入配置环境：<插件根>/venv + 后台派生安装脚本 ─────────────────────────────
+// 契约（host 侧与脚本侧共用）：脚本 --json 只往 stdout 打一个信封（进度走 stderr + setup.log）
+//   scan    { ok, mode:'scan', pythons:[{path,version,source,hasPlaywright,hasSherpa,usable}],
+//             ffmpeg{path,ok,source}, model{…}, cookie{path,exists,count},
+//             verdict{canReusePython,reusePath,reuseReason,missing}, elapsed }
+//   install { ok, mode, action:'reused'|'installed'|'failed', python, pythonPath, version,
+//             playwright, sherpa, ffmpeg{…}, model{…}, missing, nextSteps, log, elapsed, error? }
+// 装成功由脚本自己把 <插件根>/venv/Scripts/python.exe 写进配置的 pythonPath（host 不新增配置键）。
+const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url))
+/**
+ * 六个 mode：auto（默认，扫描→复用或安装）/ scan（只体检）**前台同步**；
+ * minimal / full / minimal-force / full-force 后台派生（-force = 加 --force-venv，不复用已有 Python）。
+ */
+const SETUP_MODES = ['auto', 'scan', 'minimal', 'full', 'minimal-force', 'full-force']
+/** 安装脚本：按候选名顺序找（脚本侧改名也不至于整块功能哑掉） */
+const SETUP_SCRIPTS = ['douyin_setup.py', 'setup_env.py', 'setup.py'].map((f) => join(PLUGIN_ROOT, 'scripts', f))
+/** 派生后最多等多久确认「进程起来了」（毫秒）；起来就返回，不等它装完 */
+const SETUP_WAIT_MS = 3000
+/** setup.log 最近这么久内有动过 = 有安装进程在跑（正在装的时候别让人再点一次） */
+const SETUP_ACTIVE_MS = 60000
+/** 锁文件超过这么久 = 上一轮崩掉留下的残锁，不再挡人 */
+const SETUP_STALE_LOCK_MS = 30 * 60 * 1000
+/** scan 是前台同步的：几秒的活，给 2 分钟天花板 */
+const SETUP_SCAN_TIMEOUT_S = 120
+/** auto 也是前台同步的（扫描 + 装依赖 + 写配置），首次装依赖几分钟，给 30 分钟天花板 */
+const SETUP_AUTO_TIMEOUT_S = 1800
+/** venv 里两个模块的探测超时：探得到就探，探不动就当没有，别把 douyin_status 拖死 */
+const VENV_PROBE_TIMEOUT_MS = 8000
+/** 一次问清两个模块（真 import，不是 find_spec）：stdout 打印能 import 的那些 */
+const VENV_PROBE_CODE = "ok = []\nfor m in ('playwright', 'sherpa_onnx'):\n    try:\n        __import__(m)\n        ok.append(m)\n    except Exception:\n        pass\nprint(' '.join(ok))"
+
+const setupLogPath = () => join(stateDir(), 'setup.log')
+const setupLockPath = () => join(stateDir(), 'setup.lock')
+/** host 侧对最近一次 scan 的缓存（脚本的 log 行格式不归我们管，这份才是稳定的数据源） */
+const setupScanPath = () => join(stateDir(), 'scan.json')
+/** 脚本装完写的结论：{ action, pythonPath, version, hasPlaywright, hasSherpa, ffmpeg, model, missing, nextSteps, at, elapsed } */
+const setupResultPath = () => join(stateDir(), 'setup-result.json')
+const setupScript = () => setupDeps.script || SETUP_SCRIPTS.find((p) => existsSync(p)) || SETUP_SCRIPTS[0]
+const venvRoot = () => setupDeps.venvDir || join(PLUGIN_ROOT, 'venv')
+const venvPython = () => join(venvRoot(), process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python')
+
+/** 测试缝（只给 selfcheck / 验收脚本用）：脚本路径、venv 位置、后台派生、venv 探测、前台 run 都能换掉，
+ *  好断言而不真装环境。生产路径永远是 resolve 出来的 scripts/*.py + spawnSetupBg + probeVenvModules；
+ *  传 null 或省略就复位成真实现。 */
+const setupDeps = { script: null, venvDir: null, spawn: null, probe: null, run: null }
+let venvProbeCache = null   // { key, value }：同一次运行只探一次
+export function __setupDeps(next) {
+  for (const k of Object.keys(setupDeps)) {
+    if (next && Object.prototype.hasOwnProperty.call(next, k)) setupDeps[k] = next[k] || null
+  }
+  venvProbeCache = null   // 换了探测 / 换了 venv：缓存跟着作废
+  return { script: setupScript(), venvDir: venvRoot(), stubbed: !!(setupDeps.spawn || setupDeps.probe || setupDeps.run) }
+}
+
+/** mtime（毫秒）；文件不在就是 0 */
+const mtimeOf = (p) => { try { return statSync(p).mtimeMs } catch { return 0 } }
+
+/** setup.log 的最后 n 行（没有日志就是 []） */
+function setupLogTail(n = 20) {
+  try {
+    return String(readFileSync(setupLogPath(), 'utf8')).split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim()).slice(-n)
+  } catch { return [] }
+}
+
+/**
+ * 已经在装了？三条判据：
+ *   ① 锁文件还在（30 分钟内的，更久当上一轮崩掉的残锁）；
+ *   ② setup-result.json 比 setup.log 新 —— 脚本已经写完结论，算结束（不然装完还要白等 60 秒日志窗口）；
+ *   ③ setup.log 最近 60 秒内有新行。
+ */
+function setupRunning() {
+  const lock = mtimeOf(setupLockPath())
+  if (lock && Date.now() - lock < SETUP_STALE_LOCK_MS) return { running: true, why: '锁文件还在：' + setupLockPath() }
+  const last = mtimeOf(setupLogPath())
+  if (last && Date.now() - last < SETUP_ACTIVE_MS && mtimeOf(setupResultPath()) < last) {
+    return { running: true, why: 'setup.log ' + Math.round((Date.now() - last) / 1000) + ' 秒前还有新行' }
+  }
+  return { running: false, why: '' }
+}
+
+/** 脚本写的安装结论：没有 / 坏了 / 不是对象 → null（绝不抛，UI 只按 null 显示「还没结果」） */
+function readSetupResult() {
+  try {
+    const r = JSON.parse(readFileSync(setupResultPath(), 'utf8'))
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return null
+    const action = ['reused', 'installed', 'failed'].includes(String(r.action || '')) ? String(r.action) : null
+    return {
+      action,
+      ok: r.ok === false ? false : action !== 'failed',
+      pythonPath: typeof r.pythonPath === 'string' && r.pythonPath.trim() ? r.pythonPath.trim() : null,
+      version: r.version === undefined || r.version === null ? '' : String(r.version),
+      hasPlaywright: r.hasPlaywright === undefined ? null : !!r.hasPlaywright,
+      hasSherpa: r.hasSherpa === undefined ? null : !!r.hasSherpa,
+      ffmpeg: typeof r.ffmpeg === 'string' ? r.ffmpeg : (r.ffmpeg && typeof r.ffmpeg === 'object' ? (r.ffmpeg.path || null) : null),
+      model: typeof r.model === 'string' ? r.model : (r.model && typeof r.model === 'object' ? (r.model.path || null) : null),
+      missing: Array.isArray(r.missing) ? r.missing.map(String) : [],
+      nextSteps: Array.isArray(r.nextSteps) ? r.nextSteps.map(String) : [],
+      at: Number(r.at) || 0,
+      elapsed: Number(r.elapsed) || 0,
+      error: r.error ? String(r.error) : null,
+    }
+  } catch { return null }
+}
+
+/** venv 是拿哪个 python 建的：优先 pyvenv.cfg 的 home= 行，其次 setup.log 里脚本打的「base python: …」 */
+function readBasePython() {
+  try {
+    const m = /^\s*home\s*=\s*(.+)$/im.exec(readFileSync(join(venvRoot(), 'pyvenv.cfg'), 'utf8'))
+    if (m && m[1].trim()) return m[1].trim()
+  } catch { /* 没有 pyvenv.cfg 就看日志 */ }
+  try {
+    const hits = [...String(readFileSync(setupLogPath(), 'utf8')).matchAll(/base python:\s*(.+)/gi)]
+    if (hits.length) return hits[hits.length - 1][1].trim()
+  } catch { /* 没有日志就是 null */ }
+  return null
+}
+
+/** setup.log 里最近一次的「复用这个 python」行（脚本 scan 的结论；没有就是 null） */
+function reuseFromLog() {
+  try {
+    const hits = [...String(readFileSync(setupLogPath(), 'utf8')).matchAll(/reuse(?:-| )?python\s*[:=]\s*(.+)/gi)]
+    const last = hits.length ? hits[hits.length - 1][1].trim() : ''
+    return last || null
+  } catch { return null }
+}
+
+/** 空探针结果：venv python 不在 / 起不来，都算「两个模块都没有」 */
+const NO_MODULES = { playwright: false, sherpa: false }
+
+/** 起子进程 import 两个模块：8 秒超时，失败当没有（探测绝不把 douyin_status 弄挂） */
+function probeVenvModules(pythonPath) {
+  return new Promise((resolve) => {
+    let child = null
+    let timer = null
+    let settled = false
+    const done = (v) => { if (!settled) { settled = true; try { clearTimeout(timer) } catch { /* ignore */ } resolve(v) } }
+    try {
+      child = spawn(pythonPath, ['-c', VENV_PROBE_CODE], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    } catch { return done(NO_MODULES) }
+    let out = ''
+    child.stdout.on('data', (d) => { out += d })
+    child.on('error', () => done(NO_MODULES))
+    child.on('close', (code) => {
+      const hit = new Set(String(out).split(/[\s,]+/).filter(Boolean))
+      done(code === 0 ? { playwright: hit.has('playwright'), sherpa: hit.has('sherpa_onnx') } : NO_MODULES)
+    })
+    timer = setTimeout(() => { try { child.kill() } catch { /* ignore */ } ; done(NO_MODULES) }, VENV_PROBE_TIMEOUT_MS)
+    timer.unref?.()
+    return undefined
+  })
+}
+
+/**
+ * venv 里两个模块就绪没。venv python 不在就零子进程直接 false/false；
+ * 在的话**同一次运行只探一次**（缓存 key 带 setup.log 的 mtime —— 装完日志一变就重探，
+ * 否则「刚装完还是 false」会让人以为装失败了）。
+ */
+async function venvModules() {
+  const py = venvPython()
+  if (!existsSync(py)) return NO_MODULES
+  const key = py + '|' + mtimeOf(setupLogPath())
+  if (venvProbeCache && venvProbeCache.key === key) return venvProbeCache.value
+  const probe = setupDeps.probe || probeVenvModules
+  let value = NO_MODULES
+  try { value = (await probe(py)) || NO_MODULES } catch { value = NO_MODULES }
+  venvProbeCache = { key, value }
+  return value
+}
+
+/** 起安装脚本用哪个 python：配置 pythonPath → DSH 自带 runtime 的 python → 环境变量 → 命令名。
+ *  带路径分隔符的必须真存在（否则就是拿旧路径白跑一遍）；裸命令名交给 PATH 自己找。 */
+function setupPythonCandidates(extra) {
+  const list = []
+  const push = (p) => {
+    const s = typeof p === 'string' ? p.trim() : ''
+    if (!s || list.includes(s)) return
+    if ((s.includes('/') || s.includes('\\')) && !existsSync(s)) return
+    list.push(s)
+  }
+  const home = String(process.env.USERPROFILE || process.env.HOME || '')
+  push(extra)
+  if (home) {
+    try {
+      for (const d of readdirSync(join(home, '.dsh', 'dsh-runtimes'))) {
+        push(join(home, '.dsh', 'dsh-runtimes', d, 'dependencies', 'python', process.platform === 'win32' ? 'python.exe' : 'python'))
+      }
+    } catch { /* 没有 .dsh/dsh-runtimes 就算了 */ }
+  }
+  push(process.env.DSH_PYTHON)
+  push(process.env.PYTHON3)
+  push(process.env.PYTHON)
+  push('python3')
+  push('python')
+  return list
+}
+
+/** 后台派生安装脚本：stdout/stderr 一起重定向到 setup.log，起来就返回（最多等 SETUP_WAIT_MS）。 */
+function spawnSetupBg(python, script, argv) {
+  return new Promise((resolve) => {
+    let fd = null
+    let child = null
+    let timer = null
+    let settled = false
+    const finish = (v) => { if (!settled) { settled = true; try { clearTimeout(timer) } catch { /* ignore */ } resolve(v) } }
+    try {
+      try { mkdirSync(stateDir(), { recursive: true }); fd = openSync(setupLogPath(), 'a') } catch { fd = null }
+      const stdio = fd === null ? ['ignore', 'ignore', 'ignore'] : ['ignore', fd, fd]
+      child = spawn(python, [script, ...argv], {
+        cwd: dirname(script),
+        env: process.env,
+        stdio,
+        detached: true,        // 工具返回 / 宿主退出都不带走它
+        windowsHide: true,
+      })
+    } catch (e) {
+      try { if (fd !== null) closeSync(fd) } catch { /* ignore */ }
+      return finish({ ok: false, pid: null, spawnError: true, reason: String((e && e.message) || e) })
+    }
+    // 子进程已经继承了这个 fd，父进程这份必须关掉，不然日志句柄一直挂着
+    try { if (fd !== null) closeSync(fd) } catch { /* ignore */ }
+    child.once('spawn', () => {
+      try { child.unref() } catch { /* ignore */ }
+      finish({ ok: true, pid: child.pid || null, reason: null })
+    })
+    child.once('error', (e) => finish({
+      ok: false, pid: child.pid || null,
+      reason: String((e && e.message) || e),
+      spawnError: !!(e && (e.code === 'ENOENT' || e.code === 'EPERM')),
+    }))
+    // 3 秒还没 error：就当它跑起来了（detached 进程不会有更明确的信号）
+    timer = setTimeout(() => {
+      try { child.unref() } catch { /* ignore */ }
+      finish({ ok: true, pid: child.pid || null, reason: null })
+    }, SETUP_WAIT_MS)
+    timer.unref?.()
+    return undefined
+  })
+}
+
+/** 把脚本的 JSON 信封规整成设置页直接能画的一张表（scan 与 install 两种形状都吃）。
+ *  脚本侧契约（scripts/douyin_setup.py）：
+ *    scan   → { ok, mode:'scan', pythons:[{path,version,source,hasPlaywright,hasSherpa,usable}],
+ *               ffmpeg:{path,ok,source}, model:{path,ok,source}, cookie:{path,exists,count},
+ *               verdict:{canReusePython,reusePath,reuseReason,missing}, elapsed }
+ *    install→ { ok, mode, action:'reused'|'installed'|'failed', python:'<路径>', version,
+ *               playwright:bool, sherpa:bool, ffmpeg{…}, model{…}, missing, reusedPython, configWritten, elapsed } */
+function normalizeScan(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {}
+  /** 路径字段：字符串 / {path} 对象 / '（未找到）' 占位都能吃，占位一律当 null */
+  const asPath = (v) => {
+    const s = v && typeof v === 'object' ? (v.path || v.dir || '') : v
+    const t = typeof s === 'string' ? s.trim() : ''
+    return t && !/未找到/.test(t) ? t : null
+  }
+  const bool = (k) => (typeof r[k] === 'boolean' ? r[k] : null)
+  const verdict = r.verdict && typeof r.verdict === 'object' ? r.verdict : {}
+  const pythons = Array.isArray(r.pythons) ? r.pythons.filter((p) => p && typeof p === 'object') : []
+  const reusePath = asPath(verdict.reusePath) || asPath(r.reusedPython) || asPath(r.python)
+  const listed = (reusePath && pythons.find((p) => asPath(p.path) === reusePath))
+    || pythons.find((p) => p.usable === true) || pythons[0] || null
+  const pyPath = reusePath || asPath(r.pythonPath) || asPath(listed && listed.path)
+  const pyFlags = { playwright: bool('playwright'), sherpa: bool('sherpa') }
+  const hasPy = !!(pyPath || listed || pyFlags.playwright !== null || pyFlags.sherpa !== null)
+  const py = hasPy ? {
+    path: pyPath || '',
+    version: String((listed && listed.version) || r.version || '').trim(),
+    playwright: pyFlags.playwright !== null ? pyFlags.playwright
+      : (listed && typeof listed.hasPlaywright === 'boolean' ? listed.hasPlaywright : null),
+    sherpa: pyFlags.sherpa !== null ? pyFlags.sherpa
+      : (listed && typeof listed.hasSherpa === 'boolean' ? listed.hasSherpa : null),
+    source: String((listed && listed.source) || r.basePythonSource || r.pythonSource || '').trim(),
+  } : null
+  const ck = r.cookie && typeof r.cookie === 'object' ? r.cookie : null
+  const action = ['reused', 'installed', 'failed', 'started'].includes(String(r.action || '')) ? String(r.action) : null
+  const canReuse = verdict.canReusePython === true || r.canReusePython === true
+    || !!(py && py.playwright === true && py.sherpa === true)
+  return {
+    ok: r.ok !== false,
+    mode: typeof r.mode === 'string' ? r.mode : null,
+    action,
+    python: py,
+    pythons: pythons.map((p) => ({
+      path: asPath(p.path) || '',
+      version: String(p.version || '').trim(),
+      usable: p.usable === true,
+      playwright: p.hasPlaywright === true,
+      sherpa: p.hasSherpa === true,
+      source: String(p.source || '').trim(),
+    })),
+    canReusePython: canReuse,
+    reusePythonPath: reusePath || null,
+    reuseReason: String(verdict.reuseReason || '').trim(),
+    missingPackages: [
+      ...(py && py.playwright === false ? ['playwright'] : []),
+      ...(py && py.sherpa === false ? ['sherpa-onnx'] : []),
+    ],
+    ffmpeg: asPath(r.ffmpeg),
+    model: asPath(r.model || r.modelDir),
+    cookie: {
+      path: asPath(ck && ck.path),
+      exists: !!(ck && ck.exists),
+      count: Number(ck && ck.count) || 0,
+    },
+    venv: asPath(r.venv) || null,
+    missing: Array.isArray(r.missing) ? r.missing.map(String) : [],
+    log: asPath(r.log) || null,
+    error: r.error ? String(r.error) : (Array.isArray(r.errors) && r.errors.length ? String(r.errors[0]) : null),
+    elapsed: Number(r.elapsed) || 0,
+  }
+}
+
+/** 最近一次 scan 的缓存（没有 / 坏了就是 null） */
+function readScanCache() {
+  try {
+    const j = JSON.parse(readFileSync(setupScanPath(), 'utf8'))
+    return j && typeof j === 'object' && !Array.isArray(j) ? normalizeScan(j) : null
+  } catch { return null }
+}
+
+/**
+ * 前台同步跑一次安装脚本（scan / auto 这种「要拿结论」的）：按候选 python 逐个试、解析 --json 信封。
+ * 解析不出 JSON 且解释器本身起不来（code 为 null）才换下一个；脚本跑了但输出不对就别再试。
+ */
+async function runSetupForeground(argv, log, timeoutSec) {
+  const script = setupScript()
+  if (!script || !existsSync(script)) {
+    return { ok: false, reason: '安装脚本不存在: ' + (script || '(没找到)'), script: script || null, candidates: SETUP_SCRIPTS }
+  }
+  const seam = setupDeps.run
+  if (typeof seam === 'function') {
+    const norm = normalizeScan(await seam(script, argv, setupPythonCandidates(cfgAll().pythonPath)))
+    try { writeFileSync(setupScanPath(), JSON.stringify(norm, null, 2), 'utf8') } catch { /* 缓存写不了不影响返回 */ }
+    return { ...norm, script }
+  }
+  const tried = []
+  for (const py of setupPythonCandidates(cfgAll().pythonPath)) {
+    const r = await runPython(py, script, argv, { timeoutSec, log })
+    const out = String(r.stdout || '')
+    const at = out.indexOf('{')
+    let parsed = null
+    if (at >= 0) { try { parsed = JSON.parse(out.slice(at)) } catch { parsed = null } }
+    if (parsed) {
+      const norm = normalizeScan(parsed)
+      try { writeFileSync(setupScanPath(), JSON.stringify(norm, null, 2), 'utf8') } catch { /* 缓存写不了不影响返回 */ }
+      return { ...norm, script, pythonUsed: py }
+    }
+    tried.push({ python: py, exitCode: r.code, reason: tail(String(r.stderr || ''), 3) })
+    if (r.code !== null) break
+  }
+  return {
+    ok: false,
+    script,
+    reason: '安装脚本没跑起来（' + ((tried[tried.length - 1] && tried[tried.length - 1].reason) || '没有可用的 Python') + '）',
+    hint: '先装 Python（或把 pythonPath 配到一个 python.exe）再试',
+    tried,
+  }
+}
+
+/** 扫描结果 + 轻量兜底：能不能直接复用一个现成的 python（不跑 import 探测，status 不该为此变慢） */
+function reuseSnapshot(scan, venvUsable, result) {
+  const out = { canReusePython: false, reusePythonPath: null, reuseSource: null, reuseVerified: false }
+  if (scan && scan.canReusePython && scan.reusePythonPath) {
+    out.canReusePython = true; out.reusePythonPath = scan.reusePythonPath; out.reuseSource = 'scan'; out.reuseVerified = true
+  }
+  // 脚本刚给的结论（setup-result.json）：装/复用成功就等于「现在有能用的 python」
+  if (!out.canReusePython && result && result.action && result.action !== 'failed' && result.pythonPath
+    && result.hasPlaywright !== false && result.hasSherpa !== false) {
+    out.canReusePython = true; out.reusePythonPath = result.pythonPath; out.reuseSource = 'result'; out.reuseVerified = true
+  }
+  if (venvUsable) {
+    // 插件自己的 venv 就绪 = 最直接的「复用」（按钮点下去就是把 venv python 写进 pythonPath）
+    out.canReusePython = true; out.reusePythonPath = venvPython(); out.reuseSource = 'venv'; out.reuseVerified = true
+  }
+  if (out.canReusePython) return out
+  const fromLog = reuseFromLog()
+  if (fromLog) { out.reusePythonPath = fromLog; out.reuseSource = 'log'; out.reuseVerified = true; return out }
+  // 只确认「存在」的候选：来源标签给设置页看，但不算 canReusePython（没验过模块，别把安装按钮锁死）
+  const cands = setupPythonCandidates(cfgAll().pythonPath)
+  const found = cands.find((p) => p.includes('/') || p.includes('\\'))
+  out.reusePythonPath = found || (cands[0] || null)
+  out.reuseSource = found ? 'path' : 'command'
+  return out
+}
+
+/** douyin_status.env：设置页「环境与诊断」页照这个画 */
+async function envSnapshot() {
+  const py = venvPython()
+  const pyExists = existsSync(py)
+  const mods = await venvModules()
+  const venvUsable = !!(pyExists && mods.playwright && mods.sherpa)
+  const scan = readScanCache()
+  const result = readSetupResult()
+  const reuse = reuseSnapshot(scan, venvUsable, result)
+  const busy = setupRunning()
+  return {
+    venv: existsSync(venvRoot()),
+    venvPython: pyExists ? py : null,
+    venvUsable,
+    basePython: readBasePython(),
+    playwright: !!mods.playwright,
+    sherpa: !!mods.sherpa,
+    canReusePython: reuse.canReusePython,
+    reusePythonPath: reuse.reusePythonPath,
+    reuseSource: reuse.reuseSource,
+    reuseVerified: reuse.reuseVerified,
+    scan,
+    setupScript: setupScript(),
+    setupLog: setupLogPath(),
+    setupLogTail: setupLogTail(20),
+    // 后台安装的进度与结论：前端靠这两个字段轮询（setupRunning 变 false 就读 setupResult）
+    setupRunning: busy.running,
+    setupWhy: busy.why,
+    setupResult: result,
+  }
+}
+
 export function apply(ctx, config = {}) {
   ensureDirs()
   const log = (m) => { try { ctx.logger?.info?.('[douyin-audio] ' + m) } catch {} ; try { logLine(m) } catch {} }
@@ -728,7 +1145,7 @@ export function apply(ctx, config = {}) {
   // ── 3. 自检 ───────────────────────────────────────────────
   tool({
     name: 'douyin_status',
-    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。',
+    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。',
     parameters: { scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' } },
     async execute(args) {
       const cfg = merged()
@@ -758,11 +1175,109 @@ export function apply(ctx, config = {}) {
         browsers,
         // 当前 browserChannel 的解析说明：自定义项路径不在 / id 不存在时在这里说清（正常情况是空串）
         browserNote: resolveBrowser(cfg).note || '',
+        // 装入配置环境的状态（设置页「环境与诊断」页 + 顶栏「环境」徽章都看它）
+        env: await envSnapshot(),
         stateDir: sdir,
         workDir: workRoot(),
         videos,
         cfg,
       }
+    },
+  })
+
+  /**
+   * 后台派生一次安装（\`douyin_setup\` 的 minimal/full/*-force 与 HTTP 的 setup_auto 共用）：
+   * detached + stdio 全量重定向到 setup.log，确认进程起来就返回，**不等它装完**。
+   * 结果由脚本写 \`<状态目录>/setup-result.json\`，再由 douyin_status.env.setupResult 读回去。
+   */
+  async function startSetupBg(mode) {
+    const venv = venvRoot()
+    const setupLog = setupLogPath()
+    const script = setupScript()
+    if (!script || !existsSync(script)) {
+      return { ok: false, mode, action: 'failed', reason: '安装脚本不存在: ' + (script || '(没找到)'), script: script || null, venv, log: setupLog, candidates: SETUP_SCRIPTS }
+    }
+    const busy = setupRunning()
+    if (busy.running) {
+      return { ok: false, mode, action: 'failed', reason: '已经有一个安装进程在跑', why: busy.why, venv, log: setupLog, hint: '看 setup.log 末尾，或者等它结束再点一次' }
+    }
+    const base = mode === 'auto' ? 'auto' : (mode === 'full' || mode === 'full-force' ? 'full' : 'minimal')
+    const argv = ['--mode', base, ...(mode.endsWith('-force') ? ['--force-venv'] : []), '--json', '--log', setupLog]
+    const spawnBg = setupDeps.spawn || spawnSetupBg
+    const tried = []
+    let last = null
+    for (const py of setupPythonCandidates(cfgAll().pythonPath)) {
+      const r = await spawnBg(py, script, argv)
+      tried.push({ python: py, ok: !!r.ok, pid: r.pid || null, reason: r.reason || null })
+      if (r.ok) {
+        venvProbeCache = null   // 环境要变了：探测缓存作废
+        log('setup ' + mode + ' 已在后台启动 pid=' + r.pid + ' python=' + py)
+        return {
+          ok: true, started: true, mode, action: 'started', python: py, pid: r.pid || null, venv, log: setupLog,
+          hint: '装完调用 douyin_status 看结果（env.setupRunning 变 false 后看 env.setupResult）',
+        }
+      }
+      last = r
+      if (!r.spawnError) break   // 不是「解释器找不到」就别一个个试下去
+    }
+    return {
+      ok: false, mode, action: 'failed',
+      reason: '安装没起来：' + ((last && last.reason) || '没有可用的 Python'),
+      hint: '先装 Python（或把 pythonPath 配到一个 python.exe）再试',
+      tried, venv, log: setupLog,
+    }
+  }
+
+  // ── 3-bis. 装入配置环境（基础能力，**不设等级闸门**）───────────────
+  /**
+   * 六个 mode：
+   *   auto           扫描 → 有可用 Python 就复用并把路径写进 pythonPath → 没有就建 venv 装依赖 → 写配置
+   *                  ⚠️ 工具调用是**前台同步**（等完拿 action）；设置页那条 HTTP 路（setup_auto）走
+   *                     startSetupBg —— 后台派生、立刻回 started，结果由脚本写 setup-result.json 再由
+   *                     env.setupRunning / env.setupResult 读回去（长请求会被宿主 HTTP 掐断，所以界面不能等）
+   *   scan           只体检、不改动（前台同步，回 inventory）
+   *   minimal/full   后台派生去装（detached，起来就返回；full 另含 ffmpeg 与模型下载）
+   *   *-force        同上再加 --force-venv（强制新建 venv，不复用已有 Python）
+   * 装完由脚本自己把 <插件根>/venv/Scripts/python.exe 写进配置的 pythonPath —— host 不新增配置键。
+   */
+  tool({
+    name: 'douyin_setup',
+    description: '给插件配运行环境（基础能力，不设等级闸门）。mode=auto（默认）：先扫描，有可用 Python 就复用它并把路径写进 pythonPath，没有就在 <插件根>/venv 建独立 venv 装 playwright + sherpa-onnx，返回 action=reused|installed|failed；mode=scan：只体检不改动，返回 inventory（Python 路径/版本/playwright/sherpa、ffmpeg、模型、cookie 条数）；mode=minimal / full / minimal-force / full-force：后台派生去装（full 另含 ffmpeg 下到 <状态目录>/bin、SenseVoice 模型下到 <状态目录>/models），起来就返回 started:true，进度写 <状态目录>/setup.log（几分钟）。装完调用 douyin_status 看 env。',
+    parameters: {
+      mode: { type: 'string', description: 'auto（默认：扫描→复用或安装）/ scan（只体检）/ minimal（venv + playwright + sherpa）/ full（另含 ffmpeg 与模型）/ minimal-force 或 full-force（强制新建 venv，不复用）' },
+    },
+    async execute(args) {
+      const given = args.mode === undefined || args.mode === null || args.mode === '' ? '' : String(args.mode).trim().toLowerCase()
+      const mode = given || 'auto'
+      const venv = venvRoot()
+      const setupLog = setupLogPath()
+      if (!SETUP_MODES.includes(mode)) {
+        return { ok: false, mode, reason: 'mode 只能是 ' + SETUP_MODES.join(' / ') + '，收到 ' + JSON.stringify(given), modes: SETUP_MODES }
+      }
+      const script = setupScript()
+      const missingScript = { ok: false, action: 'failed', mode, reason: '安装脚本不存在: ' + (script || '(没找到)'), script: script || null, venv, log: setupLog, candidates: SETUP_SCRIPTS }
+      if (!script || !existsSync(script)) return missingScript
+
+      // scan / auto：前台同步，要拿结论（auto 还要回 action）
+      if (mode === 'scan' || mode === 'auto') {
+        log('setup ' + mode + ' 开始')
+        const argv = mode === 'scan'
+          ? ['--scan', '--json', '--log', setupLog]
+          : ['--mode', 'auto', '--json', '--log', setupLog]
+        const r = await runSetupForeground(argv, log, mode === 'scan' ? SETUP_SCAN_TIMEOUT_S : SETUP_AUTO_TIMEOUT_S)
+        const out = { ...r, mode, venv, log: setupLog }
+        if (mode === 'auto') {
+          // 脚本没给 action 就按结果推：装不成就 failed，能复用就 reused
+          if (!out.action) out.action = r.ok === false ? 'failed' : (r.canReusePython ? 'reused' : 'installed')
+          out.ok = out.action !== 'failed'
+          if (out.action === 'installed') venvProbeCache = null   // 刚装完：缓存里的 false 不能再信
+        }
+        log('setup ' + mode + ' 结束 ok=' + out.ok + (out.action ? ' action=' + out.action : '') + (out.reason ? ' reason=' + out.reason : ''))
+        return out
+      }
+
+      // 其余四个：后台派生，起来就返回，不等它装完
+      return startSetupBg(mode)
     },
   })
 
@@ -1286,6 +1801,20 @@ export function apply(ctx, config = {}) {
               if (!dutyTool) return send(500, { ok: false, error: 'douyin_duty 没注册上' })
               return send(200, await dutyTool.execute({ action: DUTY_ACTIONS[action] }))
             }
+            // setup_* 是 douyin_setup 的界面入口
+            //   setup_auto → **后台派生**（detached），立刻回 started:true —— 首次装依赖几分钟，
+            //                长请求会被宿主 HTTP 掐断，掐断后用户看到失败、脚本其实还在跑；结果读 env.setupResult
+            //   setup_scan → 前台同步（几秒，要拿 inventory）
+            //   setup_start → 前台走工具（minimal/full/*-force 内部就是后台派生，立刻回 started）
+            if (action === 'setup_auto') {
+              return send(200, await startSetupBg('auto'))
+            }
+            if (action === 'setup_scan' || action === 'setup_start') {
+              const setupTool = byName.get('douyin_setup')
+              if (!setupTool) return send(500, { ok: false, error: 'douyin_setup 没注册上' })
+              const mode = action === 'setup_start' ? body.mode : 'scan'
+              return send(200, await setupTool.execute({ mode }))
+            }
             const t = byName.get('douyin_' + action)
             if (!t) return send(400, { ok: false, error: '未知 action: ' + action })
             return send(200, await t.execute(body))
@@ -1296,7 +1825,7 @@ export function apply(ctx, config = {}) {
         }
       },
     }), 'douyin-audio: /api/douyin-audio 路由')
-    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr,duty}')
+    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr,duty}（run 认得 status / scroll / login_* / duty_* / setup_*）')
   } catch (e) { log('HTTP 路由没挂上: ' + (e && e.message ? e.message : e)) }
 
   // ── 谷时自动刷调度：每 60 秒判定一次（apply 时启动，dispose 时清掉）──────

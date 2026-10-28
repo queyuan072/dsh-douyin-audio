@@ -10,7 +10,7 @@
 
 ---
 
-## 1. 十五个工具
+## 1. 十六个工具
 
 ### 1.1 只读查询（5 个）
 
@@ -104,6 +104,27 @@
 
 ---
 
+### 1.7 装入配置环境（1 个，基础能力，**不设等级闸门**）
+
+装依赖是基础能力，跟等级开关无关：五个等级**全关**也能调。
+
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| `douyin_setup` | `mode`（`auto` \| `scan` \| `minimal` \| `full` \| `minimal-force` \| `full-force`，默认 `auto`） | `auto`（设置页那个【一键配置环境】按钮）= 先扫描，**有能用的 Python（playwright + sherpa_onnx 都能 import）就直接复用它并把路径写进 `pythonPath`**，没有就在 `<插件根>/venv` 建独立 venv 装依赖，返回 `action: reused \| installed \| failed`；`scan` = 只体检不改动，回 inventory；`minimal` / `full` = **后台派生**去装（起来就返回 `started: true`）；`*-force` 再加 `--force-venv`（强制新建 venv，不复用已有解释器）。走 `scripts/douyin_setup.py` |
+
+权限模型：「装环境」是基础能力，**不设等级闸门**。执行形态有两条路：
+
+- **MCP 工具调用**：`auto` / `scan` 前台同步（等它跑完拿结论，`auto` 30 分钟上限、`scan` 2 分钟）；`minimal` / `full` / `*-force` 后台派生，起来就返回。
+- **设置页按钮**：HTTP `POST /run {action:'setup_auto'}` 也走**后台派生**，**立刻**回 `{ ok:true, started:true, action:'started' }` —— 首次装依赖几分钟，长请求会被宿主 HTTP 掐断，掐断后用户看到失败、脚本其实还在跑，所以界面不能等；装的结果由脚本写 `<状态目录>/setup-result.json`，前端每 3 秒轮询一次 `douyin_status` 直到 `env.setupRunning` 变 false，再读 `env.setupResult`。
+
+已经在装（锁文件 `<状态目录>/setup.lock` 在，或 `setup.log` 最近 60 秒内有新行）时返回 `{ ok: false, reason: '已经有一个安装进程在跑' }`。
+
+`douyin_status` 多了个 `env` 字段给设置页画状态：`venv` / `venvPython` / `venvUsable` / `basePython` / `playwright` / `sherpa` / `canReusePython` / `reusePythonPath` / `reuseSource` / `scan`（上次扫描的 inventory）/ `setupRunning` / `setupWhy` / `setupResult`（`{action, pythonPath, version, hasPlaywright, hasSherpa, missing, nextSteps, at}` 或 `null`）/ `setupLog` / `setupLogTail`（最近 20 行）。
+
+> `venvUsable` 是真起一个子进程跑 `import playwright, sherpa_onnx`（8 秒超时，失败算 false），所以**同一次运行只探一次**：缓存 key 带着 `setup.log` 的 mtime，装完日志一变就重探，既不会让 `douyin_status` 变慢，也不会「刚装完还显示 false」。`setupResult` 读不出来（没文件 / 坏 JSON）一律当 `null`，绝不抛。
+
+装到哪、怎么复用、升级后为什么要重装 —— 见第 3.5 节。
+
 ## 2. 安装
 
 本包自带挂载声明（`cordis.patch.yml`），装好后 profile 只要在 `dsh.profile.bundles` 里列出包名即生效，**不需要再手改 profile 自己的 `cordis.patch.yml`**。
@@ -128,7 +149,7 @@
 
 ## 3. 依赖与自检
 
-不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、13 个工具是否齐全，不依赖 Python、不联网。
+不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、16 个工具是否齐全，不依赖 Python、不联网。
 
 装完跑一次 `douyin_status`。它的 `ok` 字段 = 「Python(playwright) 找到」且「Python(sherpa_onnx) 找到」且「`~/.dsh/bin/ffmpeg.exe` 存在」且「模型目录存在」。
 
@@ -142,6 +163,44 @@
 | **可写的临时目录** | 下载件、截图、manifest、转写中间 WAV 都落在这里 | 受限沙箱里系统 `%TEMP%` 可能不可写（open 直接 Errno 13、ffmpeg 开不出输出文件），此时下载/转写会报错。转写脚本会依次试 `DSH_DOUYIN_TMP` → 系统临时目录 → 脚本旁 `tmp/` → 当前目录 `tmp/`，第一个能写的胜出；刷屏脚本的工作目录固定为「系统临时目录 `/douyin`」（`tempfile.gettempdir()`，同样跟随 `TMP`/`TEMP`）。插件侧 `lib/runner.mjs` 的 `runPython(..., { tmpDir })` 会给子进程注入 `DSH_DOUYIN_TMP` 并预建目录（当前 `index.js` 的两个调用点没有传 `tmpDir`，所以默认仍用系统临时目录）；要整体换盘，就在启动 DSH 的环境里把 `TMP`/`TEMP` 指到可写目录 |
 
 > 想固定解释器：把路径写进 `pythonPath` 配置（`douyin_config set key=pythonPath value=<解释器绝对路径>`），探测会先试它。
+
+---
+
+## 3.5 装入配置环境（一键）
+
+设置页「环境与诊断」页的主区域只有一个按钮【一键配置环境】（其余开关都收在下面的「高级选项」里），它走 HTTP `setup_auto` → 后台派生 `scripts/douyin_setup.py --mode auto`：
+
+1. **先扫描**：看本机有没有一个解释器**同时能 import playwright 与 sherpa_onnx**；
+2. **扫到了就复用**：把那个 python 路径直接写进配置的 `pythonPath`，一个字节都不装，`action: "reused"`；
+3. **扫不到才装**：在 `<插件根>/venv` 建一个独立 venv（装好后就是 `node_modules/dsh-douyin-audio/venv`，Windows 下解释器是 `venv\Scripts\python.exe`），`pip install playwright sherpa-onnx`；装完由脚本自己把 `<插件根>/venv\Scripts\python.exe` 写进 `pythonPath`，`action: "installed"`；失败是 `action: "failed"` + 原因（设置页这时给一个【查看日志】按钮）。
+
+**结果怎么回到界面**：脚本把结论写进 `<状态目录>/setup-result.json`（`{ action, pythonPath, version, hasPlaywright, hasSherpa, ffmpeg, model, missing, nextSteps, at, elapsed }`），插件只读它 + 看锁文件 / `setup.log` 的活跃度，合成 `douyin_status.env` 的 `setupRunning` / `setupResult`。前端点完按钮就每 3 秒轮询一次 `status`（最多 30 分钟），看到 `setupRunning === false` 且 `setupResult.at` 是这次点击之后写的，才把那一行结果画出来（旧结果不会被误当成本次结果）。
+
+### 基础解释器不用你自己装
+
+venv 是基于 **DSH 自带的那份 python** 建的 —— `%USERPROFILE%\.dsh\dsh-runtimes\*\dependencies\python\python.exe`（本机是 `dsh-primary-runtime` 下的 3.12），所以**不需要用户先自己装 Python**。脚本侧选基础解释器的优先级：`--base-python` > DSH 自带 python > 配置里的 `pythonPath` > `PATH` > 报错让你装一个。
+
+venv 到底基于谁，看 `douyin_status.env.basePython`（来源是 `venv/pyvenv.cfg` 的 `home=` 行，读不到再退回 `setup.log` 里脚本打的 `base python: …`）。
+
+### 两种模式（在「高级选项」里）
+
+| 模式 | 装什么 | ffmpeg | SenseVoice 模型 |
+| --- | --- | --- | --- |
+| 精简 `minimal` | venv + playwright + sherpa-onnx | **检测到就复用**；缺了只明确提示怎么装（`winget install ffmpeg`，或把 `ffmpeg.exe` 放进 `<状态目录>\bin`） | **检测到就复用**；缺了提示手动解压到 `<状态目录>\models\` |
+| 完整 `full` | 精简 + 下载 ffmpeg + 下载模型 | 自动下载到 `<状态目录>\bin\ffmpeg.exe` | 自动下载到 `<状态目录>\models\` |
+
+勾上「强制新建独立 venv（不复用已有 Python）」= 给脚本加 `--force-venv`（对应 `douyin_setup` 的 `minimal-force` / `full-force`）：即使扫到能用的解释器也照建 venv。
+
+高级选项里另外两个按钮：**只看扫描结果**（`setup_scan`，只体检、不改任何配置或文件，回一张 Python / ffmpeg / 模型 / cookie 的小表 + 一句结论）、**刷新状态**（重跑 `douyin_status` 读最新的 `env`）。
+
+### ⚠️ 插件升级 / npm install 会清掉 venv
+
+venv 建在**插件的安装目录里**，所以：
+
+- 升级 / 重装 / `npm install` 都可能把整个包目录替换掉，**venv 跟着没了**；升级完请回来再点一次【一键配置环境】（通常几十秒，pip 有缓存）。
+- `pythonPath` 这时会指向一个不存在的路径 —— 探测会自动跳过它去找别的解释器，不会把插件弄挂；只是转写在重装环境之前会报「找不到带 sherpa_onnx 的 Python」。
+
+进度都写在 `<状态目录>\setup.log`（逐行追加、带时间戳）：页面上点【查看日志】，或者读 `douyin_status.env.setupLogTail`（最近 20 行）。装好的判据是 `douyin_status.env.venvUsable === true`（= venv python 在，且 `import playwright, sherpa_onnx` 成功）。
 
 ---
 
@@ -159,7 +218,7 @@
 | `saveAll` | boolean | `true` | 是否逐屏下载视频（关掉就只截图，后续没东西可转写） |
 | `downloadTimeout` | number（正整数，秒） | `300` | 单个视频下载超时 |
 | `transcribeModel` | string | `''` | **当前仅占位**：`config.json` 里有这个键，但没有任何工具读取它（转写模型目录请用 `douyin_transcribe` 的 `modelDir` 参数） |
-| `pythonPath` | string | `''` | 指定 Python 解释器；空 = 自动探测 |
+| `pythonPath` | string | `''` | 指定 Python 解释器；空 = 自动探测。**装完环境后它指向插件内的 venv python**（`<插件根>/venv/Scripts/python.exe`）—— 这个值是 `scripts/douyin_setup.py` 自己写的，插件不额外加配置键 |
 | `asrThreads` | number（正整数） | `8` | SenseVoice 本地推理线程数，范围 1–64，实际建议不超过本机逻辑核（设置页按 `GET /sysinfo` 读到的核数夹取，读不到就按 1–64）。`douyin_transcribe` 与「刷完自动转写」都把它透传成 `--threads`（1–64 夹取，0/非法值就不带） |
 | `autoTranscribe` | boolean | `false` | **关（默认，推荐）= 刷完只给清单，由你决定转哪条（返回体 `autoTranscribe: null`）；开 = 刷完立刻转清单里最新的 1 条**。转写结果放在 `autoTranscribe` 字段里；找不到 sherpa_onnx 的 Python、脚本报错、没有任何已下载文件时只把原因写进该字段，**scroll 本身仍照旧返回 `ok`** |
 | `browserChannel` | string | `msedge` | 让三个会起浏览器的脚本（`douyin_scroller.py` / `douyin_read.py` / `douyin_login.py`）用哪个浏览器。**两类取值**：① 已知内核 `msedge` \| `chrome` \| `chromium` \| `firefox` \| `webkit` → 插件给脚本加 `--browser-channel <值>`；② 自定义浏览器（配置 `browserExtras` 里的 id，如 `custom-1`）或**一个 exe 完整路径**（开始菜单 / 桌面快捷方式扫描出来的项就是这样存的）→ **不加** `--browser-channel`，改加 `--browser-executable <路径>`。默认 `msedge` = 你装的 Microsoft Edge（实测最稳，抖音风控对真浏览器宽松）；`chromium` = Playwright 自带的内置浏览器（没有真实用户的浏览痕迹，**最容易撞验证码**，只建议排查问题时用）。脚本侧候选链只限于 Chromium 家族：`msedge → [msedge, chrome, chromium]`、`chrome → [chrome, msedge, chromium]`、`chromium → [chromium]`、`firefox → [firefox]`、`webkit → [webkit]` —— `firefox` / `webkit` 是不同引擎，**不装了就直接报错**（错误里写「先运行 `npx playwright install firefox`」），绝不静默退回 Edge。自定义项若路径没了 / id 找不到，插件**一个浏览器参数都不传**（脚本走自己的默认 msedge 候选链），并把原因写进 `douyin_status` 的 `browserNote`。旧版脚本不认这些参数时（`--help` 里没有）就不带，行为与升级前一致。⚠️ 换浏览器后需要**重启 DSH** 才生效 |
@@ -436,7 +495,7 @@ python douyin_login.py --out D:\my\cookie.txt
 node selfcheck.mjs
 ```
 
-退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 13 个工具（原有 4 + 只读 5 + 通知 2 + 登录 2）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
+退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 16 个工具（原有 4 + 只读 5 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
 
 **第 2 步：环境自检**
 
@@ -471,7 +530,7 @@ douyin_search  keyword=美食  limit=5  order=click
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.js` | 13 个工具的实现（原有 4 + 只读 5 + 通知 2 + 登录 2）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
+| `index.js` | 16 个工具的实现（原有 4 + 只读 5 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
 | `selfcheck.mjs` | 本地预检：假 ctx 跑一次 `apply()`，校验工具注册与参数 schema；`node selfcheck.mjs`，退出码 0=通过 |
 | `lib/state.mjs` | 家的路径（`DSH_HOME`）、`DEFAULTS`、`loadCfg`/`saveCfg`、日志轮转 |
 | `lib/runner.mjs` | Python 探测（按模块名 import 试探）、脚本执行、pipe→cmd 沙箱降级、`childEnv()` 注入 `DSH_DOUYIN_TMP` |

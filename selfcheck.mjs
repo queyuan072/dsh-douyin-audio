@@ -4,12 +4,13 @@
  * 那类错误提前在本地暴露出来（宿主只会留一句 warning，日志里看不出根因）。
  *
  * 查什么：
- *   a. 恰好注册 15 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
+ *   a. 恰好注册 16 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  *      + douyin_hot / douyin_search / douyin_video / douyin_comments / douyin_note（只读查询）
  *      + douyin_notes / douyin_messages（② 通知，只读）
  *      + douyin_react（③A 轻互动：点赞 / 收藏 / 取消，**写操作**，默认关）
  *      + douyin_login_start / douyin_login_poll（登录，基础能力不设等级闸门）
  *      + douyin_duty（谷时自动刷，基础能力不设等级闸门）
+ *      + douyin_setup（装入配置环境：auto 扫描→复用或装 venv，基础能力不设等级闸门）
  *   b. 每个工具都有 description(string) / parameters(对象) / execute(function)
  *   c. 参数 schema 里 type:'object' 的节点必须显式写 additionalProperties
  *      （宿主的 defineTool 会抛 JsonSchemaError ⇒ 整条插件不激活）
@@ -28,6 +29,13 @@
  *   f. 谷时自动刷 douyin_duty：只认一个 action 参数；**没有任何等级闸门**
  *      （五个等级全关时 action=status 也照常返回 ok:true）；没有 duty.json 时 todayScreens=0、
  *      autoRun 默认 false、windows 按默认窗口解析；action=history 返回 items 数组
+ *   h. 装入配置环境 douyin_setup：只认一个 mode 参数（auto / scan / minimal / full / minimal-force /
+ *      full-force）；**没有任何等级闸门**（五个等级全关也能调）；脚本不存在时给明确 reason；
+ *      脚本存在（测试缝换成桩）时 minimal/full/minimal-force 走**后台派生**（--mode / --force-venv 透传、
+ *      返回 started:true），MCP 调用的 scan / auto 走**前台同步**；HTTP 的 setup_auto 走**后台派生**
+ *      （立刻回 started:true，结果读 env.setupResult）、setup_scan 前台回 inventory、setup_start 透传 mode；
+ *      douyin_status 返回体带 env 对象（venv / venvPython / venvUsable / basePython / playwright / sherpa /
+ *      canReusePython / setupLog / setupLogTail / setupRunning / setupResult），venv 探测同一次运行只探一次
  *
  * 用法：node selfcheck.mjs [入口文件，默认 ./index.js]
  * 退出码：0 = 全通过；1 = 有问题（宿主里就是 "entry did not activate"）
@@ -45,6 +53,7 @@ const EXPECTED_TOOLS = [
   'douyin_react',
   'douyin_login_start', 'douyin_login_poll',
   'douyin_duty',
+  'douyin_setup',
 ]
 const EXPECTED_NAME = 'douyin-audio'
 
@@ -88,6 +97,8 @@ try {
 
 /* ───────── ② 假 ctx：登记到的工具收集起来，日志打到 stderr ───────── */
 const registered = []
+/** 捕获 /api/douyin-audio 的路由处理函数（断言 HTTP 分支用：setup_auto 必须走后台派生） */
+let webRoute = null
 const toStderr = (level) => (m) => { try { process.stderr.write('[selfcheck/' + level + '] ' + m + '\n') } catch { /* ignore */ } }
 const fakeCtx = {
   tools: { register: (t) => { registered.push(t); return t } },
@@ -99,7 +110,7 @@ const fakeCtx = {
   plugin: () => {},
   setTimeout: () => () => {},
   settings: { register: () => ({}) },
-  webServer: { register: () => ({ dispose() {} }) },
+  webServer: { register: (route) => { webRoute = route && route.handler ? route.handler : null; return { dispose() {} } } },
 }
 
 try { mkdirSync(SANDBOX_HOME, { recursive: true }) } catch (e) {
@@ -389,6 +400,193 @@ else {
   const dhi = await callTool('douyin_duty', { action: 'history' })
   if (dhi && dhi.ok === true && Array.isArray(dhi.items)) ok('douyin_duty history 返回 items 数组（' + dhi.items.length + ' 条）')
   else problem('douyin_duty history 形状不对：' + JSON.stringify(dhi))
+}
+
+/* ───────── ⑧-bis 装入配置环境 douyin_setup：无闸门 + mode 透传 + HTTP 后台派生 + status.env ───────── */
+const setupTool = byName.get('douyin_setup')
+if (!setupTool || typeof setupTool.execute !== 'function') problem('少了工具：douyin_setup')
+else {
+  const fields = Object.keys(setupTool.parameters || {})
+  if (fields.join(',') !== 'mode') problem('douyin_setup 的参数应只有 mode，现在是 ' + JSON.stringify(fields))
+  else ok('douyin_setup 存在（参数 mode）')
+
+  const setSetupDeps = (o) => (typeof mod.__setupDeps === 'function' ? mod.__setupDeps(o) : null)
+  if (typeof mod.__setupDeps !== 'function') problem('index.js 没导出 __setupDeps 测试缝（argv 没法断言）')
+
+  // 五个等级全关：基础能力照常可用；mode 非法也只会撞参数校验，不许被闸门挡
+  writeCfg({ tierRead: false, tierNotify: false, tierReact: false, tierComment: false, tierPublish: false })
+  const setupNoGate = await callTool('douyin_setup', { mode: 'bogus' })
+  if (setupNoGate && setupNoGate.code !== 'TIER_DISABLED' && /mode 只能是/.test(String(setupNoGate.reason))) {
+    ok('douyin_setup 无等级闸门（五个等级全关也能调）')
+  } else problem('douyin_setup 被等级闸门挡住了：' + JSON.stringify(setupNoGate))
+  for (const want of ['auto', 'scan', 'minimal', 'full', 'minimal-force', 'full-force']) {
+    if (!String((setupNoGate && setupNoGate.reason) || '').includes(want)) problem('douyin_setup 的 mode 列表里少了 ' + want)
+  }
+
+  // 脚本不存在 → 明确 reason（先换脚本缝，绝不碰真的 scripts/douyin_setup.py）
+  const noSetupScript = join(SANDBOX_HOME, 'no-such-setup.py')
+  setSetupDeps({ script: noSetupScript })
+  const setupNoScript = await callTool('douyin_setup', { mode: 'minimal' })
+  if (setupNoScript && setupNoScript.ok === false && /安装脚本不存在/.test(String(setupNoScript.reason))) {
+    ok('脚本不存在时给明确 reason（' + String(setupNoScript.reason).slice(0, 40) + '…）')
+  } else problem('脚本不存在时没说清：' + JSON.stringify(setupNoScript))
+
+  // 桩脚本 + 桩派生：后台派生只调一次、mode 透传、返回 started:true
+  const stubSetup = join(SANDBOX_HOME, 'stub_setup.py')
+  try { writeFileSync(stubSetup, '# stub\n', 'utf8') } catch (e) { die('写桩安装脚本失败', e) }
+  const setupSpawned = []
+  setSetupDeps({ script: stubSetup, spawn: async (py, script, argv) => { setupSpawned.push({ py, script, argv }); return { ok: true, pid: 4242 } } })
+  const setupStarted = await callTool('douyin_setup', { mode: 'full' })
+  if (setupStarted && setupStarted.started === true && setupSpawned.length === 1) ok('后台派生被调用一次，返回 started:true')
+  else problem('后台派生没按预期：' + JSON.stringify(setupStarted) + ' 次数=' + setupSpawned.length)
+  const setupFullArgv = setupSpawned.length ? setupSpawned[0].argv : []
+  if (setupFullArgv[setupFullArgv.indexOf('--mode') + 1] === 'full') ok('mode=full 透传 --mode full')
+  else problem('mode=full 没透传：' + JSON.stringify(setupFullArgv))
+  if (setupStarted && /setup\.log$/.test(String(setupStarted.log))) ok('返回里带安装日志：' + setupStarted.log)
+  else problem('返回里没有 setup.log 路径：' + JSON.stringify(setupStarted && setupStarted.log))
+
+  setupSpawned.length = 0
+  await callTool('douyin_setup', { mode: 'minimal-force' })
+  const setupForceArgv = setupSpawned.length ? setupSpawned[0].argv : []
+  if (setupForceArgv.includes('--force-venv') && setupForceArgv[setupForceArgv.indexOf('--mode') + 1] === 'minimal') {
+    ok('mode=minimal-force 透传 --mode minimal --force-venv')
+  } else problem('minimal-force 没透传 --force-venv：' + JSON.stringify(setupForceArgv))
+  setupSpawned.length = 0
+
+  // MCP 调的 scan / auto 走前台同步：一个后台进程都不许派生
+  const setupFront = []
+  const scanEnvelope = {
+    ok: true, mode: 'scan',
+    pythons: [{ path: 'C:\\stub\\python.exe', version: '3.12.14', source: 'dsh-runtimes', usable: true, hasPlaywright: true, hasSherpa: true }],
+    ffmpeg: { path: null, ok: false, source: null },
+    model: { path: null, ok: false, source: null },
+    cookie: { path: '', exists: false, count: 0 },
+    verdict: { canReusePython: true, reusePath: 'C:\\stub\\python.exe', reuseReason: '桩', missing: ['ffmpeg'] },
+  }
+  const foregroundSeam = async (script, argv) => {
+    setupFront.push(argv)
+    return argv.includes('--scan') ? scanEnvelope : { ok: true, mode: 'auto', action: 'reused', python: 'C:\\stub\\python.exe', version: '3.12.14', playwright: true, sherpa: true }
+  }
+  setSetupDeps({ script: stubSetup, run: foregroundSeam })
+  const setupScan = await callTool('douyin_setup', { mode: 'scan' })
+  if (setupScan && setupScan.mode === 'scan' && setupScan.canReusePython === true && setupSpawned.length === 0) {
+    ok('工具调 mode=scan 走前台同步（没派生后台进程），回 inventory')
+  } else problem('scan 没走前台：' + JSON.stringify(setupScan))
+  if (setupFront.length === 1 && setupFront[0].includes('--scan') && setupFront[0].includes('--log')) ok('scan 的 argv 是 --scan --json --log <setup.log>')
+  else problem('scan argv 不对：' + JSON.stringify(setupFront))
+  const setupAuto = await callTool('douyin_setup', { mode: 'auto' })
+  if (setupAuto && setupAuto.action === 'reused' && setupSpawned.length === 0) ok('工具调 mode=auto 走前台同步并回 action=reused')
+  else problem('auto 没走前台 / 没回 action：' + JSON.stringify(setupAuto))
+
+  // HTTP：setup_auto 必须**后台派生**（几分钟的长请求会被宿主 HTTP 掐断，掐断后用户看到失败、脚本其实还在跑）
+  const frontBefore = setupFront.length
+  const spawnedHttp = []
+  setSetupDeps({
+    script: stubSetup,
+    spawn: async (py, script, argv) => { spawnedHttp.push({ py, script, argv }); return { ok: true, pid: 777 } },
+    run: async (script, argv) => {
+      if (argv.includes('--scan')) return scanEnvelope
+      throw new Error('setup_auto 不该走前台 runPython')
+    },
+  })
+  const callRoute = (method, url, body) => new Promise((resolve) => {
+    const req = {
+      method, url, headers: {},
+      on(ev, fn) {
+        if (ev === 'data' && body !== undefined) fn(Buffer.from(JSON.stringify(body)))
+        if (ev === 'end') fn()
+        return this
+      },
+    }
+    let out = null
+    const res = { statusCode: 0, setHeader() {}, end(text) { try { out = JSON.parse(text) } catch { out = text } } }
+    Promise.resolve(webRoute(req, res)).then(() => resolve(out), (e) => resolve({ error: String((e && e.message) || e) }))
+  })
+  if (typeof webRoute !== 'function') problem('没捕获到 /api/douyin-audio 路由')
+  else {
+    const httpAuto = await callRoute('POST', '/api/douyin-audio/run', { action: 'setup_auto' })
+    if (httpAuto && httpAuto.ok === true && httpAuto.started === true && httpAuto.action === 'started' && httpAuto.mode === 'auto') {
+      ok('HTTP setup_auto 立刻回 started:true / action=started / mode=auto')
+    } else problem('HTTP setup_auto 返回不对：' + JSON.stringify(httpAuto))
+    if (spawnedHttp.length === 1 && spawnedHttp[0].argv[spawnedHttp[0].argv.indexOf('--mode') + 1] === 'auto') {
+      ok('HTTP setup_auto 走后台派生（argv 带 --mode auto）：' + JSON.stringify(spawnedHttp[0].argv))
+    } else problem('HTTP setup_auto 没走后台派生：' + JSON.stringify(spawnedHttp.map((x) => x.argv)))
+    if (setupFront.length === frontBefore) ok('HTTP setup_auto 没走前台 runPython')
+    else problem('HTTP setup_auto 走了前台（前台调用 ' + setupFront.length + ' 次）')
+    const httpScan = await callRoute('POST', '/api/douyin-audio/run', { action: 'setup_scan' })
+    if (httpScan && httpScan.mode === 'scan') ok('HTTP setup_scan 走前台同步回 inventory')
+    else problem('HTTP setup_scan 不对：' + JSON.stringify(httpScan))
+    const httpStart = await callRoute('POST', '/api/douyin-audio/run', { action: 'setup_start', mode: 'minimal' })
+    if (httpStart && httpStart.started === true && httpStart.mode === 'minimal') ok('HTTP setup_start 把 mode 透传给 douyin_setup')
+    else problem('HTTP setup_start 不对：' + JSON.stringify(httpStart))
+  }
+  setSetupDeps({ script: null, spawn: null, run: null, probe: null, venvDir: null })
+
+  // douyin_status.env：结构 + venv 探测缓存（桩 venv，绝不真起子进程）
+  const fakeVenv = join(SANDBOX_HOME, 'venv')
+  try {
+    mkdirSync(join(fakeVenv, 'Scripts'), { recursive: true })
+    writeFileSync(join(fakeVenv, 'Scripts', 'python.exe'), 'stub', 'utf8')
+    writeFileSync(join(fakeVenv, 'pyvenv.cfg'), 'home = C:\\stub-base\\python\nversion = 3.12.14\n', 'utf8')
+  } catch (e) { die('造假 venv 失败', e) }
+  let envProbes = 0
+  setSetupDeps({ venvDir: fakeVenv, probe: async () => { envProbes += 1; return { playwright: true, sherpa: true } } })
+  const stWithEnv = await callTool('douyin_status', {})
+  const envObj = stWithEnv && stWithEnv.env
+  if (envObj && typeof envObj === 'object' && !Array.isArray(envObj)) ok('douyin_status 返回 env 对象')
+  else problem('douyin_status 没有 env 对象：' + JSON.stringify(envObj))
+  const envKeys = ['venv', 'venvPython', 'venvUsable', 'playwright', 'sherpa', 'setupLog', 'setupLogTail',
+    'canReusePython', 'reusePythonPath', 'setupRunning', 'setupResult']
+  const envLost = envObj ? envKeys.filter((k) => !(k in envObj)) : envKeys
+  if (!envLost.length) ok('env 字段齐（' + envKeys.join(' / ') + '）')
+  else problem('env 少了字段：' + envLost.join(','))
+  if (envObj && envObj.venv === true && envObj.venvUsable === true && /python\.exe$/.test(String(envObj.venvPython))) {
+    ok('env.venv / venvUsable / venvPython 对得上（venv 桩）')
+  } else problem('env.venv* 不对：' + JSON.stringify({ venv: envObj && envObj.venv, venvUsable: envObj && envObj.venvUsable, venvPython: envObj && envObj.venvPython }))
+  if (envObj && envObj.basePython === 'C:\\stub-base\\python') ok('env.basePython 读 pyvenv.cfg 的 home：' + envObj.basePython)
+  else problem('env.basePython 不对：' + JSON.stringify(envObj && envObj.basePython))
+  if (envObj && Array.isArray(envObj.setupLogTail)) ok('env.setupLogTail 是数组（' + envObj.setupLogTail.length + ' 行）')
+  else problem('env.setupLogTail 不是数组：' + JSON.stringify(envObj && envObj.setupLogTail))
+  await callTool('douyin_status', {})
+  if (envProbes === 1) ok('venv 探测有缓存：两次 status 只探一次')
+  else problem('venv 探测没缓存（探了 ' + envProbes + ' 次）')
+
+  // env.setupRunning / env.setupResult：后台安装的进度与结论（前端轮询就靠这两个字段）
+  const resultPath = join(SANDBOX_HOME, 'douyin-duty', 'setup-result.json')
+  try { rmSync(resultPath, { force: true }) } catch { /* 本来就没有 */ }
+  const envNoResult = (await callTool('douyin_status', {})).env
+  if (envNoResult && envNoResult.setupRunning === false && envNoResult.setupResult === null) {
+    ok('没有 setup-result.json 时 env.setupRunning=false / setupResult=null')
+  } else problem('没有 setup-result.json 时 env 不对：' + JSON.stringify({ running: envNoResult && envNoResult.setupRunning, result: envNoResult && envNoResult.setupResult }))
+  try {
+    writeFileSync(resultPath, JSON.stringify({
+      action: 'reused', pythonPath: 'C:\\x\\python.exe', version: '3.13.2',
+      hasPlaywright: true, hasSherpa: true, ffmpeg: null, model: null, missing: [], nextSteps: [], at: Date.now(), elapsed: 2.1,
+    }), 'utf8')
+  } catch (e) { die('写桩 setup-result.json 失败', e) }
+  const envReused = (await callTool('douyin_status', {})).env
+  if (envReused && envReused.setupResult && envReused.setupResult.action === 'reused'
+    && envReused.setupResult.pythonPath === 'C:\\x\\python.exe' && envReused.setupResult.version === '3.13.2'
+    && envReused.setupRunning === false) {
+    ok('env.setupResult.action=reused（pythonPath / version 都读到了）')
+  } else problem('env.setupResult 读得不对：' + JSON.stringify(envReused && envReused.setupResult))
+  if (envReused && envReused.canReusePython === true) ok('reused 之后 env.canReusePython=true（徽章/按钮跟着变）')
+  else problem('reused 之后 canReusePython 没变 true：' + JSON.stringify(envReused && envReused.canReusePython))
+  try {
+    writeFileSync(resultPath, JSON.stringify({ action: 'failed', error: 'pip install 两次都失败（网络）', missing: ['playwright'], at: Date.now() }), 'utf8')
+  } catch (e) { die('写桩 setup-result.json（失败态）失败', e) }
+  const envFailed = (await callTool('douyin_status', {})).env
+  if (envFailed && envFailed.setupResult && envFailed.setupResult.action === 'failed'
+    && /两次都失败/.test(String(envFailed.setupResult.error))) {
+    ok('env.setupResult.action=failed（error 原样带回）')
+  } else problem('failed 结论没读到：' + JSON.stringify(envFailed && envFailed.setupResult))
+  try { writeFileSync(resultPath, '{ 坏 JSON', 'utf8') } catch { /* ignore */ }
+  const envBroken = (await callTool('douyin_status', {})).env
+  if (envBroken && envBroken.setupResult === null) ok('setup-result.json 坏了 → setupResult=null（不抛）')
+  else problem('坏 JSON 没吞掉：' + JSON.stringify(envBroken && envBroken.setupResult))
+  try { rmSync(resultPath, { force: true }) } catch { /* ignore */ }
+  setSetupDeps({ venvDir: null, probe: null })
+  writeCfg({})
 }
 
 /* ───────── ⑨ 界面布局键：uiLayout（字符串，默认 classic）───────── */

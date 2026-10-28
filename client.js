@@ -137,6 +137,16 @@ window.__ModuleLoader__.load({
 [data-dy-hist-dir]{color:var(--dsw-alias-label-secondary,#c9ccd1);word-break:break-all;flex:1;min-width:0;}
 [data-dy-hist-ok]{color:#22c55e;}
 [data-dy-hist-bad]{color:#f59e0b;}
+/* ── 装入配置环境：扫描结果小表 + 单选框 ── */
+[data-dy-table]{display:flex;flex-direction:column;gap:4px;padding:7px 9px;border-radius:8px;
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.10));
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.10));}
+[data-dy-tablerow]{display:flex;gap:8px;font-size:11px;line-height:16px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+[data-dy-tablek]{flex:none;width:52px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+[data-dy-tablev]{flex:1;min-width:0;word-break:break-all;color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-dy-radio]{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;}
+[data-dy-radio][data-off]{opacity:.5;cursor:default;}
 `
 
     function Switch({ on, onChange, disabled }) {
@@ -212,10 +222,22 @@ window.__ModuleLoader__.load({
 
     /** 四枚徽章：{ text, tone(good|warn|''), act(env|login|null), title } */
     function statusBadges(s) {
+      const envObj = s && s.env && typeof s.env === 'object' ? s.env : null
+      const pyPath = String((s && s.cfg && s.cfg.pythonPath) || '').trim()
       const miss = ENV_PARTS.filter((p) => !p.has(s))
-      const env = miss.length
-        ? { text: '环境缺 ' + miss[0].name, tone: 'warn', act: 'env', title: miss.map((p) => p.why).join('；') + '（点这里重跑自检）' }
-        : { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里重跑自检）' }
+      /* 「装入配置环境」三档：
+         venv 可用 = 插件自己的解释器就绪（路径固定，跟 pythonPath 配没配无关）→ 直接算环境就绪；
+         没 venv 但扫到能复用的 Python、pythonPath 还空着 → 提示去一键配置（这是唯一需要人点一下的状态）。 */
+      let env
+      if (envObj && envObj.venvUsable) {
+        env = { text: '环境就绪', tone: 'good', act: 'env', title: '插件 venv 可用（playwright + sherpa 都在）' + (envObj.basePython ? '，基于 ' + envObj.basePython : '') + '（点这里重跑自检）' }
+      } else if (envObj && envObj.canReusePython && !pyPath) {
+        env = { text: '环境未配置（可一键配置）', tone: 'warn', act: 'env', title: '本机已有可用 Python' + (envObj.reusePythonPath ? '：' + envObj.reusePythonPath : '') + '，但 pythonPath 还空着 —— 去「环境与诊断」页点「一键配置环境」' }
+      } else if (miss.length) {
+        env = { text: '环境缺 ' + miss[0].name, tone: 'warn', act: 'env', title: miss.map((p) => p.why).join('；') + '（点这里重跑自检）' }
+      } else {
+        env = { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里重跑自检）' }
+      }
       /* ⚠️ 只按 cookie 文件在不在说，不写「已登录」—— 真实登录态我们确认不了 */
       const login = s.cookie && s.cookie.exists
         ? { text: 'cookie 已配置', tone: '', act: 'login', title: '只按 cookie 文件存在判断，不代表当前登录态一定有效（点这里去登录区）' }
@@ -255,6 +277,15 @@ window.__ModuleLoader__.load({
       const [extraPath, setExtraPath] = React.useState('')    // 手动添加：浏览器可执行文件路径
       const [extraName, setExtraName] = React.useState('')    // 手动添加：可选名称
       const [deletedExtras, setDeletedExtras] = React.useState({})   // 刚删掉的自定义项（宿主那份 status 还是旧的，本地先藏起来）
+      /* 「装入配置环境」：默认只露一个「一键配置环境」，其余全在「高级选项」里 */
+      const [setupBusy, setSetupBusy] = React.useState('')      // '' | auto | install | scan | env
+      const [autoRes, setAutoRes] = React.useState(null)        // 安装结论（前台返回或 env.setupResult）
+      const [scanRes, setScanRes] = React.useState(null)        // setup_scan 的原样返回（inventory 小表）
+      const [advOpen, setAdvOpen] = React.useState(false)       // 「高级选项」展开没（默认收起）
+      const [advMode, setAdvMode] = React.useState('minimal')   // 高级选项里的精简 / 完整
+      const [forceVenv, setForceVenv] = React.useState(false)   // 强制新建 venv（不复用已有 Python）
+      const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
+      const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
 
@@ -992,8 +1023,294 @@ window.__ModuleLoader__.load({
             + '（读不到登录态，上面那些开关都白开）。')),
       ]
 
+      /* ── 装入配置环境（两种布局共用）：默认只露【一键配置环境】，其余收在「高级选项」里 ──
+            数据源：/run 的 setup_scan 前台回 inventory；一键配置走 setup_auto（后台派生）+ 轮询
+            douyin_status.env.setupRunning / env.setupResult；venv 状态看 env.venvUsable。 */
+      const envOf = (s) => (s && s.env && typeof s.env === 'object' && !Array.isArray(s.env) ? s.env : null)
+      const envNow = () => envOf(st)
+      /** 本机有能直接用的 python 吗：scan 的结论优先，其次 status.env 的轻量兜底 */
+      const canReuse = () => !!(scanRes && scanRes.canReusePython) || !!(envNow() && envNow().canReusePython)
+      const reusePathNow = () => String((scanRes && scanRes.reusePythonPath) || (envNow() && envNow().reusePythonPath) || '')
+      /** inventory：刚扫的优先，其次 status.env 里带回来的上次扫描缓存 */
+      const invNow = () => (scanRes && typeof scanRes === 'object' ? scanRes : (envNow() && envNow().scan) || null)
+
+      /** 安装结论的一行文案：两种来源都吃 —— setup_auto 的前台返回，或脚本写的 setup-result.json */
+      const autoLine = (r) => {
+        if (!r || typeof r !== 'object') return null
+        const py = r.python && typeof r.python === 'object' ? r.python : null
+        const path = (py && py.path) || r.pythonPath || r.reusePythonPath || ''
+        const ver = (py && py.version) || r.version || '?'
+        const mark = (b) => (b === true ? '✓' : b === false ? '✗' : '?')
+        const pick = (a, b, c) => (a !== undefined && a !== null ? a : (b !== undefined && b !== null ? b : c))
+        const pw = py ? pick(py.playwright, r.playwright, r.hasPlaywright) : pick(r.playwright, r.hasPlaywright)
+        const sh = py ? pick(py.sherpa, r.sherpa, r.hasSherpa) : pick(r.sherpa, r.hasSherpa)
+        if (r.action === 'reused') {
+          return { tone: 'good', text: '已复用现有环境：' + (path || '(宿主没回路径)') + '（Python ' + ver + '，playwright' + mark(pw) + ' sherpa' + mark(sh) + '）' }
+        }
+        if (r.action === 'installed') {
+          return { tone: 'good', text: '已安装独立环境：' + (path || '(宿主没回路径)') + '（Python ' + ver + '）' }
+        }
+        const why = (r.error || r.reason || (r.action === 'failed' ? '看日志' : '')) || '没拿到安装结果（点「查看日志」）'
+        return { tone: 'warn', failed: true, text: '配置失败：' + why }
+      }
+
+      /* 【一键配置环境】= HTTP setup_auto：**后台派生**（宿主不等它装完，否则几分钟的长请求会被 HTTP 掐断），
+         立刻回 started:true；之后这里每 3 秒轮询一次 status，直到 env.setupRunning 变 false，
+         再用 env.setupResult 渲染那一行结果。最多盯 30 分钟。 */
+      const SETUP_POLL_MS = 3000
+      const SETUP_POLL_MAX_MS = 30 * 60 * 1000
+      const sleep = (ms) => new Promise((r) => { setTimeout(r, ms) })
+
+      /** 轮询到装完：返回 setupResult；null = 没拿到结果；undefined = 盯到超时还在跑 */
+      const waitSetup = async (startedAt) => {
+        let sawRunning = false
+        while (Date.now() - startedAt < SETUP_POLL_MAX_MS) {
+          const env = envOf(await refreshStatus())
+          if (env) {
+            if (env.setupRunning) sawRunning = true
+            else {
+              const res = env.setupResult
+              const at = Number(res && res.at) || 0
+              // 上一轮留下的旧结果不算（at 早于这次点击就不认）
+              const fresh = !at || at >= startedAt - 5000
+              if (res && fresh) { setAutoRes(res); return res }
+              if (sawRunning || Date.now() - startedAt > 30000) { setAutoRes(null); return null }
+            }
+          }
+          await sleep(SETUP_POLL_MS)
+        }
+        return undefined
+      }
+
+      const runAuto = async () => {
+        setSetupBusy('auto')
+        setAutoRes(null)
+        setLogOpen(false)
+        const startedAt = Date.now()
+        say('正在配置环境…（首次可能要几分钟，别关窗口）')
+        try {
+          const r = await jpost('/run', { action: 'setup_auto' })
+          if (!(r && r.ok && r.started)) {
+            const why = (r && (r.reason || r.error)) || '宿主没回 started'
+            setAutoRes({ ok: false, action: 'failed', error: why })
+            say('配置没起来：' + why, 'warn')
+            return
+          }
+          const res = await waitSetup(startedAt)
+          if (res === undefined) say('还在跑，点【刷新状态】查看结果', 'warn')
+          else if (!res) say('没拿到安装结果，点【查看日志】看脚本走到哪一步了', 'warn')
+          else if (res.action === 'reused') say('已复用现有环境', 'good')
+          else if (res.action === 'installed') say('已安装独立环境', 'good')
+          else say('配置失败：' + ((res.error || res.reason) || '点「查看日志」'), 'warn')
+        } catch (e) {
+          setAutoRes({ ok: false, action: 'failed', error: errText(e) })
+          say('配置环境：' + errText(e), 'warn')
+        } finally { setSetupBusy('') }
+        await reload()          // 脚本会自己把 venv python 写进 pythonPath，配置得重读一遍
+        await refreshStatus()
+      }
+
+      /** 高级选项里的【开始安装】：按单选 + 强制复选框拼 mode（*-force 就是 --force-venv） */
+      const startInstall = async () => {
+        const mode = (advMode === 'full' ? 'full' : 'minimal') + (forceVenv ? '-force' : '')
+        setSetupBusy('install')
+        try {
+          const r = await jpost('/run', { action: 'setup_start', mode })
+          setOut(show(r))
+          if (r && r.ok && r.started) {
+            setInstallMsg('安装中…（几分钟）')
+            say('安装已在后台开始（' + mode + '），装完点「刷新状态」', 'good')
+          } else {
+            setInstallMsg('')
+            say('安装没起来：' + ((r && (r.reason || r.error)) || '宿主没回 started'), 'warn')
+          }
+        } catch (e) { say('安装：' + errText(e), 'warn') }
+        finally { setSetupBusy('') }
+        await refreshStatus()
+      }
+
+      /** 「复用现有环境」：把扫到的 python 路径写进 pythonPath（这时不需要装任何东西） */
+      const reuseExisting = async () => {
+        const p = reusePathNow()
+        if (!p) return
+        await patch('pythonPath', p, '复用现有环境')
+        await refreshStatus()
+      }
+
+      const runScan = async () => {
+        setSetupBusy('scan')
+        try {
+          const r = await jpost('/run', { action: 'setup_scan' })
+          const res = r && typeof r === 'object' ? r : { ok: false, error: '宿主没回扫描结果' }
+          setScanRes(res)
+          if (res.ok) say('扫描完成：' + (res.canReusePython ? '有可用 Python，无需安装' : '需要安装'), res.canReusePython ? 'good' : '')
+          else say('扫描失败：' + ((res.error || res.reason) || '看结果区'), 'warn')
+        } catch (e) { say('扫描：' + errText(e), 'warn') }
+        finally { setSetupBusy('') }
+        await refreshStatus()
+      }
+
+      /** 刷新状态 = 重跑自检（拿最新的 env）；装完了这里也会顺手清掉「安装中」提示 */
+      const refreshEnv = async () => {
+        setSetupBusy('env')
+        try {
+          const r = await refreshStatus()
+          setInstallMsg('')
+          if (r) say('环境状态已刷新', 'good')
+        } finally { setSetupBusy('') }
+      }
+
+      /** 扫描结果小表：Python（路径/版本/playwright/sherpa/来源）、ffmpeg、模型、cookie */
+      const scanTable = (inv) => {
+        if (!inv) return h('div', { 'data-dy-note': '' }, '还没扫描过 —— 点「只看扫描结果」看本机现在有什么')
+        const py = inv.python || null
+        const mark = (b) => (b === true ? '✓' : b === false ? '✗' : '?')
+        const ck = inv.cookie || null
+        const rows = [
+          ['Python', py
+            ? (py.path || '(未找到)') + (py.version ? '（Python ' + py.version + '）' : '')
+              + ' playwright' + mark(py.playwright) + ' sherpa' + mark(py.sherpa)
+              + (py.source ? ' · 来源 ' + py.source : '')
+            : '(未找到)'],
+          ['ffmpeg', inv.ffmpeg || '(未找到)'],
+          ['模型', inv.model || '(未找到)'],
+          ['cookie', ck ? (ck.count > 0 ? ck.count + ' 条' : (ck.exists ? '0 条（文件在）' : '未登录')) : '未登录'],
+        ]
+        return h('div', { 'data-dy-table': '' },
+          rows.map(([k, v]) => h('div', { key: 'scanrow-' + k, 'data-dy-tablerow': '' },
+            h('span', { 'data-dy-tablek': '' }, k),
+            h('span', { 'data-dy-tablev': '' }, String(v)))))
+      }
+
+      const scanVerdict = (inv) => {
+        if (!inv) return null
+        if (inv.canReusePython) {
+          return h('div', { 'data-dy-msg': '', 'data-good': '' },
+            '已找到可直接使用的 Python，无需安装' + (inv.reusePythonPath ? '：' + inv.reusePythonPath : ''))
+        }
+        const miss = Array.isArray(inv.missingPackages) && inv.missingPackages.length
+          ? inv.missingPackages.join('、')
+          : 'playwright、sherpa-onnx'
+        return h('div', { 'data-dy-msg': '', 'data-warn': '' }, '需要安装：' + miss)
+      }
+
+      /** 环境状态那一行（只读；点「刷新状态」更新） */
+      const envLine = () => {
+        const e = envNow()
+        if (!e) return '还没拿到 env 状态（点「刷新状态」）'
+        const mark = (b) => (b ? '✓' : '✗')
+        return 'venv ' + (e.venvUsable ? '可用' : (e.venv ? '在但不可用' : '没有'))
+          + ' · playwright ' + mark(e.playwright) + ' · sherpa ' + mark(e.sherpa)
+          + (e.basePython ? ' · 基于 ' + e.basePython : '')
+          + (e.canReusePython ? ' · 可复用 ' + (e.reusePythonPath || '(路径未知)') : '')
+          + (e.setupRunning ? ' · 安装中' : '')
+      }
+
+      const setupLogCard = () => {
+        const e = envNow()
+        const tail = (e && Array.isArray(e.setupLogTail) ? e.setupLogTail : []).slice(-12)
+        return h('div', { 'data-dy-sec': '' },
+          h('div', { 'data-dy-h': '' }, 'setup.log（最近几行）'),
+          h('pre', { 'data-dy-out': '', 'data-dy-setuplogtail': '' },
+            tail.length ? tail.join('\n') : '（还没有日志 —— 先点「一键配置环境」或「刷新状态」）'))
+      }
+
+      /** 高级选项：精简/完整、强制新建 venv、开始安装 / 只看扫描结果 / 刷新状态 + 扫描表 + 日志 */
+      const advCard = () => {
+        const can = canReuse()
+        return h('div', { 'data-dy-sec': '', 'data-dy-adv': '' },
+          h('div', { 'data-dy-note': '' },
+            can ? '已找到可直接使用的 Python —— 安装选项置灰；要重装就勾「强制新建独立 venv」走下面的【开始安装】'
+              : '不确定就用上面的「一键配置环境」；这里只是把它背后的开关摊开'),
+          h('div', { 'data-dy-row': '', 'data-dy-setupmodes': '' },
+            ...[['minimal', '精简（venv + playwright + sherpa）'], ['full', '完整（另含 ffmpeg 与模型）']].map(([m, label]) => h('label', {
+              key: 'advmode-' + m, 'data-dy-radio': '', 'data-off': can ? '' : undefined,
+            },
+            h('input', {
+              type: 'radio', name: 'dy-setup-mode', value: m, 'data-dy-setupmode': m,
+              checked: advMode === m, disabled: can,
+              onChange: () => setAdvMode(m),
+            }),
+            h('span', {}, label)))),
+          h('label', { 'data-dy-radio': '', 'data-off': can ? '' : undefined },
+            h('input', {
+              type: 'checkbox', 'data-dy-forcevenv': '', checked: forceVenv, disabled: can,
+              onChange: (e) => setForceVenv(!!(e && e.target && e.target.checked)),
+            }),
+            h('span', {}, '强制新建独立 venv（不复用已有 Python）')),
+          h('div', { 'data-dy-row': '' },
+            can
+              ? h('button', {
+                'data-dy-btn': '', 'data-primary': '', 'data-dy-reuse': '',
+                disabled: !reusePathNow(), onClick: reuseExisting,
+                title: reusePathNow() || '扫描没回可复用的路径',
+              }, '复用现有环境')
+              : h('button', {
+                'data-dy-btn': '', 'data-primary': '', 'data-dy-setupstart': '',
+                disabled: setupBusy === 'install' || !!installMsg, onClick: startInstall,
+              }, setupBusy === 'install' ? '安装中…' : '开始安装'),
+            h('button', {
+              'data-dy-btn': '', 'data-dy-setupscan': '',
+              disabled: setupBusy === 'scan', onClick: runScan,
+            }, setupBusy === 'scan' ? '扫描中…' : '只看扫描结果'),
+            h('button', {
+              'data-dy-btn': '', 'data-dy-envrefresh': '',
+              disabled: setupBusy === 'env', onClick: refreshEnv,
+            }, '刷新状态')),
+          installMsg ? h('div', { 'data-dy-msg': '', 'data-warn': '', 'data-dy-installing': '' }, installMsg) : null,
+          h('div', { 'data-dy-sec': '' },
+            h('div', { 'data-dy-h': '' }, '扫描结果'),
+            scanTable(invNow()),
+            scanVerdict(invNow())),
+          h('div', { 'data-dy-sec': '' },
+            h('div', { 'data-dy-h': '' }, '环境状态'),
+            h('div', { 'data-dy-note': '', 'data-dy-envline': '' }, envLine())),
+          setupLogCard())
+      }
+
+      /** 主区域：一个大按钮 + 一行结果 + 一行「高级选项」（默认收起） */
+      const setupBody = () => {
+        const env = envNow()
+        /* 后台安装期间（本轮点下去，或上次点完还在跑 —— 刷新页面也认）按钮一律禁用 */
+        const running = setupBusy === 'auto' || !!(env && env.setupRunning)
+        const line = autoLine(autoRes || (env && env.setupResult) || null)
+        return [
+          h('div', { 'data-dy-sec': '', key: 'diag-setup', 'data-dy-setup': '' },
+            h('div', { 'data-dy-h': '' }, '装入配置环境'),
+            h('div', { 'data-dy-row': '' },
+              h('button', {
+                'data-dy-btn': '', 'data-primary': '', 'data-dy-setupauto': '',
+                disabled: running,
+                title: '扫描本机：有能用（playwright + sherpa）的 Python 就直接复用，没有就在插件目录建 venv 装依赖',
+                onClick: runAuto,
+              }, running ? '配置中…（首次可能要几分钟）' : '一键配置环境')),
+            line ? h('div', {
+              'data-dy-msg': '', 'data-dy-autoline': '',
+              'data-good': line.tone === 'good' ? '' : undefined,
+              'data-warn': line.tone === 'warn' ? '' : undefined,
+            }, line.text) : null,
+            line && line.failed ? h('div', { 'data-dy-row': '' },
+              h('button', {
+                'data-dy-btn': '', 'data-dy-setuplog': '',
+                onClick: () => { setLogOpen((v) => !v); if (!envNow()) refreshStatus() },
+              }, logOpen ? '收起日志' : '查看日志')) : null,
+            h('div', { 'data-dy-row': '' },
+              h('button', {
+                'data-dy-btn': '', 'data-dy-advtoggle': '',
+                onClick: () => setAdvOpen((v) => !v),
+                title: '精简/完整、强制新建 venv、只看扫描结果',
+              }, (advOpen ? '▾ ' : '▸ ') + '高级选项')),
+            advOpen ? advCard() : null,
+            logOpen ? setupLogCard() : null,
+            h('div', { 'data-dy-note': '' },
+              '装到插件的 venv 目录；装完脚本会自己把 pythonPath 指过去。'
+              + '插件升级 / npm install 会把 venv 清掉，升级后需要重装一次。')),
+        ]
+      }
+
       /* ── 4 环境与诊断：pythonPath + 自检/刷 1 屏 + 结果区 ── */
       const pageDiag = () => [
+        ...setupBody(),
         h('div', { 'data-dy-sec': '', key: 'diag-py' },
           h('div', { 'data-dy-h': '' }, 'Python（转写要用）'),
           h('div', { 'data-dy-label': '' }, 'pythonPath'),
@@ -1147,6 +1464,9 @@ window.__ModuleLoader__.load({
             onBlur: (e) => editPath('pythonPath', e.target.value, false),
           }),
           h('div', { 'data-dy-note': '' }, '留空就用插件自己找的那个 —— 有没有找到，点「自检」会直接说')),
+
+        /* ── 装入配置环境（跟「环境与诊断」页共用同一份 setupBody）── */
+        ...setupBody(),
 
         /* ── 浏览器内核 ── */
         h('div', { 'data-dy-sec': '' },
