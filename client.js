@@ -129,7 +129,8 @@ window.__ModuleLoader__.load({
     const TIERS = [
       { key: 'tierRead', title: '① 只读', note: '看热榜、搜视频、读视频详情和评论列表 —— 只读不写，不动你账号里的任何东西' },
       { key: 'tierNotify', title: '② 通知', note: '读私信、拉通知摘要 —— 风险：能看到你账号收到的私信内容' },
-      { key: 'tierInteract', title: '③ 互动', note: '发评论、回复、点赞 —— 风险：会用你的账号发评论', needRead: true },
+      { key: 'tierReact', title: '③A 轻互动（点赞收藏）', note: '点赞、收藏、取消 —— 风险：会动你账号的互动记录，但可撤回', needRead: true },
+      { key: 'tierComment', title: '③B 评论回复', note: '发评论、回复 —— 风险：会以你的账号公开发言，发出去收不回', needRead: true },
       { key: 'tierPublish', title: '④ 发布', note: '上传视频到抖音 —— 风险：会向你的账号上传视频', needRead: true },
     ]
 
@@ -422,13 +423,13 @@ window.__ModuleLoader__.load({
             /* ③④ 依赖 ①：只提示「需要先开启」，开关照旧可点 */
             hint: t.needRead && !cfg.tierRead ? '需要先开启 ① 只读' : null,
             /* ① 本身关着、但 ③ 或 ④ 开着时：① 实际已生效 —— 只标注，不改用户的值 */
-            badge: t.key === 'tierRead' && !cfg.tierRead && (cfg.tierInteract || cfg.tierPublish)
-              ? '上级已开：③ 互动 / ④ 发布 打开时，只读自动生效（你的存值仍是关）'
+            badge: t.key === 'tierRead' && !cfg.tierRead && (cfg.tierReact || cfg.tierComment || cfg.tierPublish)
+              ? '上级已开：③A / ③B / ④ 打开时，只读自动生效（你的存值仍是关）'
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
           h('div', { 'data-dy-note': '' },
-            '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这四个开关只负责把选择存进配置，'
+            '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这五个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
 
         /* ── 提速 ── */

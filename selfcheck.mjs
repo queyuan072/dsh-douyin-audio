@@ -13,7 +13,7 @@
  *      （宿主的 defineTool 会抛 JsonSchemaError ⇒ 整条插件不激活）
  *   d. 模块导出 name === 'douyin-audio'，inject 含 'tools'
  *   e. 能力等级闸门：tierRead=false 时五个只读工具（含图文 douyin_note）返回 TIER_DISABLED；
- *      开回来后放行；tierInteract=true 时 tierRead 视为生效；基础四工具不受限；
+ *      开回来后放行；tierReact/tierComment=true 时 tierRead 视为生效；基础四工具不受限；
  *      tierNotify=false 时 douyin_notes / douyin_messages 返回 TIER_DISABLED(tier=notify)，
  *      打开后放行（② 通知与 ① 只读互相独立）
  *
@@ -206,10 +206,15 @@ if (hotOpen && hotOpen.code !== 'TIER_DISABLED' && /limit/.test(String(hotOpen.r
 else problem('tierRead=true 时没放行：' + JSON.stringify(hotOpen))
 
 // ④ 依赖：③ 或 ④ 打开 → ① 视为生效（不改用户存的值）
-writeCfg({ tierRead: false, tierInteract: true })
+writeCfg({ tierRead: false, tierReact: true })
 const hotDerived = await callTool('douyin_hot', { limit: 99 })
-if (hotDerived && hotDerived.code !== 'TIER_DISABLED') ok('tierInteract=true 时 tierRead 视为生效')
-else problem('tierInteract=true 没让 tierRead 自动生效：' + JSON.stringify(hotDerived))
+if (hotDerived && hotDerived.code !== 'TIER_DISABLED') ok('tierReact(③A)=true 时 tierRead 视为生效')
+else problem('tierReact=true 没让 tierRead 自动生效：' + JSON.stringify(hotDerived))
+
+writeCfg({ tierRead: false, tierComment: true })
+const hotDerived2 = await callTool('douyin_hot', { limit: 99 })
+if (hotDerived2 && hotDerived2.code !== 'TIER_DISABLED') ok('tierComment(③B)=true 时 tierRead 视为生效')
+else problem('tierComment=true 没让 tierRead 自动生效：' + JSON.stringify(hotDerived2))
 
 // ⑤ tierNotify 关着：两个通知工具都必须被闸门挡住（② 通知独立于 ① 只读）
 writeCfg({ tierRead: true, tierNotify: false })

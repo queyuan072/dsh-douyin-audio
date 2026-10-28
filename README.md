@@ -148,16 +148,18 @@
 | `loginMode` | string（`window`\|`qr`） | `window` | 登录方式：`window` = 前台弹真窗口人工扫码（推荐，最稳）；`qr` = 后台驻留抓二维码到设置页扫。`douyin_login_start` 不传 `mode` 时用它，设置页「登录」区块的两个单选也读写它 |
 | `tierRead` | boolean | `true` | **① 只读**：解锁 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` |
 | `tierNotify` | boolean | `false` | **② 通知**：解锁 `douyin_notes` / `douyin_messages`（读通知摘要、私信会话列表；仍然只读，不发消息、不标已读） |
-| `tierInteract` | boolean | `false` | **③ 互动**：发评论 / 回复 / 点赞（预留；会用你的账号发言） |
+| `tierReact` | boolean | `false` | **③A 轻互动**：点赞 / 收藏 / 取消（预留；会动你账号的互动记录，但可撤回） |
+| `tierComment` | boolean | `false` | **③B 评论回复**：发评论 / 回复（预留；会以你的账号公开发言，发出后收不回） |
 | `tierPublish` | boolean | `false` | **④ 发布**：上传视频到抖音（预留；会向你的账号投稿） |
 
-**能力等级（四档开关）**
+**能力等级（五个开关）**
 
-四个 `tier*` 键就是「能力等级」开关，设置页里有一节「能力等级」可以直接点，也能用
+五个 `tier*` 键就是「能力等级」开关，设置页里有一节「能力等级」可以直接点，也能用
 `douyin_config` 改：`{"action":"set","key":"tierRead","value":"true"}`。
 
 - 基础四件（`douyin_scroll` / `douyin_transcribe` / `douyin_status` / `douyin_config`）**不受等级限制**——它们不碰抖音的写接口。
-- **依赖规则**：`tierInteract` 或 `tierPublish` 为真时，`tierRead` 在判断上视为真（**不会改写你存的值**）。
+- **依赖规则**：`tierReact` / `tierComment` / `tierPublish` 任一为真时，`tierRead` 在判断上视为真（**不会改写你存的值**）。
+- **③ 为什么拆两档**：点赞收藏可撤回，评论回复公开且不可撤回——风控强度差一个量级，所以给了两个独立开关。
 - 等级没开时，对应工具不报错也不崩，返回：
 
 ```json

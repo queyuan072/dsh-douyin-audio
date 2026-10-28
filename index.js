@@ -313,11 +313,11 @@ export function apply(ctx, config = {}) {
     return { ...base, ...over }
   }
   // ── 能力等级（四档闸门）──────────────────────────────────
-  // ① 只读 / ② 通知 / ③ 互动 / ④ 发布。基础四工具（刷屏/转写/自检/配置）不受等级限制。
+  // ① 只读 / ② 通知 / ③A 轻互动 / ③B 评论 / ④ 发布。基础四工具（刷屏/转写/自检/配置）不受等级限制。
   // 默认值与 lib/state.mjs 的 DEFAULTS 一致；这里再留一份兜底，config.json 里缺键也能判断。
-  const TIER_DEFAULTS = { tierRead: true, tierNotify: false, tierInteract: false, tierPublish: false }
-  const TIER_LABEL = { read: '只读', notify: '通知', interact: '互动', publish: '发布' }
-  const TIER_KEY = { read: 'tierRead', notify: 'tierNotify', interact: 'tierInteract', publish: 'tierPublish' }
+  const TIER_DEFAULTS = { tierRead: true, tierNotify: false, tierReact: false, tierComment: false, tierPublish: false }
+  const TIER_LABEL = { read: '只读', notify: '通知', react: '轻互动', comment: '评论', publish: '发布' }
+  const TIER_KEY = { read: 'tierRead', notify: 'tierNotify', react: 'tierReact', comment: 'tierComment', publish: 'tierPublish' }
 
   /** 四个等级键的当前值（缺失键按默认值）；③ 或 ④ 打开时 ① 视为生效，但不改用户存的值 */
   function getTiers() {
@@ -327,7 +327,7 @@ export function apply(ctx, config = {}) {
       const v = cfg[key]
       out[key] = v === undefined || v === null || v === '' ? dflt : (typeof v === 'boolean' ? v : String(v).toLowerCase() === 'true')
     }
-    if (out.tierInteract || out.tierPublish) out.tierRead = true
+    if (out.tierReact || out.tierComment || out.tierPublish) out.tierRead = true
     return out
   }
 
