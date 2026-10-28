@@ -278,10 +278,12 @@ def playwright_context():
             pass
 
 
-def open_session(pw, headless, extra_args=None, viewport=None, browser_channel="msedge"):
+def open_session(pw, headless, extra_args=None, viewport=None, browser_channel="msedge",
+                 browser_executable=None):
     """起浏览器 + 上下文 + 抖音首页；失败带步骤名抛出"""
     browser = launch_browser(pw, headless, extra_args=extra_args,
-                             browser_channel=browser_channel)
+                             browser_channel=browser_channel,
+                             browser_executable=browser_executable)
     try:
         ctx = browser.new_context(locale="zh-CN", viewport=viewport) if viewport \
             else browser.new_context(locale="zh-CN")
@@ -297,18 +299,24 @@ def open_session(pw, headless, extra_args=None, viewport=None, browser_channel="
 
 
 # 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
-BROWSER_CHANNELS = ("msedge", "chrome", "chromium")
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium", "firefox", "webkit")
+# Chromium 家族：只有它们才带 channel 参数、也只有它们之间允许互相回退
+CHROMIUM_FAMILY = ("msedge", "chrome", "chromium")
 # 实际用上的 channel（launch_browser 写，write_state 读进 state.json）
 _BROWSER_USED = ""
 
 
 def browser_candidates(preferred):
-    """按用户选择把候选链排好；chromium = 明确要裸浏览器，不再回退（免得以为在测 Chrome）"""
+    """按用户选择把候选链排好。
+    Chromium 家族之间互相回退（同一引擎，指纹相近）；firefox / webkit 是不同引擎，
+    不装就直接报错，绝不静默退到别的内核（否则你以为在测 firefox，其实跑的是 Edge）"""
     preferred = preferred if preferred in BROWSER_CHANNELS else "msedge"
-    if preferred == "chromium":
-        return ["chromium"]
     if preferred == "chrome":
         return ["chrome", "msedge", "chromium"]
+    if preferred == "chromium":
+        return ["chromium"]
+    if preferred in ("firefox", "webkit"):
+        return [preferred]
     return ["msedge", "chrome", "chromium"]
 
 
@@ -323,25 +331,70 @@ def _mark_browser(channel):
         pass
 
 
-def launch_browser(pw, headless, extra_args=None, browser_channel="msedge"):
-    """按 --browser-channel 排好候选链逐个试 launch；全失败才报错（错误里带每一条原因）"""
+def _require_executable(path):
+    """--browser-executable 给了就必须真的存在：不存在直接报错，绝不静默改回 msedge"""
+    if not path or not str(path).strip():
+        return None
+    path = os.path.expanduser(os.path.expandvars(str(path).strip()))
+    if not os.path.isfile(path):
+        raise RuntimeError("指定的浏览器不存在：{}".format(path))
+    return path
+
+
+def _engine(pw, channel):
+    """channel → (playwright 的浏览器类型对象, launch 时要多带的参数)
+    Chromium 家族用 pw.chromium（msedge/chrome 带 channel）；firefox / webkit 各自的内核"""
+    if channel == "firefox":
+        return pw.firefox, {}
+    if channel == "webkit":
+        return pw.webkit, {}
+    if channel in CHROMIUM_FAMILY and channel != "chromium":
+        return pw.chromium, {"channel": channel}
+    return pw.chromium, {}
+
+
+def _launch_error(chain, errors):
+    """全链条都失败时的报错；单内核（firefox/webkit）给一句能直接照抄的安装命令"""
+    detail = " | ".join(errors)
+    if len(chain) == 1 and chain[0] in ("firefox", "webkit"):
+        return "无法启动 {}（Playwright 未安装该浏览器内核）：先运行 npx playwright install {}｜{}".format(
+            chain[0], chain[0], detail)
+    return "无法启动浏览器（候选链 {}，已逐个试过）：{}".format(" / ".join(chain), detail)
+
+
+def launch_browser(pw, headless, extra_args=None, browser_channel="msedge", browser_executable=None):
+    """按 --browser-channel 排好候选链逐个试 launch；全失败才报错（错误里带每一条原因）
+    给了 browser_executable（用户自选浏览器）就直接用它、不走候选链"""
     errors = []
     if extra_args:
         extra = list(extra_args)
     else:
         extra = ["--autoplay-policy=no-user-gesture-required"] if headless else ["--start-maximized"]
+    custom = _require_executable(browser_executable)
+    if custom:
+        # executable_path 与 channel 互斥；自选浏览器默认按 Chromium 家族处理
+        try:
+            browser = pw.chromium.launch(headless=headless, executable_path=custom, args=list(extra))
+        except Exception as exc:
+            raise RuntimeError("无法用指定的浏览器启动（{}）：{}".format(custom, _brief(exc, 160)))
+        _mark_browser("custom({})".format(os.path.basename(custom)))
+        return browser
     chain = browser_candidates(browser_channel)
     for channel in chain:
-        kwargs = {} if channel == "chromium" else {"channel": channel}
+        engine, extra_kwargs = _engine(pw, channel)
+        kwargs = dict(extra_kwargs)
+        kwargs["headless"] = headless
+        if channel in CHROMIUM_FAMILY:
+            # --autoplay-policy / --start-maximized 是 Chromium 系开关，firefox/webkit 传了起不来
+            kwargs["args"] = list(extra)
         try:
-            browser = pw.chromium.launch(headless=headless, args=list(extra), **kwargs)
+            browser = engine.launch(**kwargs)
         except Exception as exc:
             errors.append("{}: {}".format(channel, _brief(exc, 160)))
             continue
         _mark_browser(channel)
         return browser
-    raise RuntimeError("无法启动浏览器（候选链 {}，已逐个试过）：{}".format(
-        " / ".join(chain), " | ".join(errors)))
+    raise RuntimeError(_launch_error(chain, errors))
 
 
 def probe_page(page):
@@ -460,7 +513,8 @@ def capture_qr(page, qr_path):
 def run_window(args, state_dir):
     with playwright_context() as pw:
         browser, ctx, page = open_session(pw, headless=False,
-                                          browser_channel=args.browser_channel)
+                                          browser_channel=args.browser_channel,
+                                          browser_executable=args.browser_executable)
         try:
             log("[1/4] 窗口已打开：请在窗口里点「登录」并扫码/完成验证")
             write_state(state_dir, "waiting", "窗口已打开，请扫码/登录", mode="window")
@@ -504,20 +558,24 @@ def run_window(args, state_dir):
                 pass
 
 
-def open_qr_session(pw, state_dir, browser_channel="msedge"):
+def open_qr_session(pw, state_dir, browser_channel="msedge", browser_executable=None):
     """qr 模式起会话：真窗口 + 挪到屏幕外（headless 会撞验证码）；
     这条起不来才退回 headless=True，并在 state.json 里注明。返回 (browser, ctx, page, note)"""
+    # 自选浏览器路径不存在就别指望退回 headless 能救回来，直接报错
+    _require_executable(browser_executable)
     try:
         browser, ctx, page = open_session(pw, headless=False,
                                           extra_args=list(QR_LAUNCH_ARGS),
                                           viewport=dict(QR_VIEWPORT),
-                                          browser_channel=browser_channel)
+                                          browser_channel=browser_channel,
+                                          browser_executable=browser_executable)
         return browser, ctx, page, "后台真窗口（已挪到屏幕外）"
     except Exception as exc:
         log("真窗口起不来（{}），退回 headless".format(_brief(exc, 200)))
         write_state(state_dir, "waiting", QR_HEADLESS_NOTE + "，正在启动浏览器…", mode="qr")
         browser, ctx, page = open_session(pw, headless=True, viewport=dict(QR_VIEWPORT),
-                                          browser_channel=browser_channel)
+                                          browser_channel=browser_channel,
+                                          browser_executable=browser_executable)
         return browser, ctx, page, QR_HEADLESS_NOTE
 
 
@@ -525,7 +583,8 @@ def run_qr(args, state_dir):
     qr_path = os.path.join(state_dir, QR_NAME)
     write_state(state_dir, "waiting", "正在启动浏览器…", mode="qr")
     with playwright_context() as pw:
-        browser, ctx, page, note = open_qr_session(pw, state_dir, args.browser_channel)
+        browser, ctx, page, note = open_qr_session(pw, state_dir, args.browser_channel,
+                                                   args.browser_executable)
         try:
             log("[1/5] 后台浏览器已就绪（{}），点开登录面板".format(note))
             time.sleep(3)
@@ -607,8 +666,12 @@ def build_parser():
                     help="window=前台可见窗口人工扫码（默认）；qr=后台出二维码图给设置页")
     ap.add_argument("--browser-channel", dest="browser_channel",
                     choices=list(BROWSER_CHANNELS), default="msedge",
-                    help="优先用哪个浏览器，默认 msedge（msedge→chrome→内置chromium；"
-                         "选 chromium 就只用内置，不再回退）")
+                    help="优先用哪个浏览器内核，默认 msedge（msedge→chrome→内置chromium，"
+                         "Chromium 家族之间互相回退；firefox / webkit 是 Playwright 自编译内核，"
+                         "需先 npx playwright install firefox|webkit，不装就报错、不回退）")
+    ap.add_argument("--browser-executable", dest="browser_executable", default=None, metavar="PATH",
+                    help="用指定的浏览器可执行文件启动（覆盖 --browser-channel：按 Chromium 内核处理、"
+                         "不回退；路径不存在直接报错）")
     ap.add_argument("--wait", type=int, default=300, help="最多等多少秒，默认 300")
     ap.add_argument("--out", default=None,
                     help="cookie 输出路径（默认取 $DOUYIN_COOKIE_FILE，再退到 "

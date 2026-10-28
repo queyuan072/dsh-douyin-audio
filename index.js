@@ -11,7 +11,7 @@
 import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { arch, cpus, platform, tmpdir, totalmem } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { ensureDirs, loadCfg, saveCfg, stateDir, log as logLine } from './lib/state.mjs'
@@ -37,8 +37,10 @@ export const Config = !z ? undefined : z.object({
   loginMode: z.string().default('window').extra('volatile', true),
   readHeadless: z.boolean().default(true).extra('volatile', true),
   verifyWait: z.number().default(0).extra('volatile', true),
-  // 浏览器通道：msedge（默认，与历史一致）/ chrome / 内置 chromium（容易被风控）
+  // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
   browserChannel: z.string().default('msedge').extra('volatile', true),
+  // 手动添加的浏览器：JSON 数组字符串 [{"id","label","path"}]（用字符串存，避开旧宿主的数组类型兼容问题）
+  browserExtras: z.string().default('[]').extra('volatile', true),
   // 谷时自动刷（契约见 lib/duty.mjs）：autoRun 默认 false —— 不开启就绝不自己定时跑
   autoRun: z.boolean().default(false).extra('volatile', true),
   dutyWindow: z.string().default('12:00-14:00,18:00-23:59').extra('volatile', true),
@@ -56,8 +58,10 @@ const EXTRA_DEFAULTS = {
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
-  // 浏览器通道：msedge（默认）/ chrome / chromium（内置）
+  // 浏览器通道：msedge（默认）/ chrome / chromium（内置）/ firefox / webkit / 自定义项 id
   browserChannel: 'msedge',
+  // 手动添加的浏览器（JSON 数组字符串）：解析失败一律当 []，绝不抛
+  browserExtras: '[]',
 }
 
 /** 读全配置：插件自己的这两把键在当前层补默认值，其余仍以 config.json / DEFAULTS 为准 */
@@ -66,8 +70,12 @@ const cfgAll = () => ({ ...EXTRA_DEFAULTS, ...loadCfg() })
 // ── 浏览器通道（--browser-channel）──────────────────────────────────────────
 //   只给三个会起浏览器的脚本用：douyin_scroller.py / douyin_read.py / douyin_login.py。
 //   transcribe_douyin.py 不起浏览器，别给它传。
-/** 三个合法取值；其余一律按 msedge 处理（与 lib/state.mjs 的 DEFAULTS 一致） */
-export const BROWSER_CHANNELS = ['msedge', 'chrome', 'chromium']
+/** 五个合法取值；其余一律按 msedge 处理（与 lib/state.mjs 的 DEFAULTS 一致）
+ *  候选链：msedge → [msedge, chrome, chromium]；chrome → [chrome, msedge, chromium]；chromium → [chromium]
+ *          firefox → [firefox]；webkit → [webkit]
+ *  说明：Chromium 系（msedge / chrome / chromium）同一个引擎家族，指纹相近，可互相回退；
+ *        firefox / webkit 是不同引擎，静默回退会让人以为在测 Firefox 其实跑的是 Edge —— 由脚本直接报错。 */
+export const BROWSER_CHANNELS = ['msedge', 'chrome', 'chromium', 'firefox', 'webkit']
 
 /** 配置里的 browserChannel 规整成合法值；空 / 未知 → 'msedge'（默认行为不变） */
 export function browserChannelOf(cfg) {
@@ -75,9 +83,198 @@ export function browserChannelOf(cfg) {
   return BROWSER_CHANNELS.includes(v) ? v : 'msedge'
 }
 
-/** 拼给脚本的两个 argv 片段：['--browser-channel', 'msedge'|'chrome'|'chromium'] */
+/** 配置 → 真正下发给脚本的浏览器参数：{ argv, label, note }
+ *    已知内核（五个）        → ['--browser-channel', <值>]
+ *    自定义项且路径在        → ['--browser-executable', <该路径>]
+ *    自定义项找不到 / 路径不在 → []（一个参数都不传，脚本走自己的默认 msedge 候选链）+ note 说明原因
+ *  ⚠️ 自定义项绝不静默变成 Edge 还不吭声：argv 空着也会带一句 note，douyin_status 的 browserNote 就是它 */
+export function resolveBrowser(cfg) {
+  const raw = String((cfg && cfg.browserChannel) || '').trim()
+  const low = raw.toLowerCase()
+  // ① 空 / 已知内核 → --browser-channel
+  if (!raw || BROWSER_CHANNELS.includes(low)) {
+    const v = browserChannelOf(cfg)
+    return { argv: ['--browser-channel', v], label: v }
+  }
+  // ② 值本身就是 exe 路径（快捷方式扫出来的项就是这么存的）→ --browser-executable
+  //    也能认出 browserExtras 里的 id
+  const extras = parseBrowserExtras(cfg && cfg.browserExtras)
+  const hit = extras.find((e) => e.id === low) || null
+  const target = hit ? hit.path : (/\.exe$/i.test(raw) || /[\\/]/.test(raw) ? raw : null)
+  if (!target) {
+    return { argv: [], label: raw, note: '浏览器通道 ' + raw + ' 既不是已知内核、也不在 browserExtras 里 —— 不传浏览器参数（脚本按默认 msedge 候选链走）' }
+  }
+  let ok = false
+  try { ok = existsSync(target) } catch { ok = false }
+  const label = 'custom(' + basename(target) + ')'
+  if (!ok) return { argv: [], label, note: '浏览器 ' + raw + ' 的可执行文件路径不存在：' + target + ' —— 不传浏览器参数' }
+  return { argv: ['--browser-executable', target], label }
+}
+
+/** 拼给脚本的 argv 片段：内核走 --browser-channel，自定义项走 --browser-executable（见 resolveBrowser） */
 export function browserArgv(cfg) {
-  return ['--browser-channel', browserChannelOf(cfg)]
+  return resolveBrowser(cfg).argv
+}
+
+// ── 各内核可用性探测（douyin_status 的 browsers 字段；设置页按它置灰按钮）──────
+//   全部 try/catch：探测失败就当没装，绝不把 douyin_status 弄挂。
+/** msedge / chrome：按常见安装路径探测（Program Files / Program Files(x86) / LOCALAPPDATA），命中就返回该 exe 路径 */
+function findChromiumApp(exe) {
+  try {
+    const sub = exe === 'msedge.exe'
+      ? ['Microsoft', 'Edge', 'Application', exe]
+      : ['Google', 'Chrome', 'Application', exe]
+    const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]
+    for (const r of roots) {
+      if (!r) continue
+      const full = join(r, ...sub)
+      if (existsSync(full)) return full
+    }
+    return null
+  } catch { return null }
+}
+
+/** chromium / firefox / webkit：看 ms-playwright 目录里有没有对应子目录（chromium-* / firefox-* / webkit-*），命中返回子目录路径 */
+function findPlaywrightBrowser(prefix) {
+  try {
+    const dirs = []
+    if (process.env.PLAYWRIGHT_BROWSERS_PATH) dirs.push(process.env.PLAYWRIGHT_BROWSERS_PATH)
+    if (process.env.LOCALAPPDATA) dirs.push(join(process.env.LOCALAPPDATA, 'ms-playwright'))
+    if (process.env.USERPROFILE) dirs.push(join(process.env.USERPROFILE, 'AppData', 'Local', 'ms-playwright'))
+    for (const d of dirs) {
+      try {
+        if (!existsSync(d)) continue
+        const hit = readdirSync(d).find((n) => String(n).startsWith(prefix + '-'))
+        if (hit) return join(d, hit)
+      } catch { /* 这个目录读不到就看下一个 */ }
+    }
+    return null
+  } catch { return null }
+}
+
+/** browserExtras（JSON 数组字符串）→ [{ id, label, path }]；坏 JSON / 不是数组 / 没 path 的元素一律丢掉，绝不抛 */
+export function parseBrowserExtras(raw) {
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw || '[]') : raw
+    if (!Array.isArray(v)) return []
+    const out = []
+    for (let i = 0; i < v.length; i++) {
+      const x = v[i]
+      if (!x || typeof x !== 'object') continue
+      const path = String(x.path || '').trim()
+      if (!path) continue
+      const id = String(x.id || '').trim() || 'custom-' + (out.length + 1)
+      out.push({ id, label: String(x.label || '').trim() || '自定义 ' + (out.length + 1), path })
+    }
+    return out
+  } catch { return [] }
+}
+
+/** 五个内核 + 手动添加项（extras）装没装：布尔值给老前端兼容，paths 给「名字 + 路径」显示用
+ *  extras 的 exists 用 existsSync 探测，取不到就是 false；shortcuts（快捷方式扫出来的）由 douyin_status 补 */
+export function probeBrowsers(cfg) {
+  const out = {
+    msedge: false, chrome: false, chromium: false, firefox: false, webkit: false,
+    paths: { msedge: null, chrome: null, chromium: null, firefox: null, webkit: null },
+    extras: [], shortcuts: [],
+  }
+  try { out.paths.msedge = findChromiumApp('msedge.exe') } catch { out.paths.msedge = null }
+  try { out.paths.chrome = findChromiumApp('chrome.exe') } catch { out.paths.chrome = null }
+  try { out.paths.chromium = findPlaywrightBrowser('chromium') } catch { out.paths.chromium = null }
+  try { out.paths.firefox = findPlaywrightBrowser('firefox') } catch { out.paths.firefox = null }
+  try { out.paths.webkit = findPlaywrightBrowser('webkit') } catch { out.paths.webkit = null }
+  for (const k of BROWSER_CHANNELS) out[k] = !!out.paths[k]
+  try {
+    out.extras = parseBrowserExtras(cfg && cfg.browserExtras).map((e) => {
+      let exists = false
+      try { exists = existsSync(e.path) } catch { exists = false }
+      return { id: e.id, label: e.label, path: e.path, exists }
+    })
+  } catch { out.extras = [] }
+  return out
+}
+
+// ── 开始菜单 / 桌面快捷方式里找浏览器（.lnk 交给 PowerShell 解析，自己不碰 LNK 二进制）──
+//   结果按进程缓存：同一次运行只扫一次，用户点【扫描已安装的浏览器】时带 scan:true 才重扫。
+/** 文件名（小写、去 .exe）命中即认为是浏览器 —— 别把 QQ / 微信塞进列表 */
+export const BROWSER_EXE_NAMES = ['msedge', 'chrome', 'firefox', 'brave', 'opera', 'vivaldi', 'chromium',
+  '360se', '360chrome', 'qqbrowser', 'sogoupv', 'ucbrowser']
+
+let lnkScanCache = null
+
+/** 用 PowerShell 一次性解析快捷方式目标：返回 [{ name, path }]；超时 8 秒，失败一律当没扫到（绝不抛） */
+function scanLnkTargets() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve([])
+    const ps = [
+      '$sh = New-Object -ComObject WScript.Shell',
+      '$dirs = @([IO.Path]::Combine($env:ProgramData, "Microsoft", "Windows", "Start Menu", "Programs"), [IO.Path]::Combine($env:APPDATA, "Microsoft", "Windows", "Start Menu", "Programs"), [IO.Path]::Combine($env:USERPROFILE, "Desktop"), [IO.Path]::Combine($env:PUBLIC, "Desktop"))',
+      'Get-ChildItem -Path $dirs -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object { $t = ""; try { $t = $sh.CreateShortcut($_.FullName).TargetPath } catch { $t = "" }; if ($t) { $t } }',
+    ].join('; ')
+    let child
+    try {
+      child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch { return resolve([]) }
+    let out = ''
+    let settled = false
+    const done = (v) => { if (!settled) { settled = true; resolve(v) } }
+    try { child.stdout.on('data', (d) => { out += d }) } catch { return done([]) }
+    child.on('error', () => done([]))
+    child.on('close', () => {
+      const rows = []
+      for (const line of String(out).split(/\r?\n/)) {
+        const path = line.trim()
+        if (path && /\.exe$/i.test(path)) rows.push({ name: exeBaseName(path), path })
+      }
+      done(rows)
+    })
+    setTimeout(() => { try { child.kill() } catch {} ; done([]) }, 8000)
+  })
+}
+
+/** exe 路径 → 文件名（小写去 .exe）：既用来过名单，也当显示名 */
+function exeBaseName(p) {
+  const file = String(p).split(/[\\/]/).pop() || ''
+  return file.toLowerCase().replace(/\.exe$/, '')
+}
+
+/** 快捷方式 → 浏览器列表：按名单过滤、按路径去重（同一条只出现一次）；已知安装路径命中的由 douyin_status 再剔一次 */
+/** 快捷方式原始结果 → 浏览器列表：按 exe 名单过滤（QQ / 微信之类丢掉）、按路径去重 */
+export function shortcutBrowsers(rows) {
+  const seen = new Set()
+  const out = []
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r || !r.path) continue
+    const name = exeBaseName(r.path)
+    if (!BROWSER_EXE_NAMES.includes(name)) continue
+    const key = String(r.path).toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ name: name.charAt(0).toUpperCase() + name.slice(1), path: String(r.path) })
+  }
+  return out
+}
+
+/** 去掉「已知安装路径已经命中」的那些：同一条浏览器只出现一次（已知安装路径优先） */
+export function mergeShortcutList(found, paths) {
+  const seen = new Set(Object.values(paths || {}).filter(Boolean).map((p) => String(p).toLowerCase()))
+  const out = []
+  for (const s of Array.isArray(found) ? found : []) {
+    if (!s || !s.path) continue
+    const key = String(s.path).toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(s)
+  }
+  return out
+}
+
+export async function scanShortcuts(force) {
+  if (!force && lnkScanCache) return lnkScanCache
+  let rows = []
+  try { rows = await scanLnkTargets() } catch { rows = [] }
+  lnkScanCache = shortcutBrowsers(rows)
+  return lnkScanCache
 }
 
 const textOutput = {
@@ -355,30 +552,42 @@ export function apply(ctx, config = {}) {
     const base = cfgAll()
     const over = {}
     for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait',
-      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel']) {
+      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
       if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') over[k] = v
     }
     return { ...base, ...over }
   }
-  // ── --browser-channel 下发 ─────────────────────────────────────────
-  // 旧版脚本还没有这个参数（argparse 会 unrecognized arguments 直接退出码 2），
-  // 所以先问一次 `--help`：认不出来就不带，行为与升级前完全一致。
+  // ── 浏览器参数下发（--browser-channel / --browser-executable）────────────
+  // 旧版脚本可能一个都不认（argparse 会 unrecognized arguments 直接退出码 2），
+  // 所以先问一次 --help，两个参数分别判断、互不牵连。
   // 每个 (python, 脚本) 每进程只问一次。
   const browserFlagCache = new Map()
-  async function browserArgvFor(python, script, cfg) {
+  async function browserFlags(python, script) {
     const key = python + '|' + script
-    let accepts = browserFlagCache.get(key)
-    if (accepts === undefined) {
+    let acc = browserFlagCache.get(key)
+    if (acc === undefined) {
       const r = await runPython(python, script, ['--help'], { timeoutSec: 30, log })
       const text = String(r.stdout || '') + String(r.stderr || '')
       // --help 自己都跑不起来（依赖缺 / 脚本坏）就当它认：真跑时的报错比这里更说明问题
-      accepts = r.ok === true ? text.includes('--browser-channel') : true
-      browserFlagCache.set(key, accepts)
-      if (!accepts) log('脚本不认 --browser-channel（旧版），本次不带该参数: ' + script)
+      acc = r.ok === true
+        ? { channel: text.includes('--browser-channel'), exe: text.includes('--browser-executable') }
+        : { channel: true, exe: true }
+      browserFlagCache.set(key, acc)
+      if (!acc.channel && !acc.exe) log('脚本不认浏览器参数（旧版），本次不带: ' + script)
+      else if (!acc.exe) log('脚本不认 --browser-executable（旧版），自定义浏览器这条会落空: ' + script)
     }
-    return accepts ? browserArgv(cfg) : []
+    return acc
+  }
+  /** 按脚本真正认得的参数拼 argv 片段（自定义项走 --browser-executable，与内核参数互不牵连） */
+  async function browserArgvFor(python, script, cfg) {
+    const acc = await browserFlags(python, script)
+    const argv = browserArgv(cfg)
+    if (!argv.length) return []
+    if (argv[0] === '--browser-channel') return acc.channel ? argv : []
+    if (argv[0] === '--browser-executable') return acc.exe ? argv : []
+    return []
   }
 
   // ── 能力等级（四档闸门）──────────────────────────────────
@@ -505,9 +714,9 @@ export function apply(ctx, config = {}) {
   // ── 3. 自检 ───────────────────────────────────────────────
   tool({
     name: 'douyin_status',
-    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用。',
-    parameters: {},
-    async execute() {
+    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。',
+    parameters: { scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' } },
+    async execute(args) {
       const cfg = merged()
       const pyScroll = await findPython(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
       const pyAsr = await findPython(log, 'sherpa_onnx', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
@@ -517,6 +726,11 @@ export function apply(ctx, config = {}) {
       const sdir = stateDir()
       const vdir = workVideos()
       const videos = existsSync(vdir) ? readdirSync(vdir).filter((f) => /\.mp4$/i.test(f)) : []
+      const browsers = probeBrowsers(cfg)
+      // 快捷方式扫出来的浏览器：按路径去重，且剔掉「已知安装路径已经命中」的那些（同一条只出现一次）
+      try {
+        browsers.shortcuts = mergeShortcutList(await scanShortcuts(!!(args && args.scan)), browsers.paths)
+      } catch { browsers.shortcuts = [] }
       return {
         ok: !!(pyScroll && pyAsr && ff && existsSync(modelDir)),
         version: pluginVersion(),
@@ -526,6 +740,10 @@ export function apply(ctx, config = {}) {
         modelDir: { path: modelDir, exists: existsSync(modelDir) },
         cookie: { path: cookie, exists: existsSync(cookie) },
         scripts: { scroll: existsSync(SCRIPT_SCROLL), transcribe: existsSync(SCRIPT_TRANSCRIBE), read: existsSync(SCRIPT_READ) },
+        // 五个内核 + 手动添加项 + 快捷方式发现的浏览器（设置页按它列可选内核）
+        browsers,
+        // 当前 browserChannel 的解析说明：自定义项路径不在 / id 不存在时在这里说清（正常情况是空串）
+        browserNote: resolveBrowser(cfg).note || '',
         stateDir: sdir,
         workDir: workRoot(),
         videos,
@@ -1042,7 +1260,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置，容易被风控）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

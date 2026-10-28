@@ -124,16 +124,22 @@ UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
 
 # 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
-BROWSER_CHANNELS = ("msedge", "chrome", "chromium")
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium", "firefox", "webkit")
+# Chromium 家族：只有它们才带 channel 参数、也只有它们之间允许互相回退
+CHROMIUM_FAMILY = ("msedge", "chrome", "chromium")
 
 
 def browser_candidates(preferred):
-    """按用户选择把候选链排好；chromium = 明确要裸浏览器，不再回退（免得以为在测 Chrome）"""
+    """按用户选择把候选链排好。
+    Chromium 家族之间互相回退（同一引擎，指纹相近）；firefox / webkit 是不同引擎，
+    不装就直接报错，绝不静默退到别的内核（否则你以为在测 firefox，其实跑的是 Edge）"""
     preferred = preferred if preferred in BROWSER_CHANNELS else "msedge"
-    if preferred == "chromium":
-        return ["chromium"]
     if preferred == "chrome":
         return ["chrome", "msedge", "chromium"]
+    if preferred == "chromium":
+        return ["chromium"]
+    if preferred in ("firefox", "webkit"):
+        return [preferred]
     return ["msedge", "chrome", "chromium"]
 
 
@@ -146,29 +152,75 @@ def _brief(exc, limit=200):
     return text[:limit] or exc.__class__.__name__
 
 
-def launch_browser(p, preferred, headless, extra_args=None):
-    """逐个试候选链里的 channel，全失败才报错（错误里带每一条的原因）。返回 (browser, channel)"""
+def _require_executable(path):
+    """--browser-executable 给了就必须真的存在：不存在直接报错，绝不静默改回 msedge"""
+    if not path or not str(path).strip():
+        return None
+    path = os.path.expanduser(os.path.expandvars(str(path).strip()))
+    if not os.path.isfile(path):
+        raise RuntimeError("指定的浏览器不存在：{}".format(path))
+    return path
+
+
+def _engine(pw, channel):
+    """channel → (playwright 的浏览器类型对象, launch 时要多带的参数)
+    Chromium 家族用 pw.chromium（msedge/chrome 带 channel）；firefox / webkit 各自的内核"""
+    if channel == "firefox":
+        return pw.firefox, {}
+    if channel == "webkit":
+        return pw.webkit, {}
+    if channel in CHROMIUM_FAMILY and channel != "chromium":
+        return pw.chromium, {"channel": channel}
+    return pw.chromium, {}
+
+
+def _launch_error(chain, errors):
+    """全链条都失败时的报错；单内核（firefox/webkit）给一句能直接照抄的安装命令"""
+    detail = " | ".join(errors)
+    if len(chain) == 1 and chain[0] in ("firefox", "webkit"):
+        return "无法启动 {}（Playwright 未安装该浏览器内核）：先运行 npx playwright install {}｜{}".format(
+            chain[0], chain[0], detail)
+    return "无法启动浏览器（候选链 {}）：{}".format(" / ".join(chain), detail)
+
+
+def launch_browser(p, preferred, headless, extra_args=None, executable=None):
+    """逐个试候选链里的内核，全失败才报错（错误里带每一条的原因）。返回 (browser, channel)
+    给了 executable（用户自选浏览器）就直接用它、不走候选链"""
+    custom = _require_executable(executable)
+    if custom:
+        # executable_path 与 channel 互斥；自选浏览器默认按 Chromium 家族处理
+        kwargs = {"headless": headless, "executable_path": custom,
+                  "args": list(extra_args) if extra_args else extra_args}
+        try:
+            browser = p.chromium.launch(**kwargs)
+        except Exception as exc:
+            raise RuntimeError("无法用指定的浏览器启动（{}）：{}".format(custom, _brief(exc)))
+        sys.stderr.write("[browser] 使用 custom({})\n".format(os.path.basename(custom)))
+        sys.stderr.flush()
+        return browser, "custom({})".format(os.path.basename(custom))
     chain = browser_candidates(preferred)
     errors = []
     for channel in chain:
-        kwargs = {"headless": headless, "args": list(extra_args) if extra_args else extra_args}
-        if channel != "chromium":
-            kwargs["channel"] = channel
+        engine, extra_kwargs = _engine(p, channel)
+        kwargs = dict(extra_kwargs)
+        kwargs["headless"] = headless
+        if channel in CHROMIUM_FAMILY:
+            # --autoplay-policy / --window-position 是 Chromium 系开关，firefox/webkit 传了起不来
+            kwargs["args"] = list(extra_args) if extra_args else extra_args
         try:
-            browser = p.chromium.launch(**kwargs)
+            browser = engine.launch(**kwargs)
         except Exception as exc:
             errors.append("{}: {}".format(channel, _brief(exc)))
             continue
         sys.stderr.write("[browser] 使用 {}\n".format(channel))
         sys.stderr.flush()
         return browser, channel
-    raise RuntimeError("无法启动浏览器（候选链 {}）：{}".format(
-        " / ".join(chain), " | ".join(errors)))
+    raise RuntimeError(_launch_error(chain, errors))
 
 
 def open_context(browser, headless, channel):
-    """实际 channel 决定要不要覆盖 UA：msedge 保持原样（真实 Edge UA）；
-    chrome/chromium 不覆盖，让浏览器用自己的真 UA（否则 UA 与实际浏览器对不上）"""
+    """实际 channel 决定要不要覆盖 UA：只有 msedge 覆盖（伪装成 Edge）；
+    chrome/chromium/firefox/webkit 一律用浏览器自己的真 UA（否则 UA 与实际内核对不上）"""
     return browser.new_context(
         viewport={"width": 1600, "height": 900},
         locale="zh-CN",
@@ -211,8 +263,12 @@ def parse_args():
                     help="截图/视频/manifest 的产物目录（默认取环境变量 DSH_DOUYIN_TMP，再退回 <系统临时目录>/douyin）")
     ap.add_argument("--browser-channel", dest="browser_channel",
                     choices=list(BROWSER_CHANNELS), default="msedge",
-                    help="优先用哪个浏览器，默认 msedge（msedge→chrome→内置chromium；"
-                         "选 chromium 就只用内置，不再回退）")
+                    help="优先用哪个浏览器内核，默认 msedge（msedge→chrome→内置chromium，"
+                         "Chromium 家族之间互相回退；firefox / webkit 是 Playwright 自编译内核，"
+                         "需先 npx playwright install firefox|webkit，不装就报错、不回退）")
+    ap.add_argument("--browser-executable", dest="browser_executable", default=None, metavar="PATH",
+                    help="用指定的浏览器可执行文件启动（覆盖 --browser-channel：按 Chromium 内核处理、"
+                         "不回退；路径不存在直接报错）")
     args = ap.parse_args()
     args.count = max(1, min(args.count, 600))
     args.delay = max(0.5, min(args.delay, 30.0))
@@ -630,6 +686,7 @@ def main():
             browser, browser_channel = launch_browser(
                 p, args.browser_channel, args.headless,
                 extra_args=["--autoplay-policy=no-user-gesture-required"] if args.headless else None,
+                executable=getattr(args, "browser_executable", None),
             )
             ctx = open_context(browser, args.headless, browser_channel)
             page = ctx.new_page()

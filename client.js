@@ -83,6 +83,10 @@ window.__ModuleLoader__.load({
 [data-dy-btn]:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.24));}
 [data-dy-btn][data-primary]{background:#3b82f6;border-color:#3b82f6;color:#fff;}
 [data-dy-btn][disabled]{opacity:.5;cursor:default;}
+[data-dy-btn][data-missing]{border-color:rgba(245,158,11,.55);color:#f59e0b;}
+[data-dy-sub]{display:block;font-size:10px;line-height:12px;opacity:.6;font-weight:400;}
+[data-dy-opt]{display:flex;align-items:center;gap:4px;}
+[data-dy-del]{padding:7px 8px;line-height:1;}
 [data-dy-msg]{font-size:11px;line-height:16px;padding:7px 9px;border-radius:8px;word-break:break-all;
   background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.12));color:var(--dsw-alias-label-tertiary,#9aa0a6);}
 [data-dy-msg][data-warn]{color:#f59e0b;}
@@ -245,6 +249,12 @@ window.__ModuleLoader__.load({
       const [histBusy, setHistBusy] = React.useState(false)
       const [dutyRunning, setDutyRunning] = React.useState(false)  // 「现在刷一轮」跑着的时候禁用按钮
       const loginRef = React.useRef(null)               // 「登录」区块：点登录徽章要滚到这里
+      const [scanBusy, setScanBusy] = React.useState(false)   // 「扫描已安装的浏览器」跑着的时候
+      const [scanMsg, setScanMsg] = React.useState('')        // 扫描结果一句话（检测到 Edge、Chrome）
+      const [extraOpen, setExtraOpen] = React.useState(false) // 「手动添加」的内联输入区开着没
+      const [extraPath, setExtraPath] = React.useState('')    // 手动添加：浏览器可执行文件路径
+      const [extraName, setExtraName] = React.useState('')    // 手动添加：可选名称
+      const [deletedExtras, setDeletedExtras] = React.useState({})   // 刚删掉的自定义项（宿主那份 status 还是旧的，本地先藏起来）
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
 
@@ -341,27 +351,220 @@ window.__ModuleLoader__.load({
         finally { setBusy('') }
       }
 
-      /* ── 浏览器内核 browserChannel：三个会起浏览器的脚本（scroll / read / login）用哪个 ──
-             两版布局共用这一份按钮 + 说明，classic 与 tabs 只有外面那层 h('div',{data-dy-sec}) 不同。 */
-      const BROWSER_CHANNELS = [
-        { key: 'msedge', label: 'Edge（推荐）', note: '用你装的 Microsoft Edge —— 实测最稳，抖音风控对真浏览器宽松' },
-        { key: 'chrome', label: 'Chrome', note: '用你装的 Google Chrome —— Edge 出问题时的替代方案' },
-        { key: 'chromium', label: '内置 Chromium', note: '用 Playwright 自带的那个，没有真实用户的浏览痕迹 —— 最容易撞验证码，只建议排查问题时用' },
+      /* ── 浏览器内核 browserChannel ─────────────────────────────────────────
+            三个会起浏览器的脚本（scroll / read / login）用它。
+            ⭐ 列表里只放真能用的：已知安装路径命中的内核 + 快捷方式扫出来的 + 手动添加的 + 当前选中值。
+               每项都标来源：已知安装路径（名字 + 路径）/（从快捷方式发现）/（手动添加，带 × 可删）。
+               classic 与 tabs 只有外面那层 h('div',{data-dy-sec}) 不同，内容共用这一份。 */
+      const KERNELS = [
+        { key: 'msedge', label: 'Edge', install: 'npx playwright install msedge', sub: '系统安装的 Microsoft Edge（最稳）' },
+        { key: 'chrome', label: 'Chrome', install: 'npx playwright install chrome', sub: '系统安装的 Google Chrome' },
+        { key: 'chromium', label: '内置 Chromium', install: 'npx playwright install chromium', sub: 'Playwright 自带的 chromium（容易被风控）' },
+        { key: 'firefox', label: 'Firefox', install: 'npx playwright install firefox', sub: 'Playwright 的 firefox（指纹弱于真实 Edge）' },
+        { key: 'webkit', label: 'WebKit', install: 'npx playwright install webkit', sub: 'Playwright 的 webkit（最容易撞验证码）' },
       ]
-      /** 配置值 → 三选一（缺键 / 旧宿主 / 未知值都按 msedge，与宿主的默认值一致） */
-      const channelOf = (c) => (c && (c.browserChannel === 'chrome' || c.browserChannel === 'chromium') ? c.browserChannel : 'msedge')
+      const kernelOf = (k) => KERNELS.find((x) => x.key === String(k || '').trim().toLowerCase()) || null
+      /** 配置值原样保留：五个已知内核 / 自定义项 id（custom-N）/ 一个 exe 路径（快捷方式项）；空 / 其它未知值按 msedge */
+      const channelOf = (c) => {
+        const v = String((c && c.browserChannel) || '').trim()
+        if (!v) return 'msedge'
+        if (kernelOf(v)) return v.toLowerCase()
+        if (/^custom-/i.test(v) || /\.exe$/i.test(v) || /[\\/]/.test(v)) return v
+        return 'msedge'
+      }
+      /** douyin_status 的 browsers：没拿到（或形状不对）就 null —— 不知道 ≠ 没装 */
+      const browsersOf = (s) => (s && s.browsers && typeof s.browsers === 'object' && !Array.isArray(s.browsers) ? s.browsers : null)
+      const browsersNow = browsersOf(st)
+      const pathsNow = () => (browsersNow && browsersNow.paths && typeof browsersNow.paths === 'object' ? browsersNow.paths : {})
+      const shortcutsNow = () => (browsersNow && Array.isArray(browsersNow.shortcuts)
+        ? browsersNow.shortcuts.filter((x) => x && x.path && x.name) : [])
+      /** cfg.browserExtras 本地解析：手动添加完不用等下一次扫描就能在列表里看到 */
+      const extrasFromCfg = () => {
+        try {
+          const v = JSON.parse(String((cfg && cfg.browserExtras) || '[]'))
+          if (!Array.isArray(v)) return []
+          return v.filter((x) => x && typeof x === 'object' && String(x.path || '').trim())
+            .map((x, i) => ({ id: String(x.id || '') || 'custom-' + (i + 1), label: String(x.label || '') || '自定义 ' + (i + 1), path: String(x.path).trim(), exists: null }))
+        } catch { return [] }
+      }
+      /** 手动添加项：本地配置打底，扫描结果里的 exists 覆盖上去 */
+      const extrasNow = () => {
+        const map = new Map()
+        for (const e of extrasFromCfg()) map.set(e.id, e)
+        for (const e of (browsersNow && Array.isArray(browsersNow.extras) ? browsersNow.extras : [])) {
+          if (!e || !e.id) continue
+          map.set(e.id, { ...(map.get(e.id) || {}), ...e })
+        }
+        return [...map.values()].filter((e) => !deletedExtras[e.id])
+      }
+      /** 这个已知内核装没装（paths 优先，老宿主只有布尔值也认） */
+      const kernelPath = (k) => {
+        const p = pathsNow()[k]
+        return p ? String(p) : ''
+      }
+      /** 可选列表：[{ key, label, sub, source, missing, id? }]；key 就是 patch 进 browserChannel 的值 */
+      const channelOptions = () => {
+        const cur = channelOf(cfg)
+        const list = []
+        const push = (o) => { if (!list.some((x) => String(x.key).toLowerCase() === String(o.key).toLowerCase())) list.push(o) }
+        for (const k of KERNELS) {
+          const p = kernelPath(k.key)
+          if (p) push({ key: k.key, label: k.label, sub: p, source: 'known', missing: false })
+        }
+        for (const s of shortcutsNow()) push({ key: String(s.path), label: String(s.name), sub: String(s.path) + '（从快捷方式发现）', source: 'shortcut', missing: false })
+        for (const e of extrasNow()) {
+          if (e.exists === false) continue
+          push({ key: e.id, label: e.label, sub: String(e.path) + '（手动添加）', source: 'extra', missing: false, id: e.id })
+        }
+        if (!list.some((x) => x.key === cur)) {
+          // 当前选中值也得出现（哪怕探测不到）—— 否则配置了 firefox 的人在界面里找不到自己选的那个
+          const k = kernelOf(cur)
+          const e = extrasNow().find((x) => x.id === cur)
+          const s = shortcutsNow().find((x) => String(x.path).toLowerCase() === String(cur).toLowerCase())
+          list.push({
+            key: cur,
+            label: k ? k.label : (e ? e.label : (s ? String(s.name) : cur)),
+            sub: k ? k.sub : String(e ? e.path : (s ? s.path : cur)),
+            source: k ? 'known' : (e ? 'extra' : 'shortcut'),
+            missing: true,
+            id: e ? e.id : undefined,
+          })
+        }
+        return list
+      }
+      /** 当前选中项探测得到吗 */
+      const curMissing = () => {
+        const cur = channelOf(cfg)
+        const k = kernelOf(cur)
+        if (k) return !kernelPath(k.key) && !(browsersNow && browsersNow[k.key] === true)
+        const e = extrasNow().find((x) => x.id === cur)
+        if (e) return e.exists === false
+        return false
+      }
+      /** 说明行用：当前选中项的名字 + 路径 + 为什么「不走内核候选链」 */
+      const selectedInfo = () => {
+        const cur = channelOf(cfg)
+        const k = kernelOf(cur)
+        if (k) return { label: k.label, path: kernelPath(k.key), note: '' }
+        const e = extrasNow().find((x) => x.id === cur)
+        if (e) return { label: e.label, path: String(e.path), note: '手动添加的浏览器，不走内核候选链（直接 --browser-executable 起它）' }
+        const s = shortcutsNow().find((x) => String(x.path).toLowerCase() === String(cur).toLowerCase())
+        if (s) return { label: String(s.name), path: String(s.path), note: '从快捷方式发现的浏览器，不走内核候选链（直接 --browser-executable 起它）' }
+        if (cur !== 'msedge') return { label: cur, path: String(cur), note: '手动添加的浏览器，不走内核候选链；这个路径探测不到，实际会报错' }
+        return { label: 'Edge', path: '', note: '' }
+      }
+      const detectedNames = (payload) => {
+        const b = browsersOf(payload)
+        if (!b) return null
+        const names = KERNELS.filter((k) => b[k.key] === true).map((k) => k.label)
+        for (const e of (Array.isArray(b.extras) ? b.extras : [])) if (e && e.exists === true) names.push(e.label)
+        for (const s of (Array.isArray(b.shortcuts) ? b.shortcuts : [])) if (s && s.name) names.push(String(s.name))
+        return names
+      }
+      /** 【扫描已安装的浏览器】= 带 scan:true 再调一次 douyin_status（快捷方式那一步会重扫） */
+      const scanBrowsers = async () => {
+        setScanBusy(true)
+        try {
+          const r = await refreshStatus(true)
+          const names = detectedNames(r)
+          if (names === null) setScanMsg('扫描失败：宿主没回自检结果（' + (stErr || '原因不详') + '）')
+          else if (names.length === 0) setScanMsg('扫描完成：没检测到任何浏览器 —— 先 npx playwright install msedge')
+          else if (names.length === 1) setScanMsg('扫描完成：只检测到 ' + names[0])
+          else setScanMsg('扫描完成：检测到 ' + names.join('、'))
+        } finally { setScanBusy(false) }
+      }
+      /** 【手动添加】存进 browserExtras 并立刻选中：同路径按 id 覆盖，不堆重复项 */
+      const addExtra = async () => {
+        const p = String(extraPath || '').trim()
+        if (!p) { say('手动添加：先填浏览器可执行文件路径（例如 C:\\Program Files\\...\\chrome.exe）', 'warn'); return }
+        const list = extrasFromCfg()
+        const same = list.find((x) => String(x.path).toLowerCase() === p.toLowerCase())
+        let id = same ? same.id : ''
+        if (!id) {
+          const used = new Set(list.map((x) => x.id))
+          let n = 1
+          while (used.has('custom-' + n)) n++
+          id = 'custom-' + n
+        }
+        const label = String(extraName || '').trim() || (same ? same.label : '自定义浏览器 ' + id.replace(/^custom-/, ''))
+        const next = list.filter((x) => x.id !== id).map((x) => ({ id: x.id, label: x.label, path: x.path }))
+        next.push({ id, label, path: p })
+        await patch('browserExtras', JSON.stringify(next), '自定义浏览器')
+        await patch('browserChannel', id, '浏览器内核')
+        setExtraOpen(false); setExtraPath(''); setExtraName('')
+      }
+      /** 删掉一个手动添加项；删的若是当前选中项 → 自动切回 msedge 并提示 */
+      const removeExtra = async (id) => {
+        const next = extrasFromCfg().filter((x) => x.id !== id).map((x) => ({ id: x.id, label: x.label, path: x.path }))
+        const wasCur = channelOf(cfg) === id
+        setDeletedExtras((old) => ({ ...(old || {}), [id]: true }))
+        await patch('browserExtras', JSON.stringify(next), '自定义浏览器')
+        if (wasCur) {
+          await patch('browserChannel', 'msedge', '浏览器内核')
+          say('删掉了当前选中的自定义浏览器，已切回 Edge（msedge）', 'warn')
+        }
+      }
       const browserChannelBody = () => {
         const cur = channelOf(cfg)
-        const picked = BROWSER_CHANNELS.find((x) => x.key === cur) || BROWSER_CHANNELS[0]
+        const opts = channelOptions()
+        const info = selectedInfo()
+        const missing = curMissing()
+        const busyChan = busy === 'browserChannel' || busy === 'browserExtras'
         return [
-          h('div', { 'data-dy-row': '', key: 'channel-row' }, BROWSER_CHANNELS.map((x) => h('button', {
-            key: x.key,
-            'data-dy-btn': '', 'data-dy-channel': x.key,
-            'data-primary': cur === x.key ? '' : undefined,
-            disabled: busy === 'browserChannel',
-            onClick: () => { if (cur !== x.key) patch('browserChannel', x.key, '浏览器内核') },
-          }, x.label))),
-          h('div', { 'data-dy-note': '', key: 'channel-note' }, picked.note),
+          h('div', { 'data-dy-row': '', key: 'channel-row' }, opts.map((opt) => {
+            const btn = h('button', {
+              key: 'b-' + opt.key,
+              'data-dy-btn': '', 'data-dy-channel': opt.key, 'data-dy-source': opt.source,
+              'data-primary': cur === opt.key ? '' : undefined,
+              'data-missing': opt.missing ? '' : undefined,
+              disabled: busyChan,
+              title: opt.sub,
+              onClick: () => { if (cur !== opt.key) patch('browserChannel', opt.key, '浏览器内核') },
+            }, opt.label + (opt.missing ? '（未安装）' : ''), h('span', { 'data-dy-sub': '' }, opt.sub))
+            if (opt.source !== 'extra') return btn
+            return h('div', { 'data-dy-opt': '', key: 'w-' + opt.key },
+              btn,
+              h('button', {
+                'data-dy-btn': '', 'data-dy-del': opt.id || opt.key, disabled: busyChan,
+                title: '从配置里删掉这个自定义浏览器',
+                onClick: () => removeExtra(opt.id || opt.key),
+              }, '×'))
+          })),
+          h('div', { 'data-dy-note': '', 'data-dy-selected': '', key: 'channel-selected' },
+            '当前：' + info.label + (info.path ? '（' + info.path + '）' : '')),
+          info.note ? h('div', { 'data-dy-note': '', 'data-dy-selected-note': '', key: 'channel-selected-note' }, info.note) : null,
+          missing
+            ? h('div', { 'data-dy-hint': '', 'data-dy-cur-missing': '', key: 'channel-missing' },
+              '当前选择的内核探测不到，实际会报错 —— ' + (kernelOf(cur) ? '先运行 ' + kernelOf(cur).install : '检查这个路径还在不在') + '，或换一个内核')
+            : null,
+          h('div', { 'data-dy-row': '', key: 'channel-actions' },
+            h('button', { 'data-dy-btn': '', 'data-dy-channel-action': 'scan', disabled: scanBusy || busyChan, onClick: scanBrowsers },
+              scanBusy ? '扫描中…' : '扫描已安装的浏览器'),
+            h('button', { 'data-dy-btn': '', 'data-dy-channel-action': 'add', disabled: busyChan, onClick: () => setExtraOpen((v) => !v) },
+              extraOpen ? '收起手动添加' : '手动添加')),
+          scanMsg ? h('div', { 'data-dy-msg': '', 'data-dy-scan-msg': '', key: 'channel-scan-msg' }, scanMsg) : null,
+          extraOpen
+            ? h('div', { 'data-dy-sec': '', 'data-dy-extra-form': '', key: 'channel-extra-form' },
+              h('div', { 'data-dy-label': '' }, '浏览器可执行文件路径'),
+              h('input', {
+                'data-dy-input': '', 'data-dy-field': 'extraPath', type: 'text', spellCheck: false,
+                placeholder: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                value: extraPath, onChange: (e) => setExtraPath(e.target.value),
+              }),
+              h('div', { 'data-dy-label': '' }, '名称（可留空）'),
+              h('input', {
+                'data-dy-input': '', 'data-dy-field': 'extraName', type: 'text', spellCheck: false,
+                placeholder: '如「公司装的 Chrome」',
+                value: extraName, onChange: (e) => setExtraName(e.target.value),
+              }),
+              h('div', { 'data-dy-row': '' },
+                h('button', { 'data-dy-btn': '', 'data-primary': '', 'data-dy-field': 'extraSave', disabled: busyChan, onClick: addExtra }, '保存并选中'),
+                h('button', { 'data-dy-btn': '', 'data-dy-field': 'extraCancel', onClick: () => { setExtraOpen(false); setExtraPath(''); setExtraName('') } }, '取消')),
+              h('div', { 'data-dy-note': '' }, '存进配置 browserExtras（JSON），保存后立刻出现在上面的列表里并选中；同路径会覆盖，不会堆重复项'))
+            : null,
+          h('div', { 'data-dy-note': '', key: 'channel-fallback' },
+            '只列真能用的：已知安装路径命中的、开始菜单 / 桌面快捷方式里发现的、手动添加的。'
+            + '没装的（含 firefox / webkit）不会出现在列表里 —— 先 npx playwright install <内核> 再点「扫描已安装的浏览器」，或「手动添加」填路径'),
           h('div', { 'data-dy-note': '', key: 'channel-restart' }, '换浏览器内核后需要重启 DSH 才生效'),
         ]
       }
@@ -385,12 +588,14 @@ window.__ModuleLoader__.load({
       }
 
       /* 顶栏徽章的数据源：走 /run 的 status（跟「自检」是同一个工具，不另开路由） */
-      const refreshStatus = async () => {
+      /** scan=true → 让宿主重扫快捷方式（【扫描已安装的浏览器】按钮）；返回 selfcheck 原始结果 */
+      const refreshStatus = async (scan) => {
         try {
-          const r = await jpost('/run', { action: 'status' })
-          if (isStatusPayload(r)) { setSt(r); setStErr('') }
-          else setStErr((r && (r.error || r.reason)) || '宿主没回状态')
-        } catch (e) { setStErr(errText(e)) }
+          const r = await jpost('/run', { action: 'status', scan: !!scan })
+          if (isStatusPayload(r)) { setSt(r); setStErr(''); return r }
+          setStErr((r && (r.error || r.reason)) || '宿主没回状态')
+          return null
+        } catch (e) { setStErr(errText(e)); return null }
       }
       /* 挂载就把徽章填上，别等用户去点「自检」 */
       React.useEffect(() => { refreshStatus() }, [])

@@ -17,7 +17,10 @@
  *      开回来后放行；tierReact/tierComment=true 时 tierRead 视为生效；基础四工具不受限；
  *      tierNotify=false 时 douyin_notes / douyin_messages 返回 TIER_DISABLED(tier=notify)，
  *      打开后放行（② 通知与 ① 只读互相独立）
- *   g. 浏览器通道 browserChannel：douyin_config 认得这个键，缺省是 msedge（可改 chrome / chromium）
+ *   g. 浏览器通道 browserChannel：douyin_config 认得这个键，缺省是 msedge；五个取值
+ *      msedge / chrome / chromium / firefox / webkit 都认，未知值仍规整成 msedge；
+ *      douyin_status 的 browsers 是五个布尔值 + extras 数组（{id,label,path,exists}），
+ *      给设置页「只列检测到的浏览器」用；browserExtras 是 JSON 数组字符串，坏 JSON 一律当 []
  *   f. 谷时自动刷 douyin_duty：只认一个 action 参数；**没有任何等级闸门**
  *      （五个等级全关时 action=status 也照常返回 ok:true）；没有 duty.json 时 todayScreens=0、
  *      autoRun 默认 false、windows 按默认窗口解析；action=history 返回 items 数组
@@ -319,6 +322,150 @@ const cfgBrowserGet = await callTool('douyin_config', { action: 'get' })
 if (cfgBrowserGet && cfgBrowserGet.ok === true && cfgBrowserGet.config && cfgBrowserGet.config.browserChannel === 'chrome') {
   ok('set browserChannel=chrome 后 loadCfg 读回来是 chrome')
 } else problem('browserChannel 存/读不一致：' + JSON.stringify(cfgBrowserGet && cfgBrowserGet.config && cfgBrowserGet.config.browserChannel))
+writeCfg({})
+
+/* ───────── ⑨-ter 扩展内核：五个取值 + douyin_status.browsers ───────── */
+const FIVE = ['msedge', 'chrome', 'chromium', 'firefox', 'webkit']
+const channels = Array.isArray(mod.BROWSER_CHANNELS) ? mod.BROWSER_CHANNELS : []
+if (channels.length === FIVE.length && FIVE.every((k) => channels.includes(k))) ok('BROWSER_CHANNELS 是五个取值：' + channels.join(' / '))
+else problem('BROWSER_CHANNELS 不是五个取值：' + JSON.stringify(channels))
+
+// 规整：五个值原样返回，未知值仍按 msedge（不认识的通道不能把脚本带偏）
+const normBad = typeof mod.browserChannelOf === 'function' ? mod.browserChannelOf({ browserChannel: 'not-a-channel' }) : null
+if (normBad === 'msedge') ok('browserChannelOf 把未知值规整成 msedge')
+else problem('browserChannelOf 没把未知值规整成 msedge：' + JSON.stringify(normBad))
+const normKept = FIVE.filter((k) => typeof mod.browserChannelOf === 'function' && mod.browserChannelOf({ browserChannel: k }) !== k)
+if (normKept.length === 0) ok('browserChannelOf 原样保留五个合法取值')
+else problem('browserChannelOf 把合法值改掉了：' + JSON.stringify(normKept))
+
+// 新增的两个内核能存能读（旧宿主只认三个，这里就是回归点）
+for (const ch of ['firefox', 'webkit']) {
+  const setR = await callTool('douyin_config', { action: 'set', key: 'browserChannel', value: ch })
+  const getR = await callTool('douyin_config', { action: 'get' })
+  const now = getR && getR.ok === true && getR.config ? getR.config.browserChannel : undefined
+  if (setR && setR.ok === true && now === ch) ok('browserChannel 认得 ' + ch + '（存进去、读回来都是它）')
+  else problem('browserChannel 不认 ' + ch + '：读回来是 ' + JSON.stringify(now))
+}
+writeCfg({})
+
+/* 手动添加的浏览器 browserExtras：JSON 数组字符串（用字符串存，避开旧宿主的数组类型兼容问题） */
+const cfgExtrasDefault = await callTool('douyin_config', { action: 'get' })
+const extrasDflt = cfgExtrasDefault && cfgExtrasDefault.ok === true && cfgExtrasDefault.config ? cfgExtrasDefault.config.browserExtras : undefined
+if (extrasDflt === '[]') ok('douyin_config 认得 browserExtras（默认字符串 []）')
+else problem('browserExtras 的默认值应为字符串 "[]"，现在是 ' + JSON.stringify(extrasDflt))
+
+// 坏 JSON 必须被吞掉（绝不抛），好 JSON 要能解析出 id / label / path
+let badParse = null
+try { badParse = mod.parseBrowserExtras('{不是 JSON') } catch (e) { badParse = 'THREW: ' + e.message }
+if (Array.isArray(badParse) && badParse.length === 0) ok('parseBrowserExtras 把坏 JSON 吞成空数组（不抛）')
+else problem('parseBrowserExtras 遇到坏 JSON 没吞掉：' + JSON.stringify(badParse))
+const goodParse = typeof mod.parseBrowserExtras === 'function'
+  ? mod.parseBrowserExtras(JSON.stringify([{ id: 'custom-1', label: '公司装的 Chrome', path: 'C:/x/chrome.exe' }, { id: 'custom-2', path: '' }]))
+  : null
+if (Array.isArray(goodParse) && goodParse.length === 1 && goodParse[0].id === 'custom-1' && goodParse[0].label === '公司装的 Chrome' && goodParse[0].path === 'C:/x/chrome.exe') {
+  ok('parseBrowserExtras 解析出 id / label / path（没 path 的项被丢掉）')
+} else problem('parseBrowserExtras 解析不对：' + JSON.stringify(goodParse))
+
+const cfgExtrasSet = await callTool('douyin_config', { action: 'set', key: 'browserExtras', value: JSON.stringify([{ id: 'custom-1', label: '自定义 A', path: 'C:/x/a.exe' }]) })
+const cfgExtrasGet = await callTool('douyin_config', { action: 'get' })
+const extrasBack = cfgExtrasGet && cfgExtrasGet.ok === true && cfgExtrasGet.config ? cfgExtrasGet.config.browserExtras : undefined
+if (cfgExtrasSet && cfgExtrasSet.ok === true && extrasBack === JSON.stringify([{ id: 'custom-1', label: '自定义 A', path: 'C:/x/a.exe' }])) {
+  ok('set browserExtras 后 loadCfg 原样读回来')
+} else problem('browserExtras 存/读不一致：' + JSON.stringify(extrasBack))
+
+// douyin_status.browsers：五个布尔值 + extras 数组（每项 { id, label, path, exists }）
+const stProbe = await callTool('douyin_status', {})
+const br = stProbe && stProbe.browsers
+const extrasOk = !!br && Array.isArray(br.extras)
+  && br.extras.length === 1
+  && br.extras[0].id === 'custom-1' && br.extras[0].label === '自定义 A'
+  && br.extras[0].path === 'C:/x/a.exe' && br.extras[0].exists === false
+if (br && typeof br === 'object' && !Array.isArray(br) && FIVE.every((k) => typeof br[k] === 'boolean')) {
+  ok('douyin_status.browsers 五个内核都是布尔值：' + JSON.stringify(FIVE.reduce((o, k) => ({ ...o, [k]: br[k] }), {})))
+} else problem('douyin_status.browsers 形状不对（应五个布尔值）：' + JSON.stringify(br))
+if (extrasOk) ok('douyin_status.browsers.extras 带 id / label / path / exists（不存在的路径 exists=false）')
+else problem('douyin_status.browsers.extras 不对：' + JSON.stringify(br && br.extras))
+writeCfg({})
+
+/* ───────── ⑨-quater 自定义浏览器：argv 走 --browser-executable ───────── */
+// 造一个真实存在的 exe 桩：existsSync 为真才会下发 --browser-executable
+const fakeExe = join(SANDBOX_HOME, 'fake-chrome.exe')
+try { writeFileSync(fakeExe, 'stub', 'utf8') } catch { /* 写不出来下面的断言会自己报 */ }
+const RB = (o) => (typeof mod.resolveBrowser === 'function' ? mod.resolveBrowser(o) : null)
+
+// h. 自定义项路径存在 → ['--browser-executable', path]，且绝不带 --browser-channel
+const rbH = RB({ browserChannel: 'custom-1', browserExtras: JSON.stringify([{ id: 'custom-1', label: '假 Chrome', path: fakeExe }]) })
+const argvH = (rbH && Array.isArray(rbH.argv)) ? rbH.argv : null
+if (argvH && argvH.length === 2 && argvH[0] === '--browser-executable' && argvH[1] === fakeExe && !argvH.includes('--browser-channel')) {
+  ok('自定义浏览器走 --browser-executable（不带 --browser-channel）：' + JSON.stringify(argvH))
+} else problem('自定义浏览器的 argv 不对：' + JSON.stringify(rbH))
+
+// 快捷方式扫出来的项：值就是一个 exe 路径 → 同一套 argv
+const rbH2 = RB({ browserChannel: fakeExe, browserExtras: '[]' })
+if (rbH2 && rbH2.argv && rbH2.argv[0] === '--browser-executable' && rbH2.argv[1] === fakeExe) {
+  ok('值是 exe 路径时也走 --browser-executable：' + JSON.stringify(rbH2.argv))
+} else problem('exe 路径值没走 --browser-executable：' + JSON.stringify(rbH2))
+
+// 已知内核仍然走 --browser-channel
+const rbK = RB({ browserChannel: 'firefox', browserExtras: '[]' })
+if (rbK && rbK.argv && rbK.argv[0] === '--browser-channel' && rbK.argv[1] === 'firefox') ok('已知内核仍走 --browser-channel firefox')
+else problem('已知内核的 argv 不对：' + JSON.stringify(rbK))
+
+// i. 自定义 id 不存在 / 路径不存在 → 一个浏览器参数都不传，但要有 note（绝不静默变 Edge）
+let rbI = null
+try { rbI = RB({ browserChannel: 'custom-9', browserExtras: '[]' }) } catch (e) { rbI = 'THREW: ' + e.message }
+if (rbI && rbI !== 'THREW' && Array.isArray(rbI.argv) && rbI.argv.length === 0 && typeof rbI.note === 'string' && rbI.note) {
+  ok('browserChannel 指向不存在的自定义 id → 不传参数 + note：' + rbI.note)
+} else problem('不存在的自定义 id 处理不对：' + JSON.stringify(rbI))
+const rbI2 = RB({ browserChannel: 'custom-1', browserExtras: JSON.stringify([{ id: 'custom-1', label: '没了', path: join(SANDBOX_HOME, 'nope.exe') }]) })
+if (rbI2 && Array.isArray(rbI2.argv) && rbI2.argv.length === 0 && typeof rbI2.note === 'string' && rbI2.note) {
+  ok('自定义项路径不存在 → 不传参数 + note：' + rbI2.note)
+} else problem('路径不存在的自定义项处理不对：' + JSON.stringify(rbI2))
+
+// douyin_status 要把这件事说清楚（browserNote），而且不许抛
+writeCfg({ browserChannel: 'custom-9', browserExtras: '[]' })
+const stNote = await callTool('douyin_status', {})
+if (stNote && typeof stNote.browserNote === 'string' && stNote.browserNote) ok('douyin_status.browserNote 说清了回退原因：' + stNote.browserNote)
+else problem('douyin_status.browserNote 是空的 / 没这个字段：' + JSON.stringify(stNote && stNote.browserNote))
+// 正常配置（msedge）时 browserNote 是空串，不打扰
+writeCfg({ browserChannel: 'msedge', browserExtras: '[]' })
+const stClean = await callTool('douyin_status', {})
+if (stClean && stClean.browserNote === '') ok('browserChannel=msedge 时 browserNote 是空串')
+else problem('msedge 时 browserNote 应为空串：' + JSON.stringify(stClean && stClean.browserNote))
+
+/* ───────── ⑨-quinquies 快捷方式扫描：名单过滤 + 去重 ───────── */
+const SB = (rows) => (typeof mod.shortcutBrowsers === 'function' ? mod.shortcutBrowsers(rows) : null)
+// k. chrome.exe 留下、wechat.exe 丢掉
+const filtered = SB([
+  { name: 'Google Chrome', path: 'C:/Users/u/Desktop/chrome.exe' },
+  { name: '微信', path: 'C:/Users/u/Desktop/wechat.exe' },
+  { name: 'QQ', path: 'C:/Users/u/Desktop/QQ.exe' },
+])
+if (Array.isArray(filtered) && filtered.length === 1 && /chrome/i.test(filtered[0].path)) {
+  ok('快捷方式按名单过滤：chrome 留下，wechat / QQ 丢掉（' + JSON.stringify(filtered) + '）')
+} else problem('快捷方式没过名单：' + JSON.stringify(filtered))
+
+// 同路径两条 → 只留一条
+const dedup = SB([
+  { name: 'Chrome', path: 'C:/a/chrome.exe' },
+  { name: 'Chrome 快捷方式', path: 'C:/A/Chrome.exe' },
+])
+if (Array.isArray(dedup) && dedup.length === 1) ok('同一路径的快捷方式只留一条（大小写不敏感）')
+else problem('快捷方式去重不对：' + JSON.stringify(dedup))
+
+// l. 同路径既被已知安装路径命中、又被快捷方式命中 → 只出现一次
+const merged = typeof mod.mergeShortcutList === 'function'
+  ? mod.mergeShortcutList([{ name: 'Chrome', path: 'C:/a/chrome.exe' }, { name: 'Firefox', path: 'C:/a/firefox.exe' }], { chrome: 'C:/a/chrome.exe' })
+  : null
+if (Array.isArray(merged) && merged.length === 1 && /firefox/i.test(merged[0].path)) {
+  ok('已知安装路径已命中的那条不再重复出现（只剩 firefox）')
+} else problem('已知路径与快捷方式没去重：' + JSON.stringify(merged))
+
+// browsers.shortcuts 永远是数组（扫不到 / 非 Windows 时是空数组，不是 undefined）
+const stShort = await callTool('douyin_status', {})
+if (stShort && stShort.browsers && Array.isArray(stShort.browsers.shortcuts)) {
+  ok('douyin_status.browsers.shortcuts 是数组（' + stShort.browsers.shortcuts.length + ' 条）')
+} else problem('douyin_status.browsers.shortcuts 不是数组：' + JSON.stringify(stShort && stShort.browsers && stShort.browsers.shortcuts))
 writeCfg({})
 
 /* ───────── ⑩ 结论 ───────── */

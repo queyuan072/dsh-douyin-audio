@@ -145,7 +145,8 @@
 | `pythonPath` | string | `''` | 指定 Python 解释器；空 = 自动探测 |
 | `asrThreads` | number（正整数） | `8` | SenseVoice 本地推理线程数，范围 1–64，实际建议不超过本机逻辑核（设置页按 `GET /sysinfo` 读到的核数夹取，读不到就按 1–64）。`douyin_transcribe` 与「刷完自动转写」都把它透传成 `--threads`（1–64 夹取，0/非法值就不带） |
 | `autoTranscribe` | boolean | `false` | **关（默认，推荐）= 刷完只给清单，由你决定转哪条（返回体 `autoTranscribe: null`）；开 = 刷完立刻转清单里最新的 1 条**。转写结果放在 `autoTranscribe` 字段里；找不到 sherpa_onnx 的 Python、脚本报错、没有任何已下载文件时只把原因写进该字段，**scroll 本身仍照旧返回 `ok`** |
-| `browserChannel` | string（`msedge`\|`chrome`\|`chromium`） | `msedge` | 让三个会起浏览器的脚本（`douyin_scroller.py` / `douyin_read.py` / `douyin_login.py`）用哪个浏览器内核。默认 `msedge` = 你装的 Microsoft Edge（实测最稳，抖音风控对真浏览器宽松）；`chrome` = 你装的 Google Chrome（Edge 出问题时的替代方案）；`chromium` = Playwright 自带的那个内置浏览器（没有真实用户的浏览痕迹，**最容易撞验证码**，只建议排查问题时用，选定后不再回退到 Edge/Chrome）。插件会给脚本加 `--browser-channel <值>`；脚本自己的候选链是 `msedge → [msedge, chrome, 内置 chromium]`、`chrome → [chrome, msedge, 内置 chromium]`、`chromium → [内置 chromium]`，逐个试 launch、全失败才报错。旧版脚本没有这个参数时不带，行为与升级前一致。⚠️ 换内核后需要**重启 DSH** 才生效 |
+| `browserChannel` | string | `msedge` | 让三个会起浏览器的脚本（`douyin_scroller.py` / `douyin_read.py` / `douyin_login.py`）用哪个浏览器。**两类取值**：① 已知内核 `msedge` \| `chrome` \| `chromium` \| `firefox` \| `webkit` → 插件给脚本加 `--browser-channel <值>`；② 自定义浏览器（配置 `browserExtras` 里的 id，如 `custom-1`）或**一个 exe 完整路径**（开始菜单 / 桌面快捷方式扫描出来的项就是这样存的）→ **不加** `--browser-channel`，改加 `--browser-executable <路径>`。默认 `msedge` = 你装的 Microsoft Edge（实测最稳，抖音风控对真浏览器宽松）；`chromium` = Playwright 自带的内置浏览器（没有真实用户的浏览痕迹，**最容易撞验证码**，只建议排查问题时用）。脚本侧候选链只限于 Chromium 家族：`msedge → [msedge, chrome, chromium]`、`chrome → [chrome, msedge, chromium]`、`chromium → [chromium]`、`firefox → [firefox]`、`webkit → [webkit]` —— `firefox` / `webkit` 是不同引擎，**不装了就直接报错**（错误里写「先运行 `npx playwright install firefox`」），绝不静默退回 Edge。自定义项若路径没了 / id 找不到，插件**一个浏览器参数都不传**（脚本走自己的默认 msedge 候选链），并把原因写进 `douyin_status` 的 `browserNote`。旧版脚本不认这些参数时（`--help` 里没有）就不带，行为与升级前一致。⚠️ 换浏览器后需要**重启 DSH** 才生效 |
+| `browserExtras` | string（JSON 数组，默认 `[]`） | `[]` | **手动添加的浏览器**，元素是 `{"id":"custom-1","label":"公司装的 Chrome","path":"D:\\tools\\chrome.exe"}`（`id` 自造、`path` 必填、`label` 可省）。设置页「环境与诊断」里的【手动添加】就是往这里写；写成**字符串**而不是数组是为了避开旧宿主的类型兼容问题，解析失败一律当空数组（绝不抛错）。选中某一项时 `browserChannel` 存的就是它的 `id`，下发时变成 `--browser-executable <path>`。开始菜单 / 桌面快捷方式里扫到的浏览器**不会**写进这里（那是动态扫出来的），只是当次渲染出来给你选 |
 | `loginMode` | string（`window`\|`qr`） | `window` | 登录方式：`window` = 前台弹真窗口人工扫码（推荐，最稳）；`qr` = 后台驻留抓二维码到设置页扫。`douyin_login_start` 不传 `mode` 时用它，设置页「登录」区块的两个单选也读写它 |
 | `autoRun` | boolean | `false` | **谷时自动刷**：开 = 插件自己按 60 秒 tick 检查，满足「谷时窗口内 + 今日额度未满 + 距上次 ≥ `dutyIntervalMin` 分钟 + 没有正在跑的 run」才自己刷一轮；默认关 |
 | `dutyWindow` | string | `12:00-14:00,18:00-23:59` | 谷时窗口，逗号分隔多个 `HH:MM-HH:MM`；支持跨零点（如 `23:00-02:00`） |
@@ -181,6 +182,30 @@
 - **线程数按逻辑核调**：设置页「提速 → 线程数 asrThreads」旁边会显示 `本机 N 逻辑核`（来自只读端点 `GET /api/douyin-audio/sysinfo`），输入框上限就是 N；填超了会按核数夹回去并提示「已按本机 N 逻辑核调整为 X」。建议 8–16，再大只是把 CPU 占满，转写不会更快。
 - **只转片段**：`--start` / `--dur` 能只截取一段来转（比如只想知道第 12 秒到第 42 秒说了什么），比整条快得多；插件层目前透传的是 `--threads`，截取请直接跑脚本（见 7.1）。
 - **纯 BGM 的视频可以跳过**：没有口播的视频转出来只有几句歌词甚至空白，先看 `douyin_scroll` 返回的 `items[]` 标题与大小，挑有内容的那几屏再转，比整批硬转省时间。
+
+---
+
+
+### 4.3 `douyin_status` 里的浏览器探测（设置页据此决定可选列表）
+
+`douyin_status` 的返回体里有两块浏览器信息，设置页只靠它决定「列表里给哪几个可选」：
+
+```jsonc
+{
+  "browsers": {
+    "msedge": true, "chrome": false, "chromium": false, "firefox": false, "webkit": false,
+    "paths": { "msedge": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "chrome": null, "chromium": null, "firefox": null, "webkit": null },
+    "extras": [ { "id": "custom-1", "label": "公司装的 Chrome", "path": "D:\\tools\\chrome.exe", "exists": true } ],
+    "shortcuts": [ { "name": "Chrome", "path": "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe" } ]
+  },
+  "browserNote": ""   // 当前 browserChannel 解析不成时的原因（正常是空串）
+}
+```
+
+- `msedge` / `chrome` 按常见安装路径探测（Program Files、Program Files (x86)、LOCALAPPDATA）；`chromium` / `firefox` / `webkit` 看 `ms-playwright` 里有没有对应子目录。
+- `shortcuts` 是把开始菜单（`%ProgramData%`、`%APPDATA%`）与桌面（`%USERPROFILE%`、`%PUBLIC%`）里的 `.lnk` 交给 PowerShell 解析出来的目标 exe，**按 exe 名单过滤**（只认 msedge / chrome / firefox / brave / opera / vivaldi / chromium / 360se / 360chrome / qqbrowser / sogoupv / ucbrowser），同路径去重、已知安装路径已命中的不再重复列。结果**按进程缓存**——点设置页的【扫描已安装的浏览器】才带 `scan:true` 重扫（`douyin_status` 的 `scan` 参数）。
+- 全部探测都在 try/catch 里：扫不到就是 `false` / 空数组，绝不影响 `douyin_status` 其它字段。
+- 设置页的规则：**只列真能用的**（已知安装路径命中的、快捷方式发现的、手动添加的）+ 当前选中值；未安装的内核不渲染成按钮。当前选中但探测不到时照样显示并标「未安装」。
 
 ---
 
