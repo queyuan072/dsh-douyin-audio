@@ -278,6 +278,19 @@ const loginLogPath = () => join(loginDir(), 'login.log')
 /** 登录脚本路径：这里自己拼，不动 lib/runner.mjs（另一个脚本正在改 douyin_login.py） */
 const SCRIPT_LOGIN = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'douyin_login.py')
 
+/** 插件版本：读本插件 package.json 的 version（给设置页顶栏用）；读不到就 null，绝不抛错 */
+let pluginVersionCache
+function pluginVersion() {
+  if (pluginVersionCache !== undefined) return pluginVersionCache
+  pluginVersionCache = null
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), 'package.json')
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+    if (pkg && typeof pkg.version === 'string' && pkg.version) pluginVersionCache = pkg.version
+  } catch { /* 读不到就是 null：版本号不该把 douyin_status 弄挂 */ }
+  return pluginVersionCache
+}
+
 /** cookie 落点：DOUYIN_COOKIE_FILE > ~/.dsh/cookies/douyin_cookies.txt（与脚本默认值一致） */
 function loginCookieFile() {
   const env = String(process.env.DOUYIN_COOKIE_FILE || '').trim()
@@ -441,6 +454,7 @@ export function apply(ctx, config = {}) {
       const videos = existsSync(vdir) ? readdirSync(vdir).filter((f) => /\.mp4$/i.test(f)) : []
       return {
         ok: !!(pyScroll && pyAsr && ff && existsSync(modelDir)),
+        version: pluginVersion(),
         pythonScroll: pyScroll || '(未找到，需带 playwright)',
         pythonAsr: pyAsr || '(未找到，需带 sherpa_onnx)',
         ffmpeg: ff || '(未找到)',

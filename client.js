@@ -93,6 +93,21 @@ window.__ModuleLoader__.load({
   line-height:15px;white-space:pre-wrap;word-break:break-all;
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   background:var(--dsw-alias-bg-layer-4,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+/* ── 顶栏：徽章 + 刷一轮（抄刷B站那页的样子）── */
+[data-dy-bar]{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:10px;
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.12));
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.10));}
+[data-dy-bar-badges]{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1;min-width:0;}
+[data-dy-badge]{font-size:11px;line-height:16px;padding:2px 8px;border-radius:999px;white-space:nowrap;
+  font-family:inherit;cursor:pointer;
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.16));
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-dy-badge]:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.24));}
+[data-dy-badge][data-static]{cursor:default;}
+[data-dy-badge][data-static]:hover{background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.14));}
+[data-dy-badge][data-good]{color:#22c55e;border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.12);}
+[data-dy-badge][data-warn]{color:#f59e0b;border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.12);}
+[data-dy-badge][disabled]{opacity:.5;cursor:default;}
 `
 
     function Switch({ on, onChange, disabled }) {
@@ -139,6 +154,42 @@ window.__ModuleLoader__.load({
       try { return JSON.stringify(r, null, 2) } catch (e) { return String(r) }
     }
 
+    /* ── 顶栏徽章：只从 douyin_status 的返回里推，不猜 ──────────────────────────
+       注意① ok:false 不代表「状态没拿到」—— 环境缺的时候 pyScroll 那些字段照旧返回，
+             所以判断「是不是状态体」看字段，不看 ok。
+       注意② 找不到的项返回的是 '(未找到…)' 这种占位字符串（truthy），不能只判真假。 */
+    const isStatusPayload = (r) => !!(r && typeof r === 'object'
+      && ('pythonScroll' in r || 'pythonAsr' in r || 'videos' in r || 'cookie' in r))
+    /* 占位文案 '(未找到…)' 与空串都算缺；有真路径才算有 */
+    const hasEnvValue = (v) => typeof v === 'string' && v.trim() !== '' && v.indexOf('未找到') < 0
+
+    /* 环境四件套：X 只取三个中文名（两个 Python 缺项都叫 Python），顺序 = 报缺的顺序 */
+    const ENV_PARTS = [
+      { name: 'Python', why: 'Python(playwright) 没找到', has: (s) => hasEnvValue(s.pythonScroll) },
+      { name: 'Python', why: 'Python(sherpa_onnx) 没找到', has: (s) => hasEnvValue(s.pythonAsr) },
+      { name: 'ffmpeg', why: 'ffmpeg 没找到', has: (s) => hasEnvValue(s.ffmpeg) },
+      { name: '转写模型', why: '转写模型目录不存在', has: (s) => !!(s.modelDir && s.modelDir.exists) },
+    ]
+
+    /** 四枚徽章：{ text, tone(good|warn|''), act(env|login|null), title } */
+    function statusBadges(s) {
+      const miss = ENV_PARTS.filter((p) => !p.has(s))
+      const env = miss.length
+        ? { text: '环境缺 ' + miss[0].name, tone: 'warn', act: 'env', title: miss.map((p) => p.why).join('；') + '（点这里重跑自检）' }
+        : { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里重跑自检）' }
+      /* ⚠️ 只按 cookie 文件在不在说，不写「已登录」—— 真实登录态我们确认不了 */
+      const login = s.cookie && s.cookie.exists
+        ? { text: 'cookie 已配置', tone: '', act: 'login', title: '只按 cookie 文件存在判断，不代表当前登录态一定有效（点这里去登录区）' }
+        : { text: '未登录', tone: 'warn', act: 'login', title: 'cookie 文件还没写出来 —— 点这里去「登录」区块扫码' }
+      const n = Array.isArray(s.videos) ? s.videos.length : 0
+      const videos = n > 0
+        ? { text: '已下载 ' + n + ' 条', tone: '', act: null, title: '本地 videos 目录里有 ' + n + ' 个 mp4' }
+        : { text: '本地无视频', tone: '', act: null, title: '本地 videos 目录里还没有 mp4' }
+      const raw = s.version ? String(s.version) : ''
+      const ver = { text: raw ? (/^v/i.test(raw) ? raw : 'v' + raw) : 'v?', tone: '', act: null, title: raw ? '插件版本' : '宿主没回版本号（package.json 没读到）' }
+      return [env, login, videos, ver]
+    }
+
     function Panel() {
       const [cfg, setCfg] = React.useState(null)
       const [fails, setFails] = React.useState(0)
@@ -150,6 +201,9 @@ window.__ModuleLoader__.load({
       const [sys, setSys] = React.useState(null)        // 本机核数（null = 还没问到；cores:0 = 没问到，降级）
       const [login, setLogin] = React.useState(null)    // 登录状态（douyin_login_poll / start 的原样返回）
       const [qrTick, setQrTick] = React.useState(0)     // 二维码时间戳：每轮询一次换一个，绕过浏览器缓存
+      const [st, setSt] = React.useState(null)          // douyin_status 的原样返回（顶栏徽章的数据源）
+      const [stErr, setStErr] = React.useState('')      // 状态没拿到时的原因（拿到了就空串）
+      const loginRef = React.useRef(null)               // 「登录」区块：点登录徽章要滚到这里
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
 
@@ -261,12 +315,37 @@ window.__ModuleLoader__.load({
         patch(key, String(raw || '').trim())
       }
 
+      /* 顶栏徽章的数据源：走 /run 的 status（跟「自检」是同一个工具，不另开路由） */
+      const refreshStatus = async () => {
+        try {
+          const r = await jpost('/run', { action: 'status' })
+          if (isStatusPayload(r)) { setSt(r); setStErr('') }
+          else setStErr((r && (r.error || r.reason)) || '宿主没回状态')
+        } catch (e) { setStErr(errText(e)) }
+      }
+      /* 挂载就把徽章填上，别等用户去点「自检」 */
+      React.useEffect(() => { refreshStatus() }, [])
+
+      /* 点「登录」徽章：滚到登录区块并聚焦（滚动参数不被认就退化成默认滚动） */
+      const focusLogin = () => {
+        const el = loginRef && loginRef.current
+        if (!el) return
+        try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }) } catch (e) { /* 老浏览器不认参数 */ }
+        try {
+          const btn = el.querySelector ? el.querySelector('button') : null
+          if (btn && btn.focus) btn.focus()
+        } catch (e) { /* 聚焦失败不影响滚动 */ }
+      }
+
       const run = async (action, extra, what) => {
         setBusy(action)
         try {
           const r = await jpost('/run', { action, ...(extra || {}) })
           setOut(show(r))
           say(what + (r && r.ok ? '：完成' : '：失败 —— ' + ((r && r.error) || '看下面结果')), r && r.ok ? 'good' : 'warn')
+          /* 徽章跟着结果走：自检直接用它回来的那份；刷完视频数变了，得重新数一遍 */
+          if (action === 'status' && isStatusPayload(r)) { setSt(r); setStErr('') }
+          else if (action === 'scroll') await refreshStatus()
         } catch (e) { setOut(String((e && e.message) || e)); say(what + '：' + errText(e), 'warn') }
         finally { setBusy('') }
       }
@@ -338,6 +417,9 @@ window.__ModuleLoader__.load({
       const loginModeCfg = cfg.loginMode === 'qr' ? 'qr' : 'window'
       const showQr = loginModeCfg === 'qr' && (loginPhase === 'waiting' || loginPhase === 'scanned')
       const maxThreads = sys && sys.cores > 0 ? sys.cores : 64   // 没读到核数就按 64 兜底
+      /* 「刷一轮」用的屏数 = 当前配置的 count（表单里还没提交的草稿不算数；配歪了就按 1 屏） */
+      const cfgCount = Number(cfg && cfg.count)
+      const runCount = Number.isFinite(cfgCount) && cfgCount > 0 ? cfgCount : 1
 
       /* 线程数：提交前按 [1, 本机逻辑核] 夹取，并把纠偏结果说出来（不悄悄改用户填的值） */
       const editThreads = (raw) => {
@@ -356,6 +438,28 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { 'data-dy-page': '' },
+        /* ── 顶栏：四枚徽章 + 刷一轮（在面板最顶上，前面不放任何东西）── */
+        h('div', { 'data-dy-bar': '' },
+          h('div', { 'data-dy-bar-badges': '' },
+            st
+              ? statusBadges(st).map((b, i) => h('button', {
+                key: 'badge' + i,
+                'data-dy-badge': '',
+                'data-good': b.tone === 'good' ? '' : undefined,
+                'data-warn': b.tone === 'warn' ? '' : undefined,
+                'data-static': b.act ? undefined : '',
+                title: b.title || b.text,
+                disabled: b.act === 'env' && busy === 'status',
+                onClick: b.act === 'env' ? () => run('status', {}, '自检')
+                  : b.act === 'login' ? focusLogin : undefined,
+              }, b.text))
+              : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…')),
+          h('button', {
+            'data-dy-btn': '', 'data-primary': '', 'data-dy-run-one': '',
+            disabled: busy === 'scroll',
+            onClick: () => run('scroll', { count: runCount }, '刷一轮'),
+          }, busy === 'scroll' ? '刷着呢…' : '刷一轮')),
+
         /* ── 刷几屏、怎么刷 ── */
         h('div', { 'data-dy-sec': '' },
           h('div', { 'data-dy-h': '' }, '刷几屏、怎么刷'),
@@ -457,7 +561,7 @@ window.__ModuleLoader__.load({
           })),
 
         /* ── 登录 ── */
-        h('div', { 'data-dy-sec': '' },
+        h('div', { 'data-dy-sec': '', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),
           h('div', { 'data-dy-row': '' },
             h('button', {
