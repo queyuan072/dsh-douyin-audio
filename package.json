@@ -34,7 +34,7 @@
     "index.js",
     "cordis.patch.yml",
     "lib",
-    "scripts",
+    "scripts/*.py",
     "README.md",
     "selfcheck.mjs",
     "client.js",
