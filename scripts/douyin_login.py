@@ -213,6 +213,53 @@ def write_state(state_dir, phase, message, cookie_path=None, mode=None):
         log("写 state.json 失败: {}".format(_brief(exc, 120)))
 
 
+def read_netscape(path):
+    """netscape 文件 -> cookie 记录列表。
+
+    以 #HttpOnly_ 开头的行是「httpOnly 标记 + 一条正常数据」，必须剥掉前缀继续解析：
+    当注释丢掉的话，sessionid 这类整条 httpOnly 的 cookie 会整条消失。"""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.rstrip("\n")
+                if ln.startswith("#HttpOnly_"):
+                    ln = ln[len("#HttpOnly_"):]
+                elif not ln.strip() or ln.startswith("#"):
+                    continue
+                parts = ln.split("\t")
+                if len(parts) < 7:
+                    continue
+                out.append({"domain": parts[0], "path": parts[2], "secure": parts[3],
+                            "expires": parts[4], "name": parts[5], "value": parts[6]})
+    except Exception as exc:
+        log("读 cookie 文件失败（{}）".format(_brief(exc, 120)))
+        return []
+    return out
+
+
+def file_session_cookie(path):
+    """写出来的 netscape 文件里有没有 session 类 cookie；没有返回 None"""
+    for c in read_netscape(path):
+        name = (c.get("name") or "").lower()
+        if name in SESSION_COOKIE_NAMES and (c.get("value") or "").strip() \
+                and "douyin" in (c.get("domain") or ""):
+            return c
+    return None
+
+
+def ensure_session_before_export(ctx, state_dir, mode):
+    """导出 cookie **之前**再校验一次：没有 session 类 cookie 就写 phase=error，绝不写 ok"""
+    ck, why = session_cookie(ctx)
+    if ck is not None:
+        return None
+    msg = ("检测到登录信号，但 cookie 里没有 session 类 cookie（{}），"
+           "未导出任何 cookie；请重新扫码，直到手机上确认「登录成功」".format(why))
+    log("[失败] " + msg)
+    write_state(state_dir, "error", msg, mode=mode)
+    return msg
+
+
 def to_netscape(cookies, path):
     """playwright cookies -> netscape 文件（沿用旧实现的格式）；写前把旧文件改名 .bak"""
     lines = [
@@ -233,8 +280,10 @@ def to_netscape(cookies, path):
         exp = int(c.get("expires") or 0)
         if exp <= 0:
             exp = int(time.time()) + 86400 * 30
-        lines.append("\t".join([domain, include_sub, path_, secure, str(exp),
-                                c.get("name") or "", c.get("value") or ""]))
+        # httpOnly 用 netscape 的 #HttpOnly_ 前缀标记（解析端已按前缀剥离开再读，不会丢）
+        prefix = "#HttpOnly_" if c.get("httpOnly") else ""
+        lines.append(prefix + "\t".join([domain, include_sub, path_, secure, str(exp),
+                                         c.get("name") or "", c.get("value") or ""]))
         n += 1
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -419,15 +468,27 @@ def is_verify_page(info):
 
 
 def find_login_button(page):
+    """找右上角「登录」按钮。**三态**：found=True 找到 / found=False 确实没有 / unknown=True 探测失败。
+
+    以前把 JS 异常吞成 {"found": False}，于是「探测失败」被当成「按钮不存在」=「已登录」，
+    这是登录假成功的根因之一。探测失败必须如实报「未知」，绝不当作「没有」。"""
     try:
-        return page.evaluate(_JS_LOGIN_BTN) or {"found": False}
-    except Exception:
-        return {"found": False}
+        hit = page.evaluate(_JS_LOGIN_BTN)
+    except Exception as exc:
+        log("探测「登录」按钮失败（{}），结果未知".format(_brief(exc, 120)))
+        return {"found": False, "unknown": True, "error": _brief(exc, 160)}
+    if not isinstance(hit, dict):
+        return {"found": False, "unknown": True, "error": "探测返回值不是对象"}
+    hit["unknown"] = False
+    hit["found"] = bool(hit.get("found"))
+    return hit
 
 
 def open_login_panel(page):
     """点一下「登录」，失败就退回 JS click；返回一句话说明"""
     hit = find_login_button(page)
+    if hit.get("unknown"):
+        return "探测「登录」按钮失败（{}），无法自动点开登录面板".format(hit.get("error") or "未知原因")
     if not hit.get("found"):
         return "没找到「登录」按钮（页面结构可能不同）"
     try:
@@ -462,18 +523,27 @@ def session_cookie(ctx):
 
 
 def logged_in(ctx, page):
-    """已登录 = cookie 有 sessionid 或 右上角「登录」按钮消失（且正文足够长）"""
+    """已登录 **只认** cookie 里的 session 类 cookie（sessionid / sessionid_ss / sid_tt / sid_guard 任一且非空）。
+
+    ⚠️ 唯一判据就是它。「右上角登录按钮消失 + 正文 >= 800 字」曾被当成登录成功 ——
+    未扫码时页面正文经常早就超过 800 字，于是登录假成功、导出一份不含 sessionid 的 cookie。
+    下面这些分支只用来产出「为什么还不是登录态」的人话解释，**一律返回 False**。"""
     ck, why = session_cookie(ctx)
     if ck is not None:
         return True, why
     info = probe_page(page)
     if not info:
-        return False, "读不到页面（可能已经关掉）"
+        return False, "读不到页面（可能已经关掉）；{}".format(why)
+    if is_verify_page(info):
+        return False, "还在验证页（title={}）；{}".format((info.get("title") or "")[:30], why)
+    hit = find_login_button(page)
+    if hit.get("unknown"):
+        return False, "「登录」按钮探测失败（未知），不能据此判定已登录；{}".format(why)
     if info.get("bodyLen", 0) < 800:
-        return False, "正文只有 {} 字，页面还没加载完".format(info.get("bodyLen", 0))
-    if not find_login_button(page).get("found"):
-        return True, "右上角「登录」按钮已消失（title={}）".format((info.get("title") or "")[:30])
-    return False, why
+        return False, "正文只有 {} 字，页面还没加载完；{}".format(info.get("bodyLen", 0), why)
+    if hit.get("found"):
+        return False, "页面上还有「登录」按钮；{}".format(why)
+    return False, "页面看起来已登录，但 cookie 里还没有 session 类 cookie；{}".format(why)
 
 
 def capture_qr(page, qr_path):
@@ -546,7 +616,14 @@ def run_window(args, state_dir):
             log("[2/4] 已登录（{}），等 5 秒让风控记下这次访问…".format(why))
             write_state(state_dir, "scanned", "已登录，正在导出 cookie", mode="window")
             time.sleep(5)
+            if ensure_session_before_export(ctx, state_dir, "window"):
+                return 2
             n = to_netscape(ctx.cookies(), args.out)
+            if file_session_cookie(args.out) is None:
+                msg = "导出的 cookie 文件里没有 session 类 cookie（{}），登录未真正完成".format(args.out)
+                log("[失败] " + msg)
+                write_state(state_dir, "error", msg, mode="window")
+                return 2
             log("[3/4] 已写入 {} 条 cookie -> {}".format(n, args.out))
             write_state(state_dir, "ok", "已导出 {} 条 cookie".format(n),
                         cookie_path=args.out, mode="window")
@@ -643,7 +720,14 @@ def run_qr(args, state_dir):
             log("[2/5] 扫码成功（{}），等 5 秒让风控记下这次访问…".format(why))
             write_state(state_dir, "scanned", "已扫码确认，正在导出 cookie", mode="qr")
             time.sleep(5)
+            if ensure_session_before_export(ctx, state_dir, "qr"):
+                return 2
             n = to_netscape(ctx.cookies(), args.out)
+            if file_session_cookie(args.out) is None:
+                msg = "导出的 cookie 文件里没有 session 类 cookie（{}），登录未真正完成".format(args.out)
+                log("[失败] " + msg)
+                write_state(state_dir, "error", msg, mode="qr")
+                return 2
             log("[3/5] 已写入 {} 条 cookie -> {}".format(n, args.out))
             write_state(state_dir, "ok", "已导出 {} 条 cookie".format(n),
                         cookie_path=args.out, mode="qr")

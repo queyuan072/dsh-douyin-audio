@@ -45,13 +45,37 @@ window.__ModuleLoader__.load({
           : res.status === 404 ? '（这版宿主还没这个路由）' : ''
       throw new Error('HTTP ' + res.status + why)
     }
-    const jget = async (p) => asJson(await fetch(API + p, { credentials: 'same-origin' }))
-    const jpost = async (p, body) => asJson(await fetch(API + p, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body || {}),
-    }))
+    /* 同源鉴权：插件的 HTTP 路由带一道同源门（Sec-Fetch-Site / Origin / 一次性 token 三选一）。
+       token 在第一次请求前取一次，之后每个请求都带 x-dsh-douyin-token；取不到就退化成不带 ——
+       同源请求本来就靠 Sec-Fetch-Site / Origin 过门，不会因为拿不到 token 就全挂。 */
+    let authToken = ''
+    const authHeaders = () => (authToken ? { 'x-dsh-douyin-token': authToken } : {})
+    const ensureToken = async () => {
+      if (authToken) return authToken
+      try {
+        const r = await fetch(API + '/token', { credentials: 'same-origin' })
+        if (r.ok) {
+          const j = await r.json()
+          if (j && typeof j.token === 'string' && j.token) authToken = j.token
+        }
+      } catch { /* 取不到就退化成不带：门那边还有同源判据兜着 */ }
+      return authToken
+    }
+    const jget = async (p) => {
+      await ensureToken()
+      return asJson(await fetch(API + p, { credentials: 'same-origin', headers: authHeaders() }))
+    }
+    const jpost = async (p, body) => {
+      await ensureToken()
+      return asJson(await fetch(API + p, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(body || {}),
+      }))
+    }
+    /* 二维码用 <img> 取：<img> 带不了请求头，token 走查询参数（服务端同源门两种都认） */
+    const qrUrl = (tick) => API + '/qr?t=' + tick + (authToken ? '&token=' + encodeURIComponent(authToken) : '')
     /* ⚠️ 别叫 msg —— Panel 里的 msg 是状态名，会在函数作用域里把它盖掉（setState 那次就是踩这个） */
     const errText = (e) => String((e && e.message) || e || '未知错误')
 
@@ -1015,7 +1039,7 @@ window.__ModuleLoader__.load({
             }, (LOGIN_PHASE[loginPhase] || loginPhase || '?')
               + (loginPhase !== 'ok' && login.message ? '（' + login.message + '）' : '')) : null),
           showQr ? h('img', {
-            'data-dy-qr': '', src: API + '/qr?t=' + qrTick, alt: '抖音登录二维码', width: 200, height: 200,
+            'data-dy-qr': '', src: qrUrl(qrTick), alt: '抖音登录二维码', width: 200, height: 200,
           }) : null,
           h('div', { 'data-dy-note': '' },
             '登录方式选好后点「开始登录」。登录成功后 cookie 写到 ~/.dsh/cookies/douyin_cookies.txt，'
@@ -1548,7 +1572,7 @@ window.__ModuleLoader__.load({
             }, (LOGIN_PHASE[loginPhase] || loginPhase || '?')
               + (loginPhase !== 'ok' && login.message ? '（' + login.message + '）' : '')) : null),
           showQr ? h('img', {
-            'data-dy-qr': '', src: API + '/qr?t=' + qrTick, alt: '抖音登录二维码', width: 200, height: 200,
+            'data-dy-qr': '', src: qrUrl(qrTick), alt: '抖音登录二维码', width: 200, height: 200,
           }) : null,
           h('div', { 'data-dy-note': '' },
             '登录成功后 cookie 写到 ~/.dsh/cookies/douyin_cookies.txt，只读 / 通知 / 私信这些工具就开始能用。'

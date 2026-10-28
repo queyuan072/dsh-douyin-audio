@@ -61,7 +61,8 @@ RESULT_NAME = "setup-result.json"
 CFG_NAME = "config.json"
 TMP_PREFIX = "dsh-douyin-setup-"
 PROBE_TIMEOUT = 8          # 每个 python 的 import 探测上限（秒）
-DOWNLOAD_TIMEOUT = 300     # 单个文件下载超时（秒）
+DOWNLOAD_TIMEOUT = 300     # 单个文件下载的整体 deadline（秒）；也当单次 socket 超时用
+DOWNLOAD_MAX_BYTES = 3 * 1024 * 1024 * 1024  # 单个文件大小上限（3GB）：防对端不限量地把盘写满
 DOWNLOAD_LOG_STEP = 5 * 1024 * 1024   # 下载中每 5MB 打一行日志
 PIP_PACKAGES = ("playwright", "sherpa-onnx")
 PIP_INDEXES = (
@@ -233,20 +234,32 @@ def venv_python():
 
 # ── JSON / 配置读写（逐文件、原子写）─────────────────────────────────────────
 def write_json_atomic(path, data):
-    """先写 <path>.tmp 再 os.replace；失败返回 False（绝不抛）"""
+    """先写一个 mkstemp 出来的唯一临时名再 os.replace；失败返回 False（绝不抛）。
+    用 mkstemp 而不是 <path>.tmp：并发写时固定名字会互相覆盖，还可能写进别人留下的符号链接。"""
+    tmp = ""
     try:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                                   dir=parent or ".")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        tmp = ""
         return True
     except Exception as exc:
         log("写 {} 失败: {}".format(path, _brief(exc)))
         return False
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 
 def read_cfg():
@@ -563,8 +576,11 @@ def cookie_info():
 
 
 # ── 下载 ────────────────────────────────────────────────────────────────────
-def download(url, dest, timeout=DOWNLOAD_TIMEOUT, min_bytes=0):
-    """流式下载到 dest（先 .part 再 os.replace）。每 5MB 打一行日志。失败抛异常。"""
+def download(url, dest, timeout=DOWNLOAD_TIMEOUT, min_bytes=0, max_bytes=DOWNLOAD_MAX_BYTES):
+    """流式下载到 dest（先 .part 再 os.replace）。每 5MB 打一行日志。失败抛异常。
+
+    三重护栏缺一不可：整体 deadline（timeout 本身只是单次 socket 超时，慢速对端能一直拖）、
+    max_bytes 上限（对端不给 Content-Length 也能兜住）、Content-Length 与实际字节数核对。"""
     log("下载: " + url)
     parent = os.path.dirname(dest)
     if parent:
@@ -573,29 +589,47 @@ def download(url, dest, timeout=DOWNLOAD_TIMEOUT, min_bytes=0):
     got = 0
     next_mark = DOWNLOAD_LOG_STEP
     total = 0
+    deadline = time.monotonic() + float(timeout or 0 or DOWNLOAD_TIMEOUT)
     req = urllib.request.Request(url, headers={"User-Agent": "dsh-douyin-setup/" + VERSION})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as fh:
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as fh:
+            try:
+                raw_len = resp.headers.get("Content-Length")
+                total = int(raw_len) if raw_len and str(raw_len).isdigit() else 0
+            except Exception:
+                total = 0
+            if total and max_bytes and total > max_bytes:
+                raise RuntimeError("文件太大: Content-Length {} 字节 > 上限 {} 字节".format(total, max_bytes))
+            if total:
+                log("  大小约 {:.1f}MB".format(total / 1048576.0))
+            while True:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("下载超时: 超过 {} 秒仍未完成（已收 {:.1f}MB）".format(
+                        timeout, got / 1048576.0))
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                got += len(chunk)
+                if max_bytes and got > max_bytes:
+                    raise RuntimeError("下载超限: 已收 {} 字节 > 上限 {} 字节".format(got, max_bytes))
+                if got >= next_mark:
+                    log("  下载中… {:.1f}MB{}".format(
+                        got / 1048576.0,
+                        "/{:.1f}MB".format(total / 1048576.0) if total else ""))
+                    next_mark += DOWNLOAD_LOG_STEP
+        if total and got != total:
+            raise RuntimeError("下载不完整: 收到 {} 字节，Content-Length 声明 {} 字节".format(got, total))
+        if min_bytes and got < min_bytes:
+            raise RuntimeError("下载不完整: {} 字节 < 预期 {} 字节".format(got, min_bytes))
+        os.replace(part, dest)
+    except BaseException:
+        # 失败/超限一律不留 .part：被拒绝的超大文件更不该留在盘上
         try:
-            raw_len = resp.headers.get("Content-Length")
-            total = int(raw_len) if raw_len and str(raw_len).isdigit() else 0
+            os.remove(part)
         except Exception:
-            total = 0
-        if total:
-            log("  大小约 {:.1f}MB".format(total / 1048576.0))
-        while True:
-            chunk = resp.read(262144)
-            if not chunk:
-                break
-            fh.write(chunk)
-            got += len(chunk)
-            if got >= next_mark:
-                log("  下载中… {:.1f}MB{}".format(
-                    got / 1048576.0,
-                    "/{:.1f}MB".format(total / 1048576.0) if total else ""))
-                next_mark += DOWNLOAD_LOG_STEP
-    if min_bytes and got < min_bytes:
-        raise RuntimeError("下载不完整: {} 字节 < 预期 {} 字节".format(got, min_bytes))
-    os.replace(part, dest)
+            pass
+        raise
     log("  下载完成 {:.1f}MB → {}".format(got / 1048576.0, dest))
     return got
 
@@ -807,7 +841,8 @@ def pip_install(py):
         for label, index in PIP_INDEXES:
             cmd = [py, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", pkg]
             if index:
-                cmd += ["-i", index, "--trusted-host", "pypi.tuna.tsinghua.edu.cn"]
+                # 只换 index-url，不加 --trusted-host：那等于关掉 TLS 证书校验
+                cmd += ["-i", index]
             log("pip install {}（源: {}）…".format(pkg, label))
             res = run(cmd, timeout=1800)
             if res["code"] == 0:

@@ -50,7 +50,7 @@
 | `douyin_scroll` | `count`(number) / `delay`(number) / `headless`(boolean) / `saveAll`(boolean) | 打开 `www.douyin.com` 推荐页，下滑 N 屏、逐屏截图；`saveAll` 为真时逐屏下载视频：候选直链先按 `/tos-xxx/<token>/` 段分组，只保留与当前 `currentSrc` 属于同一条视频的候选，下载后再按 SHA256 内容哈希去重（换屏却下到上一条流会被丢掉），然后校验音轨；没有可用音轨的屏会在 manifest 里写 `# NO_AUDIO`。返回统计、退出码、工作目录，另加给「人挑」的清单 `items[]` / `totalMB` / `manifestPath`（见 1.4）。配置 `autoTranscribe` **关着时返回体里 `autoTranscribe: null`（零开销）**；开着时刷完自动转清单里最新的 1 条，结果放在 `autoTranscribe: { ok, attempted, threads, items:[{file,text,error,hasSpeech}], reason? }`，**转写失败不会让 scroll 变失败** | Python + playwright（走 Edge 通道）、ffmpeg |
 | `douyin_transcribe` | `screens`(array) / `files`(array) / `modelDir`(string) / `limit`(number) | 把本地视频/音频转成文字（SenseVoice 本地推理）。三种选文件的优先级：**`screens`（按 manifest 屏号取 `videos/video_<屏号三位>.mp4`）> `files`（明确路径）> 自动**（扫**工作目录** `videos/` 下的 `mp4/m4a/wav/mp3`，按修改时间倒序取 `limit` 个，返回里 `order:"mtime-desc"`）。底层以 `--json` 调用 CLI，配置里的 `asrThreads` 透传成 `--threads`，结果原样回传并补 `order` / `screens` / `threads`。**每条 item 再补三个字段做兜底**：`screen`（从文件名 `video_<三位屏号>.mp4` 解析，认不出就是 `null`）、`title`（manifest 里该屏标题，`screen` 认不出也 `null`）、`hasSpeech`（`text` 去掉空白后长度 ≥ 2 为真）；`hasSpeech === false` 的条目再加一句 `note`：「无语音（纯 BGM 或静音），可看 title 判断内容；需要更多信息可调用 douyin_video 看 tags」。返回体顶层另有 `summary: { transcribed, empty, totalMB }`（有语音条数 / 无语音条数 / 选中文件总大小） | Python + sherpa_onnx、ffmpeg、SenseVoice 模型目录 |
 | `douyin_status` | 无 | 自检：两个 Python 能力、ffmpeg、模型目录、cookie 文件、两个脚本是否存在，并报告 `stateDir`（配置/日志家）、`workDir`（产物家）、已下载视频列表、当前配置 | 无（纯检查） |
-| `douyin_config` | `action`(`get`/`set`) / `key` / `value` | `get` 读出当前配置 + 状态目录；`set` 改一个键并落盘 `config.json`（布尔按 `true`/`false`，数字自动转 number） | 无 |
+| `douyin_config` | `action`(`get`/`set`) / `key` / `value` | `get` 读出当前配置 + 状态目录；`set` 改一个键并落盘 `config.json`（布尔按 `true`/`false`，数字自动转 number；数值有底线：`count>=1`、`delay>=0`、`downloadTimeout>=30`，非法直接拒）。**`tier*` 五个能力等级键它一律拒绝**：等级只能由用户在设置页改 | 无 |
 
 参数取值会被夹到安全区间：`count` 1–200、`delay` 0.5–30（秒）、`limit` 1–20。
 
@@ -68,6 +68,9 @@
   "manifestPath": "%TEMP%\douyin\manifest.txt" }
 ```
 
+`screens` 是**实际**刷到的屏数（脚本输出里的「下滑屏数」那一行，取不到就看 manifest 行数），不是入参
+`count`：撞登录墙 / 验证码被提前挡下时两者会不一样，回请求值等于骗人。请求值另存在 `screensRequested`。
+
 - `hasFile: false` / `file: null` = 这一屏没下到文件（下载失败、内容重复被跳过、或 `saveAll` 关着）。
 - `title` 来自 manifest 第二列（脚本抓的页面标题签名，最长 60 字，可能为空串）。
 - 挑好屏号后直接交给转写：`douyin_transcribe screens=[1,3]`，一个屏号一个文件，不会再对错。
@@ -80,7 +83,7 @@
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `douyin_login_start` | `mode`(`window`\|`qr`；不给就取配置 `loginMode`) | `window` = 前台弹可见 Edge 窗口等你在窗口里扫码（超时预算 = `--wait` 300s + 60s），返回 `{ ok, mode:'window', loggedIn, cookiePath, exitCode }`；`qr` = **后台派生**脚本进程（不阻塞、stdout 重定向到 `login/login.log`），最多等 15s 让 `qr.png` 出现，返回 `{ ok, mode:'qr', qrPath, stateFile, imageUrl, phase, hint }` |
+| `douyin_login_start` | `mode`(`window`\|`qr`；不给就取配置 `loginMode`) | `window` = **后台派生**一个可见 Edge 窗口（同样不阻塞、stdout 重定向到 `login/login.log`，脚本侧 `--wait` 300s），立刻返回 `{ ok, started:true, mode:'window', phase:'waiting', pid, stateFile, log, hint }`，之后用 `douyin_login_poll` 看进度（cookie 落地即 `phase:'ok'`）；`qr` = **后台派生**脚本进程（不阻塞、stdout 重定向到 `login/login.log`），最多等 15s 让 `qr.png` 出现，返回 `{ ok, mode:'qr', qrPath, stateFile, imageUrl, phase, hint }` |
 | `douyin_login_poll` | 无 | 读 `<状态目录>/login/state.json`，返回 `{ ok, phase, loggedIn, cookiePath, message, at, mode, stateFile, qrPath, hasQr }`。`phase` ∈ `waiting` / `scanned` / `ok` / `expired` / `error`（没有 state.json 时是 `none`），**`ok` 与 `loggedIn` 都只在 `phase === 'ok'` 时为 true** |
 
 这两个工具**不受能力等级限制**：读不到登录态，只读/通知那些开关一个也用不上。两种模式的区别、状态文件、图片端点见第 5 节。
@@ -237,8 +240,10 @@ venv 建在**插件的安装目录里**，所以：
 
 **能力等级（五个开关）**
 
-五个 `tier*` 键就是「能力等级」开关，设置页里有一节「能力等级」可以直接点，也能用
-`douyin_config` 改：`{"action":"set","key":"tierRead","value":"true"}`。
+五个 `tier*` 键就是「能力等级」开关，**只能在设置页的「能力等级」那一节由用户自己点**。
+`douyin_config` 会明确拒绝改 `tier*`（返回 `{ok:false, error:"能力等级只能由用户在设置页修改"}`）——
+让 agent 能自己解锁，闸门就等于没设。设置页走的是 `POST /api/douyin-audio/config`（要过同源门那一条，
+见第 5 节），那条路照旧能写 `tier*`，因为那是你自己点的开关。
 
 - 基础四件（`douyin_scroll` / `douyin_transcribe` / `douyin_status` / `douyin_config`）**不受等级限制**——它们不碰抖音的写接口。
 - **依赖规则**：`tierReact` / `tierComment` / `tierPublish` 任一为真时，`tierRead` 在判断上视为真（**不会改写你存的值**）。
@@ -248,7 +253,7 @@ venv 建在**插件的安装目录里**，所以：
 ```json
 { "ok": false, "code": "TIER_DISABLED", "tier": "read",
   "reason": "该能力属于「只读」，当前未开启",
-  "hint": "在设置页「能力等级」打开 tierRead，或调用 douyin_config 设置该键" }
+  "hint": "在设置页「能力等级」打开 tierRead（这一档只能由用户自己开：douyin_config 会拒绝改 tier*）" }
 ```
 
 说明：`douyin_scroll` / `douyin_transcribe` 真正读取的是 `count`/`delay`/`headless`/`saveAll`/`downloadTimeout`/`pythonPath`/`asrThreads`；五个只读工具额外读取 `readHeadless`/`verifyWait`（见上表）；`transcribeModel` 只在配置里保留，`autoTranscribe` 目前也只存值（设置页上的「刷完自动转写」开关，存值本身不触发任何动作）。
@@ -291,11 +296,11 @@ venv 建在**插件的安装目录里**，所以：
 
 | | `window`（默认，推荐） | `qr` |
 | --- | --- | --- |
-| 怎么跑 | 前台弹一个**可见**的 Edge 窗口（`--mode window`），工具调用一直等到登录成功或超时 | **后台派生**脚本进程（不阻塞，`--mode qr`），脚本 headless 驻留，同一个浏览器上下文里等你扫完 |
+| 怎么跑 | **后台派生**一个**可见**的 Edge 窗口（`--mode window`，不阻塞，工具立刻返回 `started`） | **后台派生**脚本进程（不阻塞，`--mode qr`），脚本 headless 驻留，同一个浏览器上下文里等你扫完 |
 | 你要做的 | 在窗口里扫码 / 拖滑块过验证，随便刷两下 | 看设置页里那张二维码（每 3 秒自动换时间戳刷新），用手机抖音扫它 |
-| 进度从哪看 | 窗口关掉后工具才返回 `loggedIn` | `douyin_login_poll` 读 `state.json`：`waiting` / `scanned` / `ok` / `expired` / `error` |
+| 进度从哪看 | 也看 `douyin_login_poll`（脚本只写 cookie、不写 `state.json`，所以 poll 会拿 cookie 的 mtime 跟本次开始时间比：更新了就是 `ok`） | `douyin_login_poll` 读 `state.json`：`waiting` / `scanned` / `ok` / `expired` / `error` |
 | 适合 | 第一次登录；撞了人机验证（滑块常常只有在真窗口里才过得去）；cookie 过期重登 | 已经登录过、只想在设置页里换一次 cookie；不想被弹窗抢焦点、不想挂着一个窗口 |
-| 代价 | 抢焦点；等待期间那次工具调用是阻塞的（默认最多 5 分钟 + 60 秒余量） | 二维码是**截图**，个别缩放比例下可能糊；要设置页开着轮询；起不来时先看 `login/login.log` |
+| 代价 | 抢焦点；窗口最多驻留 5 分钟（`--wait`），等不到就自己退出，**要自己轮询才知道结果** | 二维码是**截图**，个别缩放比例下可能糊；要设置页开着轮询；起不来时先看 `login/login.log` |
 
 **状态文件与临时目录**（`stateDir` = `$DSH_HOME/douyin-duty`）：
 
@@ -307,14 +312,35 @@ $DSH_HOME/douyin-duty/login/
   login.log   qr 模式派生进程的 stdout + stderr（工具起不来时第一个该看的文件）
 ```
 
-**二维码图片端点**（设置页 `<img src="/api/douyin-audio/qr?t=时间戳">` 直接用，同源、无需鉴权）：
+**二维码图片端点**（设置页 `<img src="/api/douyin-audio/qr?t=时间戳">` 直接用；它和其它路由一样要过同源门，
+`<img>` 带不了请求头，所以客户端拿到 token 时会额外拼 `&token=…`）：
 
 ```text
 GET /api/douyin-audio/qr    ->  200  image/png（login/qr.png，cache-control: no-store）
                                404  { ok:false, error:"二维码还没生成（先调用 douyin_login_start 的 qr 模式）", qrPath, stateFile }
 ```
 
-**设置页「登录」区块**（在「提速」和「跑一下」之间）：两个模式单选（`真窗口（推荐）` / `抓二维码到设置页`，切换即 `POST /config {key:'loginMode'}`）＋ 一个「开始登录」按钮（`POST /run {action:'login_start', mode}`）。`qr` 模式随后每 3 秒 `POST /run {action:'login_poll'}`，出结果（`ok` / `expired` / `error`）就停；成功后显示「已登录，cookie 已写入」。
+**所有插件 HTTP 路由都要过同源门**（`/config` / `/run` / `/sysinfo` / `/qr` / `/duty` / `/token`）：
+
+```text
+放行（满足其一，按顺序判）:
+  1) 请求头 x-dsh-douyin-token 是插件签发过且没过期的 token
+     （GET 也可以用 ?token=…：给 <img> 这种带不了请求头的地方）
+  2) Sec-Fetch-Site: same-origin      <- 现代浏览器同源请求必带，设置页靠这条
+  3) Origin 的 host:port 等于本次请求的 Host
+否则一律:
+  403  { ok:false, error:"forbidden: cross-origin or missing token" }   <- 动作不执行
+
+GET /api/douyin-audio/token   ---- 它自己也要过同源门（否则等于没加）
+  -> 200 { ok:true, token:"<32 hex>", expiresInMs:600000, header:"x-dsh-douyin-token" }
+```
+
+token 只在内存里：10 分钟内可复用，进程（宿主）重启就作废，客户端重新取一次即可。
+既没有 Origin 也没有 Sec-Fetch-Site 的请求（curl / 本地进程 / 跨站表单）**默认拒绝**——
+这正是审查报告里 `/api/douyin-audio/config` 不带 cookie 就能读、`POST /run` 带
+`Origin: https://evil.example` 还能真的执行的那个口子。
+
+**设置页「登录」区块**（在「提速」和「跑一下」之间）：两个模式单选（`真窗口（推荐）` / `抓二维码到设置页`，切换即 `POST /config {key:'loginMode'}`）＋ 一个「开始登录」按钮（`POST /run {action:'login_start', mode}`）。两种模式随后都每 3 秒 `POST /run {action:'login_poll'}`，出结果（`ok` / `expired` / `error`）就停；成功后显示「已登录，cookie 已写入」。
 
 **命令行等价物**（不经过 DSH 也能登，契约见 7.3）：
 

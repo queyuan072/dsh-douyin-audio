@@ -73,6 +73,12 @@ DOUYIN_HOST = "https://www.douyin.com"
 DOUYIN_NOTES_URL = DOUYIN_HOST + "/notifications"
 DOUYIN_MESSAGES_URL = DOUYIN_HOST + "/messages"
 _DEFAULT_COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "cookies", "douyin_cookies.txt")
+
+# 页面跳转只允许抖音自己的域名（防 SSRF：douyin_video --url http://127.0.0.1:8080/
+# 会把内网页面的文本当抖音内容读回来）。判据是 urlsplit().hostname，不做子串匹配。
+_DOUYIN_HOST_SUFFIXES = ("douyin.com", "iesdouyin.com", "amemv.com", "douyinvod.com")
+_SHORT_HOSTS_EXTRA = ("v.douyin.com",)
+
 UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
 # 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
@@ -102,6 +108,20 @@ class StepError(Exception):
         super().__init__("{}: {}".format(step, reason))
         self.step = step
         self.reason = reason
+
+
+def _assert_douyin_url(url, step="url"):
+    """只放行抖音域名（douyin.com 及其子域 / v.douyin.com / iesdouyin.com），否则抛 StepError。
+    所有 page.goto 之前的入口都必须过这一关：脚本不接受任何任意的 http(s) 地址。"""
+    raw = (url or "").strip()
+    try:
+        host = (urllib.parse.urlsplit(raw).hostname or "").lower().rstrip(".")
+    except Exception:
+        host = ""
+    if host and (host in _SHORT_HOSTS_EXTRA
+                 or any(host == suf or host.endswith("." + suf) for suf in _DOUYIN_HOST_SUFFIXES)):
+        return url
+    raise StepError(step, "只允许抖音域名，收到 {}".format(host or "(空)"))
 
 
 def _brief(exc, limit=240):
@@ -143,7 +163,11 @@ def _load_douyin_cookie(cookie_file=None):
         with open(path, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.strip()
-                if not ln or ln.startswith("#"):
+                if ln.startswith("#HttpOnly_"):
+                    # netscape 用 #HttpOnly_ 前缀标记 httpOnly：剥掉前缀继续解析，
+                    # 否则 sessionid 这类整条 httpOnly 的 cookie 会被当注释丢弃
+                    ln = ln[len("#HttpOnly_"):]
+                elif not ln or ln.startswith("#"):
                     continue
                 parts = ln.split("\t")
                 if len(parts) >= 7:
@@ -161,7 +185,9 @@ def _cookie_records(cookie_file=None):
         with open(path, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.rstrip("\n")
-                if not ln or ln.startswith("#"):
+                if ln.startswith("#HttpOnly_"):
+                    ln = ln[len("#HttpOnly_"):]   # 剥掉 httpOnly 标记，别当注释丢掉
+                elif not ln or ln.startswith("#"):
                     continue
                 parts = ln.split("\t")
                 if len(parts) < 7:
@@ -1215,8 +1241,11 @@ def _await_verify(page, args, step, verify_hint=None):
 
 
 def _goto(page, url, args, step, verify_hint=None):
-    """打开页面；被验证页挡住就抛 StepError（verify_hint 用来给某个子命令定制话术）"""
+    """打开页面；被验证页挡住就抛 StepError（verify_hint 用来给某个子命令定制话术）
+    域名白名单在 goto 之前把关：不是抖音域名就抛 StepError，一个字节都不发往浏览器。"""
+    url = _assert_douyin_url(url, step)
     url = _resolve_short_url(url)
+    url = _assert_douyin_url(url, step)   # 短链跳转后的落地地址也要在同一白名单内
     log("打开 {}".format(url))
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000))
@@ -1503,7 +1532,8 @@ def _note_url(raw):
     if m:
         return "{}/note/{}".format(DOUYIN_HOST, m.group(1))
     if raw.startswith("http") or re.match(r"^v\.douyin\.com/", raw):
-        return raw  # 短链交给 _goto 里的 _resolve_short_url
+        # 短链交给 _goto 里的 _resolve_short_url；域名白名单先把关
+        return _assert_douyin_url(raw if raw.startswith("http") else "https://" + raw, "note")
     raise StepError("note", "无法识别的图文地址: {}".format(raw[:120]))
 
 
@@ -1518,7 +1548,8 @@ def _video_url(raw):
     if m:
         return "{}/video/{}".format(DOUYIN_HOST, m.group(1))
     if raw.startswith("http"):
-        return raw  # 短链/分享链接交给抖音自己跳转
+        # 短链/分享链接交给抖音自己跳转；先过域名白名单（防 SSRF）
+        return _assert_douyin_url(raw, "video")
     raise StepError("video", "无法识别的视频地址: {}".format(raw[:120]))
 
 

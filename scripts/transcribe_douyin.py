@@ -473,7 +473,8 @@ def run(argv: list[str] | None = None) -> int:
             result["items"].append({"source": it["source"], "text": "", "error": "找不到 ffmpeg"})
         return finish(2)
 
-    need_url = any(it["url"] for it in items)
+    # 本地文件已存在时不需要下载（清单同时给直链与本地路径时以本地为准）
+    need_url = any(it["url"] and not (it["local"] and os.path.exists(it["local"])) for it in items)
     yt_dlp = resolve_tool(args.yt_dlp, "yt-dlp") if need_url else None
     if need_url and not yt_dlp:
         eprint("[错误] 清单里有直链，但找不到 yt-dlp：请装到 PATH 或用 --yt-dlp 指定")
@@ -521,11 +522,15 @@ def run(argv: list[str] | None = None) -> int:
             if not tmp_root:
                 raise RuntimeError("没有可写的临时目录（可用 DSH_DOUYIN_TMP 指定）")
             media, downloaded = it["local"], ""
-            if it["url"]:
+            if media and os.path.exists(media):
+                pass  # 本地文件就在手边：不再为同一段声音下载一遍
+            elif it["url"]:
                 downloaded = download(yt_dlp, it["url"], tmp_root, args.cookies)
                 media = downloaded
-            elif not os.path.exists(media):
+            elif media:
                 raise RuntimeError(f"文件不存在: {media}")
+            else:
+                raise RuntimeError("既没有直链，本地文件也不存在")
             try:
                 if entry["duration"] is None:  # 下载来的媒体只能到这一步才量
                     entry["duration"] = probe_duration(ffmpeg, media)

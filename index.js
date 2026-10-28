@@ -11,6 +11,7 @@
  *   运行痕迹写 <stateDir>/duty.json；apply() 里起一个 60 秒的调度器，五条全中才自己跑一轮
  */
 import { spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { arch, cpus, platform, tmpdir, totalmem } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -472,13 +473,23 @@ export async function autoTranscribeLatest(items, cfg, n = 1, log = null) {
 }
 
 /** 刷完的返回体：脚本输出 + 清单（items/totalMB/manifestPath）+ autoTranscribe（关着是 null） */
+/** 实际刷了几屏：优先读脚本自己打的那行（"  下滑屏数: 3"），没有就看 manifest 行数（脚本每轮 w 覆盖写） */
+export function actualScreens(stdout, items) {
+  const m = /下滑屏数\s*[:：]\s*(\d+)/.exec(String(stdout || ''))
+  if (m) return Number(m[1])
+  return Array.isArray(items) ? items.length : 0
+}
+
 export async function scrollResult({ ok, code, stdout, stderr, count, cfg, log } = {}) {
   const out = String(stdout || '')
   const mf = manifestItems()
   return {
     ok: !!ok && out.includes('本次刷视频统计'),
     exitCode: code,
-    screens: count,
+    // screens 是**实际**刷到的屏数（脚本输出 / manifest 行数），不是请求的 count ——
+    // 撞登录墙 / 验证码被提前挡下时两者不一样，回请求值等于骗人；请求值另存 screensRequested
+    screens: actualScreens(out, mf.items),
+    screensRequested: count === undefined || count === null ? null : count,
     items: mf.items,
     totalMB: mf.totalMB,
     manifestPath: mf.manifestPath,
@@ -488,14 +499,103 @@ export async function scrollResult({ ok, code, stdout, stderr, count, cfg, log }
   }
 }
 
-/** 读 POST body（限 256KB） */
+/** POST body 上限：超过就掐连接 */
+const BODY_MAX = 262144
+
+/** 读 POST body（限 256KB）：超限先 resolve({}) 再 destroy —— destroy 之后 'end'/'error' 可能都不再来 */
 function readJson(req) {
   return new Promise((resolve) => {
     let buf = ''
-    req.on('data', (c) => { buf += c; if (buf.length > 262144) req.destroy() })
-    req.on('end', () => { try { resolve(JSON.parse(buf || '{}')) } catch { resolve({}) } })
-    req.on('error', () => resolve({}))
+    let settled = false
+    const done = (v) => { if (!settled) { settled = true; resolve(v) } }
+    req.on('data', (c) => {
+      if (settled) return
+      buf += c
+      if (buf.length <= BODY_MAX) return
+      buf = ''
+      done({})
+      try { req.destroy() } catch { /* 连接已经断了 */ }
+    })
+    req.on('end', () => { try { done(JSON.parse(buf || '{}')) } catch { done({}) } })
+    req.on('error', () => done({}))
   })
+}
+
+// ── 同源鉴权（插件 HTTP 路由唯一的门）───────────────────────────────────────
+// 宿主自己的 /api/version 有鉴权，插件挂的 prefix 路由没有：任何本地进程、任何网页
+// （跨站表单、text/plain 的简单请求、fetch no-cors）都能打进来执行动作。这里补一道同源门，
+// 三种情形放行，其余一律 403 且**不执行任何动作**：
+//   ① 带本插件签发的 token（x-dsh-douyin-token，或 GET 的 ?token=）
+//   ② Sec-Fetch-Site: same-origin（现代浏览器同源请求必带）
+//   ③ Origin 存在且它的 host:port 等于本次请求的 Host
+// 三条都不满足（典型：curl / 本地进程 / 无 Origin 的跨站请求）→ 拒绝。
+const AUTH_TOKEN_TTL_MS = 10 * 60 * 1000
+const AUTH_TOKEN_HEADER = 'x-dsh-douyin-token'
+const authTokens = new Map()   // token -> 过期时间戳（只在内存里，进程重启即失效）
+
+/** 签发一个 32 hex token（10 分钟内可复用；顺手清掉过期的，别让 Map 无限长） */
+function issueAuthToken() {
+  const now = Date.now()
+  for (const [t, exp] of authTokens) if (exp <= now) authTokens.delete(t)
+  const token = randomBytes(16).toString('hex')
+  authTokens.set(token, now + AUTH_TOKEN_TTL_MS)
+  return token
+}
+
+/** token 还在有效期内？（过期的顺手删掉） */
+function authTokenValid(token) {
+  const t = String(token || '').trim()
+  if (!t) return false
+  const exp = authTokens.get(t)
+  if (!exp) return false
+  if (exp <= Date.now()) { authTokens.delete(t); return false }
+  return true
+}
+
+/** 取头字段：名字大小写不定（宿主 Node 给的是小写，手搓的桩可能不是） */
+function headerOf(req, name) {
+  const headers = (req && req.headers) || {}
+  const want = String(name).toLowerCase()
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() !== want) continue
+    const v = headers[k]
+    return Array.isArray(v) ? String(v[0] === undefined ? '' : v[0]) : String(v === undefined || v === null ? '' : v)
+  }
+  return ''
+}
+
+/** 'https://h:1/x' / 'h:1' → 'h:1'（小写；解析不了就是空串） */
+function hostOf(value) {
+  const s = String(value || '').trim().toLowerCase()
+  if (!s) return ''
+  try { return new URL(s.includes('://') ? s : 'http://' + s).host.toLowerCase() } catch { return '' }
+}
+
+/** 同源判定：{ ok, via } —— via 只进日志/返回体，方便排查「为什么被拦」 */
+function sameOrigin(req, queryToken) {
+  if (authTokenValid(headerOf(req, AUTH_TOKEN_HEADER)) || authTokenValid(queryToken)) return { ok: true, via: 'token' }
+  const site = headerOf(req, 'sec-fetch-site').trim().toLowerCase()
+  if (site === 'same-origin') return { ok: true, via: 'sec-fetch-site' }
+  const origin = hostOf(headerOf(req, 'origin'))
+  if (origin && origin === hostOf(headerOf(req, 'host'))) return { ok: true, via: 'origin' }
+  return { ok: false, via: null, site: site || null, origin: headerOf(req, 'origin') || null }
+}
+
+/** 数值型配置的硬底线（非法直接拒绝，不夹取） */
+const NUMERIC_CFG_RULES = {
+  count: { min: 1, label: '屏数' },
+  delay: { min: 0, label: '每屏停留秒数' },
+  downloadTimeout: { min: 30, label: '单个视频下载超时（秒）' },
+}
+
+/** 数值校验：没问题返回 null，有问题返回人话。工具与 HTTP /config 共用一套规则 */
+function checkNumericCfg(key, v) {
+  const rule = NUMERIC_CFG_RULES[key]
+  if (!rule) return null
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < rule.min) {
+    return key + '（' + rule.label + '）需 >= ' + rule.min + '，收到 ' + JSON.stringify(v === undefined ? null : v)
+  }
+  return null
 }
 
 function tail(text, n = 12) {
@@ -1051,7 +1151,7 @@ export function apply(ctx, config = {}) {
       code: 'TIER_DISABLED',
       tier,
       reason: '该能力属于「' + TIER_LABEL[tier] + '」，当前未开启',
-      hint: '在设置页「能力等级」打开 ' + key + '，或调用 douyin_config 设置该键',
+      hint: '在设置页「能力等级」打开 ' + key + '（这一档只能由用户自己开：douyin_config 会拒绝改 tier*）',
     }
   }
 
@@ -1078,13 +1178,16 @@ export function apply(ctx, config = {}) {
     const delay = Math.max(0.5, Math.min(Number(args.delay) || cfg.delay || 1.5, 30))
     const headless = args.headless !== undefined ? !!args.headless : !!cfg.headless
     const saveAll = args.saveAll !== undefined ? !!args.saveAll : !!cfg.saveAll
+    const downloadTimeout = Number(cfg.downloadTimeout) || 300
     const argv = ['--tab', 'recommend', '--count', String(count), '--delay', String(delay),
-      '--download-timeout', String(cfg.downloadTimeout || 300)]
+      '--download-timeout', String(downloadTimeout)]
     if (headless) argv.push('--headless')
     if (saveAll) argv.push('--save-all')
     argv.push('--work-dir', workRoot())
     argv.push(...(await browserArgvFor(python, SCRIPT_SCROLL, cfg)))
-    const budget = count * (delay + 12) + 120
+    // 父进程预算：每屏 = 停留 + 启动/滚动杂项 12s + **一次下载超时**（取 max(默认 300, downloadTimeout)）。
+    // 原来漏了下载那一项：逐屏下载慢的时候脚本还在跑，父进程先把超时打到底，返回体就成了假失败。
+    const budget = count * (delay + 12 + Math.max(300, downloadTimeout)) + 120
     const r = await runPython(python, SCRIPT_SCROLL, argv, { timeoutSec: budget, log })
     log('scroll 结束 code=' + r.code)
     // 返回体由 scrollResult 统一拼：清单 + autoTranscribe（关着是 null）
@@ -1579,21 +1682,31 @@ export function apply(ctx, config = {}) {
       try { mkdirSync(loginDir(), { recursive: true }) } catch { /* 建不了后面写文件会报，工具不崩 */ }
 
       if (mode === 'window') {
-        log('login(window) 开始: ' + python)
+        // 后台派生 + douyin_login_poll 轮询：前台等满 5 分钟会把宿主 HTTP / 工具调用掐断，
+        // 掐断后用户看到「登录失败」，而窗口其实还开着。先写一份 boot 状态给 poll 兜着，
+        // cookie 一落地（mtime 比 startedAt 新）poll 就报 phase=ok。
+        const startedAt = Date.now()
+        const boot = { phase: 'waiting', at: startedAt, message: '窗口已打开：在里面扫码 / 过验证', cookiePath: null, mode: 'window' }
+        try { writeFileSync(loginStatePath(), JSON.stringify(boot, null, 2), 'utf8') } catch { /* poll 读不到会说没状态 */ }
         const winArgv = ['--mode', 'window', '--wait', String(LOGIN_WAIT), '--out', cookiePath,
           ...(await browserArgvFor(python, SCRIPT_LOGIN, cfg))]
-        const r = await runPython(python, SCRIPT_LOGIN, winArgv,
-          { timeoutSec: LOGIN_WAIT + 60, log, tmpDir: join(stateDir(), 'wavtmp') })
-        const loggedIn = !!r.ok && existsSync(cookiePath)
-        log('login(window) 结束 code=' + r.code + ' loggedIn=' + loggedIn)
-        const out = { ok: !!r.ok, mode, loggedIn, cookiePath, exitCode: r.code, script: SCRIPT_LOGIN }
-        if (!r.ok) {
-          out.reason = r.code === 2
-            ? '窗口里等超时了（' + LOGIN_WAIT + 's 内没检测到登录）'
-            : '登录脚本退出码 ' + r.code
-          out.output = tail(String(r.stdout || '') + '\n' + String(r.stderr || ''), 10)
+        const sp = await spawnLoginBg(python, winArgv, log)
+        if (!sp.ok) {
+          return { ok: false, mode, stateFile: loginStatePath(), log: loginLogPath(), cookiePath,
+            reason: '后台派生登录脚本失败：' + sp.reason }
         }
-        return out
+        log('login(window) 已派生 pid=' + sp.pid + '，日志 ' + loginLogPath())
+        return {
+          ok: true,
+          started: true,
+          mode,
+          phase: 'waiting',
+          pid: sp.pid,
+          stateFile: loginStatePath(),
+          cookiePath,
+          log: loginLogPath(),
+          hint: '窗口已经弹出：扫码 / 过验证后调用 douyin_login_poll 看进度（phase=ok 就是成功，cookie 已落盘）',
+        }
       }
 
       // qr：先把上一轮的痕迹清掉（旧 qr.png 会被当成新码，旧 state.json=ok 会让 poll 直接说已登录）
@@ -1654,7 +1767,14 @@ export function apply(ctx, config = {}) {
           at: null, mode: null, stateFile, qrPath, hasQr,
         }
       }
-      const phase = String(st.phase || '') || 'waiting'
+      let phase = String(st.phase || '') || 'waiting'
+      // window 模式的脚本只写 cookie、不写 state.json：cookie 比本次开始时间新（留 1s 容差）= 已经登上了
+      if (phase !== 'ok' && phase !== 'error' && phase !== 'expired') {
+        const startedAt = Number(st.at) || 0
+        try {
+          if (startedAt && statSync(loginCookieFile()).mtimeMs >= startedAt - 1000) phase = 'ok'
+        } catch { /* cookie 还没写出来：继续按 state.json 说的报 */ }
+      }
       const atNum = Number(st.at)
       const at = st.at === undefined || st.at === null || st.at === '' || !Number.isFinite(atNum) ? null : atNum
       const cookie = st.cookiePath === undefined || st.cookiePath === null || st.cookiePath === ''
@@ -1743,7 +1863,21 @@ export function apply(ctx, config = {}) {
           try { res.statusCode = code; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(obj)) } catch {}
         }
         try {
-          const sub = new URL(req.url || '/', 'http://127.0.0.1').pathname.replace(/^\/api\/douyin-audio/, '') || '/'
+          const reqUrl = new URL(req.url || '/', 'http://127.0.0.1')
+          const sub = reqUrl.pathname.replace(/^\/api\/douyin-audio/, '') || '/'
+          // 同源门在最前面：不满足就 403，**后面一个分支都不走**（动作绝不执行）
+          const gate = sameOrigin(req, reqUrl.searchParams.get('token'))
+          if (!gate.ok) {
+            log('HTTP 拒绝（不是同一来源：' + (gate.origin ? 'origin=' + gate.origin + ' ' : '')
+              + (gate.site ? 'sec-fetch-site=' + gate.site : '没有 Origin / Sec-Fetch-Site') + '）: '
+              + String(req.method || '') + ' ' + sub)
+            try { if (typeof req.resume === 'function') req.resume() } catch { /* 把 body 丢掉，别把连接挂住 */ }
+            return send(403, { ok: false, error: 'forbidden: cross-origin or missing token' })
+          }
+          // token 端点：本身也过同源门（否则等于没加）。设置页挂载时取一次，之后带 x-dsh-douyin-token。
+          if (req.method === 'GET' && sub === '/token') {
+            return send(200, { ok: true, token: issueAuthToken(), expiresInMs: AUTH_TOKEN_TTL_MS, header: AUTH_TOKEN_HEADER })
+          }
           if (req.method === 'GET' && sub === '/config') return send(200, { ok: true, config: merged() })
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
           if (req.method === 'GET' && sub === '/sysinfo') {
@@ -1757,7 +1891,8 @@ export function apply(ctx, config = {}) {
             try { architecture = arch() } catch { architecture = '' }
             return send(200, { ok: true, cores, platform: plat, arch: architecture, totalMemGB })
           }
-          // 二维码图片：设置页 <img src="/api/douyin-audio/qr?t=…"> 直接显示（同源、无需鉴权）
+          // 二维码图片：设置页 <img src="/api/douyin-audio/qr?t=…"> 直接显示（同源门放行；
+          // <img> 带不了请求头，所以同源判据之外也认 ?token=）
           if (req.method === 'GET' && sub === '/qr') {
             let png = null
             try { png = readFileSync(loginQrPath()) } catch { png = null }
@@ -1788,6 +1923,9 @@ export function apply(ctx, config = {}) {
             if (typeof cfg[key] === 'boolean') v = String(v).toLowerCase() === 'true'
             else if (typeof cfg[key] === 'number') v = Number(v)
             if (typeof cfg[key] === 'number' && Number.isNaN(v)) return send(400, { ok: false, error: 'value 不是数字' })
+            // 数值底线与 douyin_config 同一套（count>=1 / delay>=0 / downloadTimeout>=30）
+            const badNum = checkNumericCfg(key, v)
+            if (badNum) return send(400, { ok: false, error: badNum })
             cfg[key] = v
             const r = saveCfg(cfg)
             return r && r.ok === false ? send(500, { ok: false, error: r.error }) : send(200, { ok: true, config: cfg })
@@ -1825,7 +1963,7 @@ export function apply(ctx, config = {}) {
         }
       },
     }), 'douyin-audio: /api/douyin-audio 路由')
-    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr,duty}（run 认得 status / scroll / login_* / duty_* / setup_*）')
+    log('HTTP 接口已挂载: /api/douyin-audio/{config,run,sysinfo,qr,duty,token}（同源鉴权：Sec-Fetch-Site / Origin / x-dsh-douyin-token；run 认得 status / scroll / login_* / duty_* / setup_*）')
   } catch (e) { log('HTTP 路由没挂上: ' + (e && e.message ? e.message : e)) }
 
   // ── 谷时自动刷调度：每 60 秒判定一次（apply 时启动，dispose 时清掉）──────
@@ -1867,13 +2005,24 @@ export function apply(ctx, config = {}) {
       const cfg = cfgAll()
       if ((args.action || 'get') === 'get') return { ok: true, config: cfg, stateDir: stateDir() }
       const key = String(args.key || '')
-      // tier* 四键即使 config.json 里还没有也允许写：等级开关不能被「未知配置键」挡住
-      const isTierKey = Object.prototype.hasOwnProperty.call(TIER_DEFAULTS, key)
-      if (!(key in cfg) && !isTierKey) return { ok: false, reason: '未知配置键: ' + key, keys: Object.keys(cfg) }
+      // 能力等级（tier*）**只能由用户在设置页改**：agent 能自己解锁的话，闸门等于没设。
+      // 设置页那条 HTTP /config 路照旧能写 tier*（那是用户自己点的开关，而且要过同源鉴权）。
+      if (Object.prototype.hasOwnProperty.call(TIER_DEFAULTS, key)) {
+        log('拒绝 agent 修改能力等级: ' + key)
+        return {
+          ok: false,
+          error: '能力等级只能由用户在设置页修改',
+          key,
+          hint: '设置页「能力等级」那一节由用户自己点；douyin_config 只改基础配置',
+        }
+      }
+      if (!(key in cfg)) return { ok: false, reason: '未知配置键: ' + key, keys: Object.keys(cfg) }
       let v = args.value
-      if (isTierKey || typeof cfg[key] === 'boolean') v = String(v).toLowerCase() === 'true'
+      if (typeof cfg[key] === 'boolean') v = String(v).toLowerCase() === 'true'
       else if (typeof cfg[key] === 'number') v = Number(v)
       if (typeof cfg[key] === 'number' && Number.isNaN(v)) return { ok: false, reason: 'value 不是数字' }
+      const badNum = checkNumericCfg(key, v)
+      if (badNum) return { ok: false, error: badNum }
       cfg[key] = v
       saveCfg(cfg)
       return { ok: true, config: cfg }

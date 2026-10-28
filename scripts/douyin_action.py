@@ -67,6 +67,10 @@ except Exception:
 
 DOUYIN_HOST = "https://www.douyin.com"
 _DEFAULT_COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "cookies", "douyin_cookies.txt")
+
+# 跳转只允许抖音自己的域名（防 SSRF：--url http://127.0.0.1:8080/ 之类绝不放行）
+_DOUYIN_HOST_SUFFIXES = ("douyin.com", "iesdouyin.com", "amemv.com", "douyinvod.com")
+_SHORT_HOSTS_EXTRA = ("v.douyin.com",)
 UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
 # 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底（与 douyin_read.py 完全一致）
@@ -139,6 +143,20 @@ class StepError(Exception):
         self.reason = reason
 
 
+def _assert_douyin_url(url, step="url"):
+    """只放行抖音域名（douyin.com 及其子域 / v.douyin.com / iesdouyin.com），否则抛 StepError。
+    所有 page.goto 之前的入口都必须过这一关。"""
+    raw = (url or "").strip()
+    try:
+        host = (urllib.parse.urlsplit(raw).hostname or "").lower().rstrip(".")
+    except Exception:
+        host = ""
+    if host and (host in _SHORT_HOSTS_EXTRA
+                 or any(host == suf or host.endswith("." + suf) for suf in _DOUYIN_HOST_SUFFIXES)):
+        return url
+    raise StepError(step, "只允许抖音域名，收到 {}".format(host or "(空)"))
+
+
 def _brief(exc, limit=240):
     """异常压成一行短句（playwright 的异常常带多行 call log）"""
     try:
@@ -189,7 +207,9 @@ def _cookie_records(cookie_file=None):
         with open(path, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.rstrip("\n")
-                if not ln or ln.startswith("#"):
+                if ln.startswith("#HttpOnly_"):
+                    ln = ln[len("#HttpOnly_"):]   # 剥掉 httpOnly 标记，别当注释丢掉
+                elif not ln or ln.startswith("#"):
                     continue
                 parts = ln.split("\t")
                 if len(parts) < 7:
@@ -567,13 +587,17 @@ def _video_url(raw):
     if m:
         return "{}/video/{}".format(DOUYIN_HOST, m.group(1))
     if raw.startswith("http") or re.match(r"^v\.douyin\.com/", raw):
-        return raw  # 短链交给 _goto 里的 _resolve_short_url
+        # 短链交给 _goto 里的 _resolve_short_url；域名白名单先把关（防 SSRF）
+        return _assert_douyin_url(raw if raw.startswith("http") else "https://" + raw, "url")
     raise StepError("url", "无法识别的视频地址: {}".format(raw[:120]))
 
 
 def _goto(page, url, args, step, verify_hint=None):
-    """打开页面；被验证页挡住就抛 StepError"""
+    """打开页面；被验证页挡住就抛 StepError。
+    域名白名单在 goto 之前把关：不是抖音域名就抛 StepError，一个字节都不发往浏览器。"""
+    url = _assert_douyin_url(url, step)
     url = _resolve_short_url(url)
+    url = _assert_douyin_url(url, step)   # 短链跳转后的落地地址也要还在白名单内
     log("打开 {}".format(url))
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000))
@@ -604,8 +628,9 @@ def _present(page, selector):
         return False
 
 
-def _read_count(page, selector):
-    """读按钮 innerText 里的数字（点赞数 / 收藏数）。读不到就是 0。"""
+def _read_text(page, selector):
+    """读按钮 innerText 原文（读不到就是空串）。判断「读数可不可观测」必须看原文，
+    因为 "1.2万" 和 "1.3万" 解析成同一个整数，光看数字分不出点击到底动没动。"""
     loc = _locator(page, selector)
     text = ""
     for attempt in (1, 2):
@@ -618,7 +643,25 @@ def _read_count(page, selector):
             else:
                 with contextlib.suppress(Exception):
                     page.wait_for_timeout(300)
-    return parse_count(text)
+    return text or ""
+
+
+def _read_count(page, selector):
+    """读按钮 innerText 里的数字（点赞数 / 收藏数）。读不到就是 0。"""
+    return parse_count(_read_text(page, selector))
+
+
+# 缩写单位：1.2万 / 1.2w / 3k 这类读数被截断了精度，前后相同并不代表「没变」
+_ABBREV_RE = re.compile(r"[万亿千wWkK]")
+
+
+def _count_observable(text):
+    """读数是否「可观测」：有数字，且没有被 万/亿 这类缩写吃掉精度。
+    不可观测时 before == after 不能作为「点击没生效」的证据。"""
+    s = (text or "").strip()
+    if not re.search(r"\d", s):
+        return False
+    return not _ABBREV_RE.search(s)
 
 
 _PRESSED_JS = """(sel) => {
@@ -749,9 +792,9 @@ def _wait_change(page, selector, baseline, login_probe=None):
 
 
 def _payload(action, url, before, after, changed, state, need_login=False, error=None,
-             clicks=0, corrected=False):
+             clicks=0, corrected=False, reason=None):
     payload = {
-        "ok": error is None,
+        "ok": error is None and reason is None,
         "action": action,
         "url": url,
         "before": before,
@@ -764,6 +807,8 @@ def _payload(action, url, before, after, changed, state, need_login=False, error
     }
     if error is not None:
         payload["error"] = error
+    if reason is not None:
+        payload["reason"] = reason
     return payload
 
 
@@ -784,11 +829,11 @@ def _login_appeared(page, pre_nodes, pre_hits):
 
 
 def _login_reason(page, pre_nodes, pre_hits, prev, after):
-    """点击后是否出现登录拦截；命中返回一句原因，否则 None。
-    「点击后才冒出」才算；点击前就有但点击完全没反应，也按需要登录处理（否则会把登录墙误判成 uncertain）。"""
+    """点击后是否**新增**了登录拦截；命中返回一句原因，否则 None。
+    只认「点击后冒出来的」：点击前页面上本来就有「登录」字样不算 —— 那不是这次点击的后果。"""
     post_nodes, post_hits = _login_present(page)
     appeared = (post_nodes > pre_nodes) or (len(post_hits) > len(pre_hits))
-    if appeared or ((post_nodes or post_hits) and after == prev):
+    if appeared:
         return "登录弹窗节点 {}->{}，正文关键词 {}->{}".format(
             pre_nodes, post_nodes, pre_hits or "无", post_hits or "无")
     return None
@@ -807,8 +852,9 @@ def perform(page, args, action, url=None):
     if not _present(page, selector):
         raise StepError(step, "按钮没找到（{} 未命中；页面可能不是视频页，或抖音改版了）".format(selector))
 
-    before = _read_count(page, selector)
-    log("{} 前：{} = {}".format(verb, selector, before))
+    before_text = _read_text(page, selector)
+    before = parse_count(before_text)
+    log("{} 前：{} = {}（原文 {!r}）".format(verb, selector, before, before_text))
     pre_nodes, pre_hits = _login_present(page)
     pressed = _pressed_hint(page, selector)
     if pressed is not None:
@@ -827,9 +873,9 @@ def perform(page, args, action, url=None):
     login_wall = bool(pre_nodes or pre_hits)   # 页面上已经有登录提示：点击预算收短，别在 actionability 上耗
     login_error = ("需要登录：点击后弹出了登录窗口（{}），未登录状态不能{}；"
                    "请先扫码登录（douyin_login_start）后重试")
-    # 已有登录墙时更不用等：数字不动就是被墙挡住（_login_reason 会判 needLogin），
-    # 真机实测这一条把「未登录」场景从 70 秒压到十几秒
-    probe = lambda: login_wall or _login_appeared(page, pre_nodes, pre_hits)
+    # 轮询探针只认「点击后新增的登录信号」。页面本来就有「登录」字样时不能恒真 ——
+    # 恒真会让 _wait_change 提前退出、把「数字没动」一律判成 needLogin
+    probe = lambda: _login_appeared(page, pre_nodes, pre_hits)
 
     # ---- 第 1 次点击 ----
     _click_button(page, selector, action, timeout_s=timeout_s, login_wall=login_wall)
@@ -848,6 +894,21 @@ def perform(page, args, action, url=None):
     if _intent_met(action, before, after):
         return _payload(action, url, before, after, after != before, target_state,
                         clicks=clicks, corrected=False)
+
+    # ---- 读数不可观测（缩写/缺失）：不做反向补点 ----
+    # 点赞数被缩写成「1.2万」时，点 1 次成功的读数和没点一样，"1.2万" -> "1.3万" 也可能还是 12000。
+    # 此时再点一次会直接把状态 toggle 回去 —— 宁可如实报 uncertain，也不翻反用户的赞。
+    # 只有走到「判失败」这条路才需要原文；读不到就按不可观测处理（更保守）
+    try:
+        after_text = _read_text(page, selector)
+    except StepError:
+        after_text = ""
+    if not (_count_observable(before_text) and _count_observable(after_text)):
+        reason = "计数不可观测（缩写或缺失），未做二次点击以避免翻反状态"
+        log("计数不可观测（{!r} -> {!r}）：不补第二枪，如实报 uncertain".format(
+            before_text, after_text))
+        return _payload(action, url, before, after, after != before, "uncertain",
+                        clicks=clicks, corrected=False, reason=reason)
 
     # ---- 方向不对：隔 >=1 秒再点同一个按钮，把状态纠正回意图 ----
     first = after

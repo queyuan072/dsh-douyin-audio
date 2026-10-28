@@ -50,6 +50,7 @@ import tempfile
 import time
 import urllib.request
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import re
 from playwright.sync_api import sync_playwright
@@ -71,6 +72,32 @@ def _resolve_cookie_file(cli_cookies=None):
 DOUYIN_COOKIE_FILE = _resolve_cookie_file()
 
 
+# 抖音视频/CDN 域后缀白名单：只有这些 host 才允许附带登录态 Cookie
+# （判据是 urlsplit().hostname 的后缀，绝不用「URL 里出现过 douyinvod.com」这种子串匹配）
+_MEDIA_HOST_SUFFIXES = (
+    "douyinvod.com", "douyin.com", "amemv.com", "byteimg.com", "douyinpic.com",
+    "douyinstatic.com", "bytecdn.cn", "pstatp.com", "snssdk.com",
+)
+
+
+def _host_of(url):
+    """URL → 小写 hostname；解析不出来就返回空串（绝不抛）"""
+    try:
+        return (urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except Exception:
+        return ""
+
+
+def _is_douyin_media_host(url):
+    """候选直链的 host 是否属于抖音自己的 CDN（后缀白名单）。
+    攻击者能让页面出现 https://evil.example/x?u=douyinvod.com 这种 URL，
+    所以判据只能是 host 本身，不能是整条 URL 的子串。"""
+    host = _host_of(url)
+    if not host:
+        return False
+    return any(host == suf or host.endswith("." + suf) for suf in _MEDIA_HOST_SUFFIXES)
+
+
 def _load_douyin_cookie():
     """读游客 cookie（netscape 格式）→ Cookie 头；抖音 CDN 无 cookie 会降级返回纯视频流（无音轨）"""
     try:
@@ -78,7 +105,11 @@ def _load_douyin_cookie():
         with open(DOUYIN_COOKIE_FILE, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.strip()
-                if not ln or ln.startswith("#"):
+                if ln.startswith("#HttpOnly_"):
+                    # netscape 用 #HttpOnly_ 前缀标记 httpOnly；剥掉前缀继续解析，
+                    # 否则 sessionid 这类整条 httpOnly 的 cookie 会被当注释丢掉
+                    ln = ln[len("#HttpOnly_"):]
+                elif not ln or ln.startswith("#"):
                     continue
                 parts = ln.split("\t")
                 if len(parts) >= 7:
@@ -91,10 +122,29 @@ def _load_douyin_cookie():
 _video_urls = []
 
 
+# 候选 URL 的路径特征（真正的视频流才会命中；先判 host 再判路径）
+_MEDIA_URL_HINT = re.compile(r"douyinvod\.com|/aweme/v1/play", re.I)
+_STATIC_URL = re.compile(r"\.(?:js|css|png|jpe?g|webp|gif|ico)(?:[?#]|$)", re.I)
+
+
+def _looks_like_media_url(u):
+    """是不是候选视频直链：必须 http(s) + host 在 CDN 白名单 + 路径像视频流"""
+    if not u or not re.search(r"^https?://", str(u), re.I):
+        return False
+    if not _is_douyin_media_host(u):
+        return False
+    return bool(_MEDIA_URL_HINT.search(u)) and not _STATIC_URL.search(u)
+
+
 def _on_video_response(resp):
     try:
         u = resp.url
-        if re.search(r"douyinvod\.com|aweme/v1/play", u) and not re.search(r"\.js\b|\.css\b", u):
+        if not _is_douyin_media_host(u):
+            # 外域一律不收集：收集了就会在下载时被附带 Cookie（H2）
+            if _MEDIA_URL_HINT.search(str(u or "")):
+                print("[跳过] 非抖音 CDN 域的响应不进候选: {}".format(str(u)[:160]))
+            return
+        if _looks_like_media_url(u):
             _video_urls.append(u)
             if len(_video_urls) > 100:
                 del _video_urls[:-50]
@@ -601,7 +651,16 @@ def grab_media_candidates(page):
     group = _url_group(current)
 
     def same_video(u):
-        return (not group) or (_url_group(u) == group)
+        """是否属于当前这条视频。有 /tos-xxx/<token>/ 段就用它精确分组；
+        拿不到分组时退回「同源 host」的弱判据 —— 绝不因为「分组为空」就放行一切 URL
+        （否则候选里混进外域，下载时就会把登录态带出去）。"""
+        if not u or not isinstance(u, str) or not _is_douyin_media_host(u):
+            return False
+        if group:
+            return _url_group(u) == group
+        if not current:
+            return True
+        return _host_of(u) == _host_of(current)
 
     def audio_hint(u):
         return ("media-audio" in u) or ("audio_mp4" in u) or ("mime_type=audio" in u)
@@ -626,18 +685,25 @@ def grab_media_url(page):
     cands = grab_media_candidates(page)
     return cands[0] if cands else ""
 def download_video(url, path, timeout=300):
-    """带 Referer + cookie 下载视频（含音轨），成功且非空返回 True"""
+    """带 Referer 下载视频（含音轨）；Cookie 只发给抖音 CDN 白名单域，成功且非空返回 True"""
     if not url or not url.startswith("http"):
         return False
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        req = urllib.request.Request(url, headers={
+        headers = {
             "Referer": DOUYIN_URL,
             "User-Agent": UA_STRING,
-            "Cookie": _load_douyin_cookie(),
             "Accept": "*/*",
             "Range": "bytes=0-",
-        })
+        }
+        if _is_douyin_media_host(url):
+            ck = _load_douyin_cookie()
+            if ck:
+                headers["Cookie"] = ck
+        else:
+            print("[跳过] 不附带 Cookie：非抖音 CDN 域 {!r}（只下载视频流本身 {}）".format(
+                _host_of(url) or "(无法解析)", str(url)[:120]))
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r, open(path, "wb") as f:
             shutil.copyfileobj(r, f, 256 * 1024)
         return os.path.getsize(path) > 10000
@@ -857,7 +923,9 @@ def main():
                     scrolled += 1
                     time.sleep(args.delay)
                     last_sig = get_video_signature(page)
-                    if not moved and last_sig == sig_before:
+                    # sig_before 为空 = 这次读不到视频签名（推荐页首屏常见），
+                    # 此时 stall 判定无据可依：不参与，否则 3 屏后就会误报「切换无进展」
+                    if sig_before and not moved and last_sig == sig_before:
                         stall += 1
                         if stall >= STALL_LIMIT:
                             os.makedirs(SHOT_DIR, exist_ok=True)

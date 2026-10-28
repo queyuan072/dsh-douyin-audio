@@ -21,7 +21,8 @@
  *      打开后放行（② 通知与 ① 只读互相独立）；
  *      tierReact=false 时 douyin_react 返回 TIER_DISABLED(tier=react)，打开后放行到参数校验，
  *      再用桩掉的 runPython 断言 argv 里真拼了动作与 url；
- *      五个等级**全关**时基础工具（douyin_config / douyin_login_poll / douyin_duty）都不受影响
+ *      五个等级**全关**时基础工具（douyin_config / douyin_login_poll / douyin_duty）都不受影响；
+ *      **能力等级只能由用户在设置页改**：douyin_config set tier* 一律被拒（agent 不许自己解锁）
  *   g. 浏览器通道 browserChannel：douyin_config 认得这个键，缺省是 msedge；五个取值
  *      msedge / chrome / chromium / firefox / webkit 都认，未知值仍规整成 msedge；
  *      douyin_status 的 browsers 是五个布尔值 + extras 数组（{id,label,path,exists}），
@@ -317,13 +318,22 @@ else {
     ok('tierReact=true 放行（url 非法时走到参数校验）')
   } else problem('tierReact=true 时没放行：' + JSON.stringify(badUrl))
 
-  // douyin_config set tierReact=true → get 读回来是 true（存/读一致，才谈得上「开关真的解锁」）
+  // 能力等级只能由用户在设置页改：douyin_config 必须**拒绝** tier*（agent 自己解锁 = 闸门白设）
   writeCfg({})
   const setReact = await callTool('douyin_config', { action: 'set', key: 'tierReact', value: 'true' })
   const getReact = await callTool('douyin_config', { action: 'get' })
   const reactNow = getReact && getReact.ok === true && getReact.config ? getReact.config.tierReact : undefined
-  if (setReact && setReact.ok === true && reactNow === true) ok('douyin_config set tierReact=true 后 loadCfg 读回来是 true')
-  else problem('tierReact 存/读不一致（set ok=' + JSON.stringify(setReact && setReact.ok) + '，读回来 ' + JSON.stringify(reactNow) + '）')
+  if (setReact && setReact.ok === false && /能力等级只能由用户在设置页修改/.test(String(setReact.error || ''))) {
+    ok('douyin_config set tierReact=true 被拒：' + setReact.error)
+  } else problem('douyin_config 居然改动了能力等级：' + JSON.stringify(setReact))
+  if (reactNow !== true) ok('被拒之后 loadCfg 里 tierReact 还是 ' + JSON.stringify(reactNow) + '（没被偷偷写进去）')
+  else problem('tierReact 被写进 config.json 了：' + JSON.stringify(reactNow))
+  const setTierRead = await callTool('douyin_config', { action: 'set', key: 'tierRead', value: 'false' })
+  if (setTierRead && setTierRead.ok === false && /能力等级/.test(String(setTierRead.error || ''))) {
+    ok('douyin_config set tierRead=false 同样被拒（所有 tier* 一视同仁）')
+  } else problem('tierRead 没被拒：' + JSON.stringify(setTierRead))
+  // 后面几条断言要闸门是开着的：直接写 config.json（等价于用户在设置页把开关点开，不是 agent 那条路）
+  writeCfg({ tierRead: true, tierReact: true })
 
   const badAction = await callTool('douyin_react', { url: 'https://www.douyin.com/video/1', action: 'zap' })
   if (badAction && badAction.code !== 'TIER_DISABLED' && /action/.test(String(badAction.reason || ''))) {
@@ -489,9 +499,13 @@ else {
       throw new Error('setup_auto 不该走前台 runPython')
     },
   })
-  const callRoute = (method, url, body) => new Promise((resolve) => {
+  /* 打路由：默认按「浏览器同源请求」发（同源门要 Sec-Fetch-Site / Origin / token 三选一），
+     headers 显式给就能构造跨站 / 无 Origin / 带 token 的请求。返回 { status, body }。 */
+  const routeRaw = (method, url, body, headers) => new Promise((resolve) => {
     const req = {
-      method, url, headers: {},
+      method,
+      url,
+      headers: headers || { host: '127.0.0.1:59944', 'sec-fetch-site': 'same-origin' },
       on(ev, fn) {
         if (ev === 'data' && body !== undefined) fn(Buffer.from(JSON.stringify(body)))
         if (ev === 'end') fn()
@@ -500,10 +514,87 @@ else {
     }
     let out = null
     const res = { statusCode: 0, setHeader() {}, end(text) { try { out = JSON.parse(text) } catch { out = text } } }
-    Promise.resolve(webRoute(req, res)).then(() => resolve(out), (e) => resolve({ error: String((e && e.message) || e) }))
+    Promise.resolve(webRoute(req, res)).then(
+      () => resolve({ status: res.statusCode, body: out }),
+      (e) => resolve({ status: res.statusCode, body: { error: String((e && e.message) || e) } }),
+    )
   })
+  /* 老用法：只要 body（同源 setup_* 那几条断言照旧） */
+  const callRoute = async (method, url, body) => (await routeRaw(method, url, body)).body
   if (typeof webRoute !== 'function') problem('没捕获到 /api/douyin-audio 路由')
   else {
+    /* ── 同源门（C1）：不同源又没有 token 的请求必须先 403，且**动作不执行** ── */
+    const HOST = '127.0.0.1:59944'
+    const bareH = { host: HOST }                                     // curl / 本地进程：没有 Origin 也没有 Sec-Fetch-Site
+    const evilH = { host: HOST, origin: 'https://evil.example' }     // 审查报告里复现的那个请求
+    const evilSiteH = { host: HOST, origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' }
+    const sameH = { host: HOST, 'sec-fetch-site': 'same-origin' }    // 设置页真正发的形状
+
+    // a. 无 Origin 无 token 的 POST /run → 403，且动作没执行
+    const bareRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, bareH)
+    if (bareRun.status === 403 && bareRun.body && /forbidden: cross-origin or missing token/.test(String(bareRun.body.error || ''))) {
+      ok('POST /run 无 Origin 无 token → 403（' + bareRun.body.error + '）')
+    } else problem('无 Origin 无 token 的 POST /run 没被挡住：' + JSON.stringify(bareRun))
+    if (bareRun.body && bareRun.body.duty === undefined && bareRun.body.todayScreens === undefined) {
+      ok('被挡住的那次没有执行 duty_status（返回体里没有刷屏数据）')
+    } else problem('403 之后动作还是执行了：' + JSON.stringify(bareRun.body))
+
+    // b. 跨站 Origin → 403（没有 Sec-Fetch-Site 也一样）
+    const evilRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, evilH)
+    if (evilRun.status === 403) ok('POST /run 带 Origin: https://evil.example → 403')
+    else problem('跨站 Origin 的 POST /run 没被挡住：' + JSON.stringify(evilRun))
+    const evilCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, evilSiteH)
+    if (evilCfg.status === 403) ok('GET /config 跨站（sec-fetch-site: cross-site）→ 403')
+    else problem('跨站还能读配置：' + JSON.stringify(evilCfg))
+    const bareCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, bareH)
+    if (bareCfg.status === 403) ok('GET /config 无 Origin 无 token → 403（原来直接回整个配置）')
+    else problem('GET /config 还是裸的：' + JSON.stringify(bareCfg))
+
+    // c. token 端点本身也过同源门；同源才发 token
+    const bareToken = await routeRaw('GET', '/api/douyin-audio/token', undefined, bareH)
+    if (bareToken.status === 403) ok('GET /token 无同源 → 403（token 端点自己也得过门）')
+    else problem('GET /token 没被挡住：' + JSON.stringify(bareToken))
+    const tokRes = await routeRaw('GET', '/api/douyin-audio/token', undefined, sameH)
+    const token = tokRes.status === 200 && tokRes.body && typeof tokRes.body.token === 'string' ? tokRes.body.token : ''
+    if (/^[0-9a-f]{32}$/.test(token)) ok('GET /token 带 Sec-Fetch-Site: same-origin → 200，token 是 32 hex')
+    else problem('GET /token 同源没拿到 token：' + JSON.stringify(tokRes))
+
+    // d. 带正确 token → 放行并真的执行；乱写的 token 不顶用
+    const tokRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, { host: HOST, 'x-dsh-douyin-token': token })
+    if (tokRun.status === 200 && tokRun.body && tokRun.body.ok === true) {
+      ok('带正确 x-dsh-douyin-token 的 POST /run → 200 且 duty_status 真的跑了')
+    } else problem('带 token 的 POST /run 没执行：' + JSON.stringify(tokRun))
+    const fakeRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, { host: HOST, 'x-dsh-douyin-token': 'deadbeefdeadbeef' })
+    if (fakeRun.status === 403) ok('乱写的 token 不顶用（还是 403）')
+    else problem('假 token 也放行了：' + JSON.stringify(fakeRun))
+    // ?token=（给 <img> 那种带不了请求头的地方）
+    const qsRun = await routeRaw('POST', '/api/douyin-audio/run?token=' + token, { action: 'duty_status' }, { host: HOST })
+    if (qsRun.status === 200) ok('?token= 查询参数也认（<img> 带不了请求头）')
+    else problem('查询参数里的 token 不认：' + JSON.stringify(qsRun))
+
+    // e. Origin 的 host:port 等于本次 Host → 放行（浏览器同源 POST 就是这么发的）
+    const originSame = await routeRaw('GET', '/api/douyin-audio/sysinfo', undefined, { host: HOST, origin: 'http://' + HOST })
+    if (originSame.status === 200) ok('Origin 与 Host 同源（不带 Sec-Fetch-Site）→ 200，设置页刷新不受影响')
+    else problem('同源 Origin 被误拦：' + JSON.stringify(originSame))
+
+    // f. HTTP /config 写 tier*：跨站 403，同源放行（那是用户自己在设置页点开关）
+    writeCfg({ tierReact: false })
+    const tierCross = await routeRaw('POST', '/api/douyin-audio/config', { key: 'tierReact', value: true }, evilSiteH)
+    if (tierCross.status === 403) ok('跨站 Origin 的 HTTP /config 写 tierReact → 403')
+    else problem('跨站能写 tierReact：' + JSON.stringify(tierCross))
+    const tierSame = await routeRaw('POST', '/api/douyin-audio/config', { key: 'tierReact', value: true }, sameH)
+    if (tierSame.status === 200 && tierSame.body && tierSame.body.ok === true
+      && tierSame.body.config && tierSame.body.config.tierReact === true) {
+      ok('同源的 HTTP /config 能写 tierReact（设置页那条路没被堵）')
+    } else problem('同源 HTTP /config 写 tierReact 失败：' + JSON.stringify(tierSame))
+    writeCfg({ tierReact: false })
+    // g. 数值底线走 HTTP 也生效（与 douyin_config 同一套规则）
+    const httpCount0 = await routeRaw('POST', '/api/douyin-audio/config', { key: 'count', value: 0 }, sameH)
+    if (httpCount0.status === 400 && /count/.test(String((httpCount0.body || {}).error || ''))) {
+      ok('HTTP /config count=0 → 400（数值底线 count>=1）')
+    } else problem('HTTP /config 放过了 count=0：' + JSON.stringify(httpCount0))
+    writeCfg({})
+
     const httpAuto = await callRoute('POST', '/api/douyin-audio/run', { action: 'setup_auto' })
     if (httpAuto && httpAuto.ok === true && httpAuto.started === true && httpAuto.action === 'started' && httpAuto.mode === 'auto') {
       ok('HTTP setup_auto 立刻回 started:true / action=started / mode=auto')
@@ -598,6 +689,21 @@ const cfgLayoutGet = await callTool('douyin_config', { action: 'get' })
 if (cfgLayoutGet && cfgLayoutGet.ok === true && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout === 'tabs') {
   ok('set uiLayout=tabs 后 loadCfg 读回来是 tabs')
 } else problem('uiLayout 存/读不一致：' + JSON.stringify(cfgLayoutGet && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout))
+
+/* ───────── ⑨-ter 数值底线：count>=1 / delay>=0 / downloadTimeout>=30（非法直接拒，不夹取）───────── */
+const numCases = [
+  { key: 'count', value: '0', want: false, why: 'count=0 被拒（屏数 >= 1）' },
+  { key: 'count', value: '2', want: true, why: 'count=2 允许' },
+  { key: 'delay', value: '0', want: true, why: 'delay=0 允许（>= 0）' },
+  { key: 'delay', value: '-1', want: false, why: 'delay=-1 被拒' },
+  { key: 'downloadTimeout', value: '10', want: false, why: 'downloadTimeout=10 被拒（>= 30）' },
+  { key: 'downloadTimeout', value: '30', want: true, why: 'downloadTimeout=30 允许（下限刚好）' },
+]
+for (const c of numCases) {
+  const r = await callTool('douyin_config', { action: 'set', key: c.key, value: c.value })
+  if (r && r.ok === c.want) ok(c.why)
+  else problem(c.why.replace(/^(.*)被拒.*$/, '$1') + '结果不对：' + JSON.stringify(r))
+}
 writeCfg({})
 
 /* ───────── ⑨-bis 浏览器通道键：browserChannel（默认 msedge）───────── */
