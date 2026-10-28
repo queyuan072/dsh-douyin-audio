@@ -17,6 +17,7 @@
  *      开回来后放行；tierReact/tierComment=true 时 tierRead 视为生效；基础四工具不受限；
  *      tierNotify=false 时 douyin_notes / douyin_messages 返回 TIER_DISABLED(tier=notify)，
  *      打开后放行（② 通知与 ① 只读互相独立）
+ *   g. 浏览器通道 browserChannel：douyin_config 认得这个键，缺省是 msedge（可改 chrome / chromium）
  *   f. 谷时自动刷 douyin_duty：只认一个 action 参数；**没有任何等级闸门**
  *      （五个等级全关时 action=status 也照常返回 ok:true）；没有 duty.json 时 todayScreens=0、
  *      autoRun 默认 false、windows 按默认窗口解析；action=history 返回 items 数组
@@ -299,6 +300,25 @@ const cfgLayoutGet = await callTool('douyin_config', { action: 'get' })
 if (cfgLayoutGet && cfgLayoutGet.ok === true && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout === 'tabs') {
   ok('set uiLayout=tabs 后 loadCfg 读回来是 tabs')
 } else problem('uiLayout 存/读不一致：' + JSON.stringify(cfgLayoutGet && cfgLayoutGet.config && cfgLayoutGet.config.uiLayout))
+writeCfg({})
+
+/* ───────── ⑨-bis 浏览器通道键：browserChannel（默认 msedge）───────── */
+// 先看缺省值：config.json 是空的，走 DEFAULTS / EXTRA_DEFAULTS 那一层
+const cfgBrowserDefault = await callTool('douyin_config', { action: 'get' })
+const dfltChannel = cfgBrowserDefault && cfgBrowserDefault.ok === true && cfgBrowserDefault.config
+  ? cfgBrowserDefault.config.browserChannel
+  : undefined
+if (dfltChannel === 'msedge') ok('douyin_config 认得 browserChannel（默认 msedge）')
+else problem('browserChannel 的默认值应为 msedge，现在是 ' + JSON.stringify(dfltChannel))
+
+const cfgBrowserSet = await callTool('douyin_config', { action: 'set', key: 'browserChannel', value: 'chrome' })
+if (cfgBrowserSet && cfgBrowserSet.ok === true) ok('douyin_config 认 browserChannel 这个键（set chrome 没被当未知键拒掉）')
+else problem('douyin_config 不认 browserChannel：' + JSON.stringify(cfgBrowserSet))
+// get 走 cfgAll() → loadCfg()：读回来是 chrome 才说明真的落盘且读得回
+const cfgBrowserGet = await callTool('douyin_config', { action: 'get' })
+if (cfgBrowserGet && cfgBrowserGet.ok === true && cfgBrowserGet.config && cfgBrowserGet.config.browserChannel === 'chrome') {
+  ok('set browserChannel=chrome 后 loadCfg 读回来是 chrome')
+} else problem('browserChannel 存/读不一致：' + JSON.stringify(cfgBrowserGet && cfgBrowserGet.config && cfgBrowserGet.config.browserChannel))
 writeCfg({})
 
 /* ───────── ⑩ 结论 ───────── */

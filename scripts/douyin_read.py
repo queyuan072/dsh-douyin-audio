@@ -75,6 +75,8 @@ DOUYIN_MESSAGES_URL = DOUYIN_HOST + "/messages"
 _DEFAULT_COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "cookies", "douyin_cookies.txt")
 UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
+# 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium")
 
 # 人机验证关键词（命中即判定被拦，不做任何绕过）
 VERIFY_KEYWORDS = ["请完成下列验证", "完成验证", "人机验证", "验证后继续", "安全验证", "拖动滑块"]
@@ -660,6 +662,8 @@ NOTE_BODY = r"""
       // 真机实测：作品图是 biz_tag=aweme_images，另有一条 biz_tag=pcweb_cover（封面，混进来会多算一张）
       if (src.indexOf('pcweb_cover') >= 0) continue;
       if (src.indexOf('noop.jpeg') >= 0) continue;
+      // 真机实测：评论区里别人发的图是 biz_tag=aweme_comment，混进来会多算
+      if (src.indexOf('aweme_comment') >= 0) continue;
       if (needWorkTos && src.indexOf('tos-cn-i') < 0) continue; // 作品图特征（真机实测）
       seen[src] = 1;
       images.push(src);
@@ -940,6 +944,50 @@ def _install_loop_noise_filter():
         pass
 
 
+def browser_candidates(preferred):
+    """按用户选择把候选链排好；chromium = 明确要裸浏览器，不再回退（免得以为在测 Chrome）"""
+    preferred = preferred if preferred in BROWSER_CHANNELS else "msedge"
+    if preferred == "chromium":
+        return ["chromium"]
+    if preferred == "chrome":
+        return ["chrome", "msedge", "chromium"]
+    return ["msedge", "chrome", "chromium"]
+
+
+def launch_browser(pw, preferred, launch_kwargs):
+    """把候选链逐个试 launch，全失败才报错（错误里带每一条的原因）。返回 (browser, channel)"""
+    chain = browser_candidates(preferred)
+    errors = []
+    for channel in chain:
+        kwargs = dict(launch_kwargs)
+        if channel == "chromium":
+            kwargs.pop("channel", None)
+        else:
+            kwargs["channel"] = channel
+        try:
+            browser = pw.chromium.launch(**kwargs)
+        except Exception as exc:
+            errors.append("{}: {}".format(channel, _brief(exc, 160)))
+            continue
+        try:
+            sys.stderr.write("[browser] 使用 {}\n".format(channel))
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return browser, channel
+    raise RuntimeError("无法启动浏览器（候选链 {}）: {}".format(
+        " / ".join(chain), " | ".join(errors)))
+
+
+def _context_kwargs(channel):
+    """实际 channel 决定要不要覆盖 UA：msedge 保持原样（Edge UA）；
+    chrome/chromium 不覆盖，让浏览器用自己的真 UA（否则 UA 与实际浏览器对不上）"""
+    kwargs = {"viewport": {"width": 1600, "height": 900}, "locale": "zh-CN"}
+    if channel == "msedge":
+        kwargs["user_agent"] = UA_STRING
+    return kwargs
+
+
 @contextlib.contextmanager
 def _browser_page(args):
     try:
@@ -955,7 +1003,7 @@ def _browser_page(args):
             pw = sync_playwright().start()
         except Exception as exc:
             raise StepError("browser", "playwright 启动失败: {}".format(_brief(exc)))
-        launch_kwargs = {"channel": "msedge", "headless": bool(args.headless)}
+        launch_kwargs = {"headless": bool(args.headless)}
         if args.headless:
             launch_kwargs["args"] = ["--autoplay-policy=no-user-gesture-required"]
         elif getattr(args, "window_offscreen", False):
@@ -963,16 +1011,12 @@ def _browser_page(args):
             # 只在显式给了 --window-offscreen 时生效，不动任何默认行为。
             launch_kwargs["args"] = ["--window-position=-3000,-3000", "--window-size=1200,900"]
         try:
-            browser = pw.chromium.launch(**launch_kwargs)
+            browser, channel = launch_browser(pw, args.browser_channel, launch_kwargs)
         except Exception as exc:
-            raise StepError("browser",
-                            "无法启动浏览器（channel=msedge）: {}".format(_brief(exc)))
+            raise StepError("browser", str(exc))
+        args.browser_used = channel
         try:
-            ctx = browser.new_context(
-                viewport={"width": 1600, "height": 900},
-                locale="zh-CN",
-                user_agent=UA_STRING,
-            )
+            ctx = browser.new_context(**_context_kwargs(channel))
         except Exception as exc:
             raise StepError("browser", "无法创建浏览器上下文: {}".format(_brief(exc)))
         records = _cookie_records(args.cookies)
@@ -1772,6 +1816,10 @@ def _common_parser():
                     help="命中人机验证后最多等多少秒让你手动处理；默认 0 = 立刻报错退出（老行为）")
     ap.add_argument("--window-offscreen", dest="window_offscreen", action="store_true",
                     help="配合 --no-headless：把浏览器窗口移到屏幕外（真机实测可过风控且不打扰桌面）")
+    ap.add_argument("--browser-channel", dest="browser_channel",
+                    choices=list(BROWSER_CHANNELS), default="msedge",
+                    help="优先用哪个浏览器，默认 msedge（msedge→chrome→内置chromium；"
+                         "选 chromium 就只用内置，不再回退）")
     ap.add_argument("--timeout", type=float, default=30.0, metavar="SEC",
                     help="单步超时秒数，默认 30")
     ap.add_argument("--json", action="store_true",
@@ -1793,7 +1841,11 @@ def parse_args(argv=None):
                 "  python douyin_read.py comments --url https://www.douyin.com/video/<id> --limit 30 --json\n"
                 "  python douyin_read.py note --url https://www.douyin.com/note/<id> --json\n"
                 "  python douyin_read.py notes --limit 20 --json\n"
-                "  python douyin_read.py messages --limit 20 --json\n"),
+                "  python douyin_read.py messages --limit 20 --json\n"
+                "\n"
+                "公共选项（写在各子命令后面，例如 hot --browser-channel chrome --json）:\n"
+                "  --cookies FILE / --headless / --no-headless / --verify-wait SEC /\n"
+                "  --window-offscreen / --browser-channel {msedge,chrome,chromium} / --timeout SEC / --json\n"),
     )
     sub = ap.add_subparsers(dest="command",
                             metavar="{hot,search,video,comments,note,notes,messages}")
@@ -1837,6 +1889,13 @@ def parse_args(argv=None):
     return args
 
 
+def browser_used(args):
+    """实际用上的 channel；还没启动成功（早失败）就回报请求的那个"""
+    if args is None:
+        return "msedge"
+    return getattr(args, "browser_used", None) or getattr(args, "browser_channel", "msedge")
+
+
 def _emit(payload, as_json):
     if as_json:
         print(json.dumps(payload, ensure_ascii=False))
@@ -1867,6 +1926,7 @@ def main(argv=None):
     except Exception as exc:
         payload = {"ok": False, "error": "未预期错误: {}".format(_brief(exc)),
                    "items": [], "elapsed": round(time.time() - start, 2)}
+    payload["browser"] = browser_used(args)
     as_json = bool(getattr(args, "json", False)) if args is not None else False
     _emit(payload, as_json)
     return 0 if payload.get("ok") else 2

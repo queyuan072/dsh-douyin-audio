@@ -200,6 +200,7 @@ def write_state(state_dir, phase, message, cookie_path=None, mode=None):
         "message": (message or "")[:400],
         "cookiePath": cookie_path or "",
         "mode": mode or "",
+        "browser": _BROWSER_USED,
     }
     path = os.path.join(state_dir, STATE_NAME)
     tmp = path + ".tmp"
@@ -277,9 +278,10 @@ def playwright_context():
             pass
 
 
-def open_session(pw, headless, extra_args=None, viewport=None):
+def open_session(pw, headless, extra_args=None, viewport=None, browser_channel="msedge"):
     """起浏览器 + 上下文 + 抖音首页；失败带步骤名抛出"""
-    browser = launch_browser(pw, headless, extra_args=extra_args)
+    browser = launch_browser(pw, headless, extra_args=extra_args,
+                             browser_channel=browser_channel)
     try:
         ctx = browser.new_context(locale="zh-CN", viewport=viewport) if viewport \
             else browser.new_context(locale="zh-CN")
@@ -294,20 +296,52 @@ def open_session(pw, headless, extra_args=None, viewport=None):
         raise RuntimeError("打开抖音首页失败: {}".format(_brief(exc, 240)))
 
 
-def launch_browser(pw, headless, extra_args=None):
-    """依次试 msedge / chrome / 内置 chromium；全失败才报错（错误里带每一条原因）"""
+# 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium")
+# 实际用上的 channel（launch_browser 写，write_state 读进 state.json）
+_BROWSER_USED = ""
+
+
+def browser_candidates(preferred):
+    """按用户选择把候选链排好；chromium = 明确要裸浏览器，不再回退（免得以为在测 Chrome）"""
+    preferred = preferred if preferred in BROWSER_CHANNELS else "msedge"
+    if preferred == "chromium":
+        return ["chromium"]
+    if preferred == "chrome":
+        return ["chrome", "msedge", "chromium"]
+    return ["msedge", "chrome", "chromium"]
+
+
+def _mark_browser(channel):
+    """记下实际用上的 channel，并按统一契约在 stderr 打一行"""
+    global _BROWSER_USED
+    _BROWSER_USED = channel
+    try:
+        sys.stderr.write("[browser] 使用 {}\n".format(channel))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def launch_browser(pw, headless, extra_args=None, browser_channel="msedge"):
+    """按 --browser-channel 排好候选链逐个试 launch；全失败才报错（错误里带每一条原因）"""
     errors = []
     if extra_args:
         extra = list(extra_args)
     else:
         extra = ["--autoplay-policy=no-user-gesture-required"] if headless else ["--start-maximized"]
-    for kwargs in ({"channel": "msedge"}, {"channel": "chrome"}, {}):
-        label = kwargs.get("channel") or "bundled-chromium"
+    chain = browser_candidates(browser_channel)
+    for channel in chain:
+        kwargs = {} if channel == "chromium" else {"channel": channel}
         try:
-            return pw.chromium.launch(headless=headless, args=list(extra), **kwargs)
+            browser = pw.chromium.launch(headless=headless, args=list(extra), **kwargs)
         except Exception as exc:
-            errors.append("{}: {}".format(label, _brief(exc, 160)))
-    raise RuntimeError("无法启动浏览器（已试 msedge / chrome / 内置 chromium）：" + " | ".join(errors))
+            errors.append("{}: {}".format(channel, _brief(exc, 160)))
+            continue
+        _mark_browser(channel)
+        return browser
+    raise RuntimeError("无法启动浏览器（候选链 {}，已逐个试过）：{}".format(
+        " / ".join(chain), " | ".join(errors)))
 
 
 def probe_page(page):
@@ -425,7 +459,8 @@ def capture_qr(page, qr_path):
 # --------------------------------------------------------------------------
 def run_window(args, state_dir):
     with playwright_context() as pw:
-        browser, ctx, page = open_session(pw, headless=False)
+        browser, ctx, page = open_session(pw, headless=False,
+                                          browser_channel=args.browser_channel)
         try:
             log("[1/4] 窗口已打开：请在窗口里点「登录」并扫码/完成验证")
             write_state(state_dir, "waiting", "窗口已打开，请扫码/登录", mode="window")
@@ -469,18 +504,20 @@ def run_window(args, state_dir):
                 pass
 
 
-def open_qr_session(pw, state_dir):
+def open_qr_session(pw, state_dir, browser_channel="msedge"):
     """qr 模式起会话：真窗口 + 挪到屏幕外（headless 会撞验证码）；
     这条起不来才退回 headless=True，并在 state.json 里注明。返回 (browser, ctx, page, note)"""
     try:
         browser, ctx, page = open_session(pw, headless=False,
                                           extra_args=list(QR_LAUNCH_ARGS),
-                                          viewport=dict(QR_VIEWPORT))
+                                          viewport=dict(QR_VIEWPORT),
+                                          browser_channel=browser_channel)
         return browser, ctx, page, "后台真窗口（已挪到屏幕外）"
     except Exception as exc:
         log("真窗口起不来（{}），退回 headless".format(_brief(exc, 200)))
         write_state(state_dir, "waiting", QR_HEADLESS_NOTE + "，正在启动浏览器…", mode="qr")
-        browser, ctx, page = open_session(pw, headless=True, viewport=dict(QR_VIEWPORT))
+        browser, ctx, page = open_session(pw, headless=True, viewport=dict(QR_VIEWPORT),
+                                          browser_channel=browser_channel)
         return browser, ctx, page, QR_HEADLESS_NOTE
 
 
@@ -488,7 +525,7 @@ def run_qr(args, state_dir):
     qr_path = os.path.join(state_dir, QR_NAME)
     write_state(state_dir, "waiting", "正在启动浏览器…", mode="qr")
     with playwright_context() as pw:
-        browser, ctx, page, note = open_qr_session(pw, state_dir)
+        browser, ctx, page, note = open_qr_session(pw, state_dir, args.browser_channel)
         try:
             log("[1/5] 后台浏览器已就绪（{}），点开登录面板".format(note))
             time.sleep(3)
@@ -568,6 +605,10 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=("window", "qr"), default="window",
                     help="window=前台可见窗口人工扫码（默认）；qr=后台出二维码图给设置页")
+    ap.add_argument("--browser-channel", dest="browser_channel",
+                    choices=list(BROWSER_CHANNELS), default="msedge",
+                    help="优先用哪个浏览器，默认 msedge（msedge→chrome→内置chromium；"
+                         "选 chromium 就只用内置，不再回退）")
     ap.add_argument("--wait", type=int, default=300, help="最多等多少秒，默认 300")
     ap.add_argument("--out", default=None,
                     help="cookie 输出路径（默认取 $DOUYIN_COOKIE_FILE，再退到 "

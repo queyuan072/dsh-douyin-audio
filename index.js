@@ -37,6 +37,8 @@ export const Config = !z ? undefined : z.object({
   loginMode: z.string().default('window').extra('volatile', true),
   readHeadless: z.boolean().default(true).extra('volatile', true),
   verifyWait: z.number().default(0).extra('volatile', true),
+  // 浏览器通道：msedge（默认，与历史一致）/ chrome / 内置 chromium（容易被风控）
+  browserChannel: z.string().default('msedge').extra('volatile', true),
   // 谷时自动刷（契约见 lib/duty.mjs）：autoRun 默认 false —— 不开启就绝不自己定时跑
   autoRun: z.boolean().default(false).extra('volatile', true),
   dutyWindow: z.string().default('12:00-14:00,18:00-23:59').extra('volatile', true),
@@ -54,10 +56,29 @@ const EXTRA_DEFAULTS = {
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
+  // 浏览器通道：msedge（默认）/ chrome / chromium（内置）
+  browserChannel: 'msedge',
 }
 
 /** 读全配置：插件自己的这两把键在当前层补默认值，其余仍以 config.json / DEFAULTS 为准 */
 const cfgAll = () => ({ ...EXTRA_DEFAULTS, ...loadCfg() })
+
+// ── 浏览器通道（--browser-channel）──────────────────────────────────────────
+//   只给三个会起浏览器的脚本用：douyin_scroller.py / douyin_read.py / douyin_login.py。
+//   transcribe_douyin.py 不起浏览器，别给它传。
+/** 三个合法取值；其余一律按 msedge 处理（与 lib/state.mjs 的 DEFAULTS 一致） */
+export const BROWSER_CHANNELS = ['msedge', 'chrome', 'chromium']
+
+/** 配置里的 browserChannel 规整成合法值；空 / 未知 → 'msedge'（默认行为不变） */
+export function browserChannelOf(cfg) {
+  const v = String((cfg && cfg.browserChannel) || '').trim().toLowerCase()
+  return BROWSER_CHANNELS.includes(v) ? v : 'msedge'
+}
+
+/** 拼给脚本的两个 argv 片段：['--browser-channel', 'msedge'|'chrome'|'chromium'] */
+export function browserArgv(cfg) {
+  return ['--browser-channel', browserChannelOf(cfg)]
+}
 
 const textOutput = {
   schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -334,13 +355,32 @@ export function apply(ctx, config = {}) {
     const base = cfgAll()
     const over = {}
     for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait',
-      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout']) {
+      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
       if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') over[k] = v
     }
     return { ...base, ...over }
   }
+  // ── --browser-channel 下发 ─────────────────────────────────────────
+  // 旧版脚本还没有这个参数（argparse 会 unrecognized arguments 直接退出码 2），
+  // 所以先问一次 `--help`：认不出来就不带，行为与升级前完全一致。
+  // 每个 (python, 脚本) 每进程只问一次。
+  const browserFlagCache = new Map()
+  async function browserArgvFor(python, script, cfg) {
+    const key = python + '|' + script
+    let accepts = browserFlagCache.get(key)
+    if (accepts === undefined) {
+      const r = await runPython(python, script, ['--help'], { timeoutSec: 30, log })
+      const text = String(r.stdout || '') + String(r.stderr || '')
+      // --help 自己都跑不起来（依赖缺 / 脚本坏）就当它认：真跑时的报错比这里更说明问题
+      accepts = r.ok === true ? text.includes('--browser-channel') : true
+      browserFlagCache.set(key, accepts)
+      if (!accepts) log('脚本不认 --browser-channel（旧版），本次不带该参数: ' + script)
+    }
+    return accepts ? browserArgv(cfg) : []
+  }
+
   // ── 能力等级（四档闸门）──────────────────────────────────
   // ① 只读 / ② 通知 / ③A 轻互动 / ③B 评论 / ④ 发布。基础四工具（刷屏/转写/自检/配置）不受等级限制。
   // 默认值与 lib/state.mjs 的 DEFAULTS 一致；这里再留一份兜底，config.json 里缺键也能判断。
@@ -403,6 +443,7 @@ export function apply(ctx, config = {}) {
     if (headless) argv.push('--headless')
     if (saveAll) argv.push('--save-all')
     argv.push('--work-dir', workRoot())
+    argv.push(...(await browserArgvFor(python, SCRIPT_SCROLL, cfg)))
     const budget = count * (delay + 12) + 120
     const r = await runPython(python, SCRIPT_SCROLL, argv, { timeoutSec: budget, log })
     log('scroll 结束 code=' + r.code)
@@ -528,6 +569,7 @@ export function apply(ctx, config = {}) {
     if (cfg.readHeadless === false) argv.push('--no-headless')
     const wait = Math.max(0, Math.round(Number(cfg.verifyWait) || 0))
     if (wait > 0) argv.push('--verify-wait', String(wait))
+    argv.push(...(await browserArgvFor(python, SCRIPT_READ, cfg)))
     // 人工过验证的时间要落在预算里，否则窗口刚弹出来就被 taskkill
     const budget = timeoutSec + (wait > 0 ? wait + 15 : 0)
     const r = await runPython(python, SCRIPT_READ, argv, { timeoutSec: budget, log })
@@ -734,8 +776,9 @@ export function apply(ctx, config = {}) {
 
       if (mode === 'window') {
         log('login(window) 开始: ' + python)
-        const r = await runPython(python, SCRIPT_LOGIN,
-          ['--mode', 'window', '--wait', String(LOGIN_WAIT), '--out', cookiePath],
+        const winArgv = ['--mode', 'window', '--wait', String(LOGIN_WAIT), '--out', cookiePath,
+          ...(await browserArgvFor(python, SCRIPT_LOGIN, cfg))]
+        const r = await runPython(python, SCRIPT_LOGIN, winArgv,
           { timeoutSec: LOGIN_WAIT + 60, log, tmpDir: join(stateDir(), 'wavtmp') })
         const loggedIn = !!r.ok && existsSync(cookiePath)
         log('login(window) 结束 code=' + r.code + ' loggedIn=' + loggedIn)
@@ -755,8 +798,9 @@ export function apply(ctx, config = {}) {
       const startedAt = Date.now()
       const boot = { phase: 'waiting', at: startedAt, message: '正在启动浏览器…', cookiePath: null, mode: 'qr' }
       try { writeFileSync(loginStatePath(), JSON.stringify(boot, null, 2), 'utf8') } catch { /* poll 读不到会说没状态 */ }
-      const sp = await spawnLoginBg(python,
-        ['--mode', 'qr', '--state-dir', loginDir(), '--wait', String(LOGIN_WAIT), '--out', cookiePath], log)
+      const qrArgv = ['--mode', 'qr', '--state-dir', loginDir(), '--wait', String(LOGIN_WAIT), '--out', cookiePath,
+        ...(await browserArgvFor(python, SCRIPT_LOGIN, cfg))]
+      const sp = await spawnLoginBg(python, qrArgv, log)
       if (!sp.ok) {
         return { ok: false, mode, qrPath, stateFile: loginStatePath(), reason: '后台派生登录脚本失败：' + sp.reason, log: loginLogPath() }
       }
@@ -998,7 +1042,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置，容易被风控）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

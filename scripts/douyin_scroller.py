@@ -123,6 +123,59 @@ KEEP_SHOTS = 60  # 截图目录最多保留的张数（推荐页每屏一张，�
 UA_STRING = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
 
+# 浏览器候选链：--browser-channel 选首选，其余按下面的顺序兜底
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium")
+
+
+def browser_candidates(preferred):
+    """按用户选择把候选链排好；chromium = 明确要裸浏览器，不再回退（免得以为在测 Chrome）"""
+    preferred = preferred if preferred in BROWSER_CHANNELS else "msedge"
+    if preferred == "chromium":
+        return ["chromium"]
+    if preferred == "chrome":
+        return ["chrome", "msedge", "chromium"]
+    return ["msedge", "chrome", "chromium"]
+
+
+def _brief(exc, limit=200):
+    """异常压成一行短句（playwright 的异常常带多行 call log）"""
+    try:
+        text = " ".join(str(exc).split())
+    except Exception:
+        text = exc.__class__.__name__
+    return text[:limit] or exc.__class__.__name__
+
+
+def launch_browser(p, preferred, headless, extra_args=None):
+    """逐个试候选链里的 channel，全失败才报错（错误里带每一条的原因）。返回 (browser, channel)"""
+    chain = browser_candidates(preferred)
+    errors = []
+    for channel in chain:
+        kwargs = {"headless": headless, "args": list(extra_args) if extra_args else extra_args}
+        if channel != "chromium":
+            kwargs["channel"] = channel
+        try:
+            browser = p.chromium.launch(**kwargs)
+        except Exception as exc:
+            errors.append("{}: {}".format(channel, _brief(exc)))
+            continue
+        sys.stderr.write("[browser] 使用 {}\n".format(channel))
+        sys.stderr.flush()
+        return browser, channel
+    raise RuntimeError("无法启动浏览器（候选链 {}）：{}".format(
+        " / ".join(chain), " | ".join(errors)))
+
+
+def open_context(browser, headless, channel):
+    """实际 channel 决定要不要覆盖 UA：msedge 保持原样（真实 Edge UA）；
+    chrome/chromium 不覆盖，让浏览器用自己的真 UA（否则 UA 与实际浏览器对不上）"""
+    return browser.new_context(
+        viewport={"width": 1600, "height": 900},
+        locale="zh-CN",
+        user_agent=(UA_STRING if (headless and channel == "msedge") else None),
+    )
+
+
 # 人机验证关键词（检测到就按验证码处理）
 VERIFY_KEYWORDS = ["请完成下列验证", "完成验证", "人机验证", "验证后继续", "安全验证"]
 # 登录墙文本信号（抖音未登录访客弹窗）
@@ -156,6 +209,10 @@ def parse_args():
                     help="ffmpeg 路径（默认取环境变量 FFMPEG，再探测 PATH 与 ~/.dsh/bin/ffmpeg.exe）")
     ap.add_argument("--work-dir", default=None, metavar="DIR",
                     help="截图/视频/manifest 的产物目录（默认取环境变量 DSH_DOUYIN_TMP，再退回 <系统临时目录>/douyin）")
+    ap.add_argument("--browser-channel", dest="browser_channel",
+                    choices=list(BROWSER_CHANNELS), default="msedge",
+                    help="优先用哪个浏览器，默认 msedge（msedge→chrome→内置chromium；"
+                         "选 chromium 就只用内置，不再回退）")
     args = ap.parse_args()
     args.count = max(1, min(args.count, 600))
     args.delay = max(0.5, min(args.delay, 30.0))
@@ -570,21 +627,11 @@ def main():
     blocked_reason = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                channel="msedge",
-                headless=args.headless,
-                args=["--autoplay-policy=no-user-gesture-required"] if args.headless else None,
+            browser, browser_channel = launch_browser(
+                p, args.browser_channel, args.headless,
+                extra_args=["--autoplay-policy=no-user-gesture-required"] if args.headless else None,
             )
-            ctx = browser.new_context(
-                viewport={"width": 1600, "height": 900},
-                locale="zh-CN",
-                user_agent=(
-                    # 后台模式用真实 Edge UA（默认带 HeadlessChrome 标记极易触发验证码）
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-                    if args.headless else None
-                ),
-            )
+            ctx = open_context(browser, args.headless, browser_channel)
             page = ctx.new_page()
             page.on("response", _on_video_response)
 

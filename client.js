@@ -341,6 +341,31 @@ window.__ModuleLoader__.load({
         finally { setBusy('') }
       }
 
+      /* ── 浏览器内核 browserChannel：三个会起浏览器的脚本（scroll / read / login）用哪个 ──
+             两版布局共用这一份按钮 + 说明，classic 与 tabs 只有外面那层 h('div',{data-dy-sec}) 不同。 */
+      const BROWSER_CHANNELS = [
+        { key: 'msedge', label: 'Edge（推荐）', note: '用你装的 Microsoft Edge —— 实测最稳，抖音风控对真浏览器宽松' },
+        { key: 'chrome', label: 'Chrome', note: '用你装的 Google Chrome —— Edge 出问题时的替代方案' },
+        { key: 'chromium', label: '内置 Chromium', note: '用 Playwright 自带的那个，没有真实用户的浏览痕迹 —— 最容易撞验证码，只建议排查问题时用' },
+      ]
+      /** 配置值 → 三选一（缺键 / 旧宿主 / 未知值都按 msedge，与宿主的默认值一致） */
+      const channelOf = (c) => (c && (c.browserChannel === 'chrome' || c.browserChannel === 'chromium') ? c.browserChannel : 'msedge')
+      const browserChannelBody = () => {
+        const cur = channelOf(cfg)
+        const picked = BROWSER_CHANNELS.find((x) => x.key === cur) || BROWSER_CHANNELS[0]
+        return [
+          h('div', { 'data-dy-row': '', key: 'channel-row' }, BROWSER_CHANNELS.map((x) => h('button', {
+            key: x.key,
+            'data-dy-btn': '', 'data-dy-channel': x.key,
+            'data-primary': cur === x.key ? '' : undefined,
+            disabled: busy === 'browserChannel',
+            onClick: () => { if (cur !== x.key) patch('browserChannel', x.key, '浏览器内核') },
+          }, x.label))),
+          h('div', { 'data-dy-note': '', key: 'channel-note' }, picked.note),
+          h('div', { 'data-dy-note': '', key: 'channel-restart' }, '换浏览器内核后需要重启 DSH 才生效'),
+        ]
+      }
+
       /* 数字项「本地草稿 + 失焦提交」：每敲一个字符就 POST 一次既吵，又会把半截值（"1"→"12"）存进去 */
       const editNum = (key, raw, typing) => {
         setForm((old) => ({ ...(old || {}), [key]: raw }))
@@ -774,6 +799,9 @@ window.__ModuleLoader__.load({
             onBlur: (e) => editPath('pythonPath', e.target.value, false),
           }),
           h('div', { 'data-dy-note': '' }, '留空就用插件自己找的那个 —— 有没有找到，点「自检」会直接说')),
+        h('div', { 'data-dy-sec': '', key: 'diag-browser' },
+          h('div', { 'data-dy-h': '' }, '浏览器内核 browserChannel'),
+          ...browserChannelBody()),
         h('div', { 'data-dy-sec': '', key: 'diag-run' },
           h('div', { 'data-dy-h': '' }, '诊断'),
           h('div', { 'data-dy-row': '' },
@@ -914,6 +942,11 @@ window.__ModuleLoader__.load({
             onBlur: (e) => editPath('pythonPath', e.target.value, false),
           }),
           h('div', { 'data-dy-note': '' }, '留空就用插件自己找的那个 —— 有没有找到，点「自检」会直接说')),
+
+        /* ── 浏览器内核 ── */
+        h('div', { 'data-dy-sec': '' },
+          h('div', { 'data-dy-h': '' }, '浏览器内核 browserChannel'),
+          ...browserChannelBody()),
 
         /* ── 能力等级 ── */
         h('div', { 'data-dy-sec': '' },

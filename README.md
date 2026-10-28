@@ -145,6 +145,7 @@
 | `pythonPath` | string | `''` | 指定 Python 解释器；空 = 自动探测 |
 | `asrThreads` | number（正整数） | `8` | SenseVoice 本地推理线程数，范围 1–64，实际建议不超过本机逻辑核（设置页按 `GET /sysinfo` 读到的核数夹取，读不到就按 1–64）。`douyin_transcribe` 与「刷完自动转写」都把它透传成 `--threads`（1–64 夹取，0/非法值就不带） |
 | `autoTranscribe` | boolean | `false` | **关（默认，推荐）= 刷完只给清单，由你决定转哪条（返回体 `autoTranscribe: null`）；开 = 刷完立刻转清单里最新的 1 条**。转写结果放在 `autoTranscribe` 字段里；找不到 sherpa_onnx 的 Python、脚本报错、没有任何已下载文件时只把原因写进该字段，**scroll 本身仍照旧返回 `ok`** |
+| `browserChannel` | string（`msedge`\|`chrome`\|`chromium`） | `msedge` | 让三个会起浏览器的脚本（`douyin_scroller.py` / `douyin_read.py` / `douyin_login.py`）用哪个浏览器内核。默认 `msedge` = 你装的 Microsoft Edge（实测最稳，抖音风控对真浏览器宽松）；`chrome` = 你装的 Google Chrome（Edge 出问题时的替代方案）；`chromium` = Playwright 自带的那个内置浏览器（没有真实用户的浏览痕迹，**最容易撞验证码**，只建议排查问题时用，选定后不再回退到 Edge/Chrome）。插件会给脚本加 `--browser-channel <值>`；脚本自己的候选链是 `msedge → [msedge, chrome, 内置 chromium]`、`chrome → [chrome, msedge, 内置 chromium]`、`chromium → [内置 chromium]`，逐个试 launch、全失败才报错。旧版脚本没有这个参数时不带，行为与升级前一致。⚠️ 换内核后需要**重启 DSH** 才生效 |
 | `loginMode` | string（`window`\|`qr`） | `window` | 登录方式：`window` = 前台弹真窗口人工扫码（推荐，最稳）；`qr` = 后台驻留抓二维码到设置页扫。`douyin_login_start` 不传 `mode` 时用它，设置页「登录」区块的两个单选也读写它 |
 | `autoRun` | boolean | `false` | **谷时自动刷**：开 = 插件自己按 60 秒 tick 检查，满足「谷时窗口内 + 今日额度未满 + 距上次 ≥ `dutyIntervalMin` 分钟 + 没有正在跑的 run」才自己刷一轮；默认关 |
 | `dutyWindow` | string | `12:00-14:00,18:00-23:59` | 谷时窗口，逗号分隔多个 `HH:MM-HH:MM`；支持跨零点（如 `23:00-02:00`） |
