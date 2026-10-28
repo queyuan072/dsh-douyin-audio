@@ -552,6 +552,38 @@ douyin_search  keyword=美食  limit=5  order=click
 
 ---
 
+## 10. 变更记录
+
+### 1.2.2 — 安全修复（2026-10-29）
+
+**这是一个安全版本，1.2.0 / 1.2.1 请勿对外分发。**
+
+| 级别 | 问题 | 修复 |
+| --- | --- | --- |
+| **Critical** | 插件 HTTP 路由（`/config` `/run` `/sysinfo` `/qr` `/duty`）无鉴权且接受跨站请求：任意网页可改写 `pythonPath` 再调 `/run`，等于本地任意程序执行 | 所有路由前置同源门（`token` / `Sec-Fetch-Site: same-origin` / `Origin == Host` 三选一），不满足直接 403 且**不执行任何动作**；新增 `GET /token` 一次性令牌 |
+| High | 能力等级闸门可被 agent 自己打开（`douyin_config` 能写 `tier*`） | 工具层拒绝写 `tier*`，只能用户在设置页点；设置页（同源 HTTP）不受影响 |
+| High | 抖音 Cookie 会被发到任意外部主机（候选直链只做子串匹配，无条件附 Cookie） | 用 `urlsplit().hostname` 做后缀白名单，非抖音 CDN 域**不带 Cookie** |
+| High | 任意 `http(s)` 地址直通浏览器（SSRF），可把内网页文本读回 | `_assert_douyin_url` 只放行抖音域与短链域，否则 `StepError` 且不调 `page.goto` |
+| High | 点赞/收藏的「纠偏二次点击」在计数被缩写（`1.2万`）时会把状态翻反 | 计数不可观测时**不补第二枪**，返回 `state:'uncertain'` + 原因 |
+| High | 登录假成功（找不到登录按钮就当成已登录，导出无 `sessionid` 的 cookie） | 成功判据只认 `sessionid/sid_tt` 等 session cookie；导出前后各校验一次 |
+
+顺带修：数值校验（`count` / `downloadTimeout` 非法直接拒）；`douyin_scroll` 的 `screens` 改为**实际**屏数（`duty.json` 额度不再虚记）；`window` 登录改后台派生 + `douyin_login_poll` 轮询（不再阻塞 5 分钟）；netscape cookie 支持 `#HttpOnly_` 前缀（原来会丢掉 `sessionid`）；pip 回退镜像去掉 `--trusted-host`；下载加整体 deadline / `max_bytes` / `Content-Length` 校验；`files` 收紧为 `scripts/*.py`，`py_compile` 的 `.pyc` 不再进包。
+
+> ⚠️ 副作用：`curl` 等本机脚本现在**打不通**插件 HTTP 路由（拿不到令牌）。这是堵住 C1 的必然代价；调试请走 MCP 工具。
+
+### 1.2.1 — 装入配置环境（2026-10-29）
+
+- 新增 `douyin_setup`（16 个工具）：扫描本机 Python / ffmpeg / 模型 / cookie，能复用就不装；需要时才建独立 venv 并装 `playwright` + `sherpa-onnx`。
+- 设置页「环境与诊断」页只有一个【一键配置环境】按钮，其余收在「高级选项」里。
+- 新增 ③A 轻互动 `douyin_react`（点赞 / 取消赞 / 收藏 / 取消收藏），仍受 `tierReact` 闸门约束、默认关闭。
+- venv 基于 **DSH 自带 Python**，用户无需自己安装 Python；⚠️ 插件升级 / `npm install` 会清掉 `<插件根>/venv`，需重装。
+
+### 1.2.0 — 首个公开版本（2026-10-28）
+
+- 16 个工具 + 五档能力闸门（① 只读 / ② 通知 / ③A 轻互动 / ③B 评论 / ④ 发布，默认只开只读）。
+- 刷屏下载、本地 SenseVoice 转写、只读四件（热榜 / 搜索 / 视频 / 评论）、图文、通知与私信、双模式登录、谷时自动刷调度。
+- 设置页两套布局可切（`classic` 平铺 / `tabs` 四标签页），顶部状态栏显示环境 / cookie / 素材 / 版本。
+- 浏览器内核可选（`msedge` / `chrome` / `chromium` / `firefox` / `webkit`），支持扫描开始菜单与桌面的 `.lnk`、手动添加自定义 exe。
 ## 附：维护者笔记
 
 | 文件 | 职责 |
