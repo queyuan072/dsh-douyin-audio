@@ -115,6 +115,15 @@ _POLL_LIMIT_S = 6.0          # 轮询上限（策略第 3 步：最多 6 秒）
 _POLL_STEP_MS = 500
 _CORRECTION_GAP_S = 1.0      # 两次点击之间的最小间隔（不连点）
 
+# 点击超时（真机实测教训：用 Playwright 默认的 30 秒 actionability 超时，
+# 未登录时按钮被登录弹窗遮住，三级兜底会串成 60~70 秒。这里显式给小预算）
+_CLICK_TIMEOUT_MS = 5000           # 普通点击
+_CLICK_FORCE_TIMEOUT_MS = 3000     # force 点击
+_CLICK_TIMEOUT_LOGIN_MS = 1500     # 页面已经有登录墙时：别在 actionability 上耗
+_CLICK_FORCE_TIMEOUT_LOGIN_MS = 800
+_GOTO_SETTLE_MS = 1200       # 打开页面后的静置（按钮另有 wait_for_selector，不必久等）
+_BUTTON_WAIT_MS = 8000       # 等按钮出现的上限（8 秒够用，慢页面也不该拖 30 秒）
+
 _BROWSER_LOGGED = False
 
 
@@ -571,7 +580,7 @@ def _goto(page, url, args, step, verify_hint=None):
     except Exception as exc:
         raise StepError(step, "打开页面失败: {}".format(_brief(exc)))
     try:
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(_GOTO_SETTLE_MS)
     except Exception:
         pass
     _await_verify(page, args, step, verify_hint)
@@ -660,41 +669,70 @@ def _login_present(page):
     return nodes, hits
 
 
-def _click_button(page, selector, action, timeout_s=30.0):
-    """只点这一个按钮。三次尝试都只作用于它自己：普通点击 -> force 点击 -> 元素自身 .click()。"""
+def _click_budgets(timeout_s=30.0, login_wall=False):
+    """(普通点击超时ms, force 点击超时ms)。
+    默认 5s / 3s；页面已经有登录墙时缩到 1.5s / 0.8s（反正点不进去，别耗）。
+    两者都被 --timeout 封顶：--timeout 给得更小时预算跟着变小。"""
+    cap_ms = int(max(0.5, float(timeout_s or 30.0)) * 1000)
+    if login_wall:
+        return min(_CLICK_TIMEOUT_LOGIN_MS, cap_ms), min(_CLICK_FORCE_TIMEOUT_LOGIN_MS, cap_ms)
+    return min(_CLICK_TIMEOUT_MS, cap_ms), min(_CLICK_FORCE_TIMEOUT_MS, cap_ms)
+
+
+def _click_button(page, selector, action, timeout_s=30.0, login_wall=False):
+    """只点这一个按钮。三级尝试都只作用于它自己：普通点击 -> force 点击 -> 元素自身 .click()。
+    每级都带显式短超时并记录本级耗时 —— 绝不让 Playwright 默认 30 秒超时把关卡串成 70 秒。"""
     if selector not in ALLOWED_SELECTORS:
         raise StepError(action, "内部保护：拒绝点击非目标按钮 {}".format(selector))
     loc = _locator(page, selector)
+    normal_ms, force_ms = _click_budgets(timeout_s, login_wall)
     errors = []
+    if login_wall:
+        log("页面已有登录墙，点击预算收短为 {}ms / {}ms".format(normal_ms, force_ms))
+
+    started = time.monotonic()
     try:
-        loc.click(timeout=int(max(3.0, timeout_s) * 1000))
-        log("点击方式: 普通点击（{}）".format(selector))
+        loc.click(timeout=normal_ms)
+        log("点击方式: 普通点击（{}，{}ms）".format(selector, normal_ms))
         return "normal"
     except Exception as exc:
-        errors.append("normal: {}".format(_brief(exc, 160)))
+        errors.append("normal({}ms, {:.1f}s): {}".format(
+            normal_ms, time.monotonic() - started, _brief(exc, 140)))
+        log("普通点击没成（{}ms 内），改用 force".format(normal_ms))
+
+    started = time.monotonic()
     try:
-        loc.click(timeout=int(max(3.0, timeout_s) * 1000), force=True)
-        log("点击方式: force 点击（{}）".format(selector))
+        loc.click(timeout=force_ms, force=True)
+        log("点击方式: force 点击（{}，{}ms）".format(selector, force_ms))
         return "force"
     except Exception as exc:
-        errors.append("force: {}".format(_brief(exc, 160)))
+        errors.append("force({}ms, {:.1f}s): {}".format(
+            force_ms, time.monotonic() - started, _brief(exc, 140)))
+        log("force 点击也没成（{}ms 内），改用元素自身 .click()".format(force_ms))
+
+    started = time.monotonic()
     try:
         if page.evaluate(_JS_CLICK, selector):
-            log("点击方式: 元素自身 .click()（{}）".format(selector))
+            log("点击方式: 元素自身 .click()（{}，{:.1f}s）".format(
+                selector, time.monotonic() - started))
             return "js"
-        errors.append("js: 元素不存在")
+        errors.append("js({:.1f}s): 元素不存在".format(time.monotonic() - started))
     except Exception as exc:
-        errors.append("js: {}".format(_brief(exc, 160)))
-    raise StepError(action, "点击失败: {}".format(" | ".join(errors)))
+        errors.append("js({:.1f}s): {}".format(time.monotonic() - started, _brief(exc, 140)))
+    raise StepError(action, "点击失败（三级兜底都失败）: {}".format(" | ".join(errors)))
 
 
-def _wait_change(page, selector, baseline):
+def _wait_change(page, selector, baseline, login_probe=None):
     """点完之后的读数：先等 1.5 秒，再每 0.5 秒复读一次，最多 6 秒。
-    一旦读数离开 baseline 就立刻返回该读数；等满 6 秒仍没动就返回 baseline。"""
+    读数离开 baseline 就立刻返回；login_probe 一旦返回 True（冒出了登录墙）也立刻返回，
+    别再对着一个点不动的按钮空等 6 秒。"""
     with contextlib.suppress(Exception):
         page.wait_for_timeout(_COOKIE_SETTLE_MS)
     after = _read_count(page, selector)
     if after != baseline:
+        return after
+    if login_probe is not None and login_probe():
+        log("冒出登录拦截，停止轮询（不再空等）")
         return after
     waited = _COOKIE_SETTLE_MS / 1000.0
     while waited < _POLL_LIMIT_S:
@@ -703,6 +741,9 @@ def _wait_change(page, selector, baseline):
         waited += _POLL_STEP_MS / 1000.0
         after = _read_count(page, selector)
         if after != baseline:
+            return after
+        if login_probe is not None and login_probe():
+            log("冒出登录拦截，停止轮询（不再空等）")
             return after
     return after
 
@@ -734,6 +775,12 @@ def _intent_met(action, prev, now):
     if action in ("like", "collect"):
         return now > prev
     return now < prev
+
+
+def _login_appeared(page, pre_nodes, pre_hits):
+    """点击后登录信号是否变多了（节点数或正文关键词命中数）—— 轮询里用作「别等了」的探针。"""
+    post_nodes, post_hits = _login_present(page)
+    return (post_nodes > pre_nodes) or (len(post_hits) > len(pre_hits))
 
 
 def _login_reason(page, pre_nodes, pre_hits, prev, after):
@@ -777,14 +824,18 @@ def perform(page, args, action, url=None):
         return _payload(action, url, 0, 0, False, target_state, clicks=0)
 
     timeout_s = getattr(args, "timeout", 30.0)
+    login_wall = bool(pre_nodes or pre_hits)   # 页面上已经有登录提示：点击预算收短，别在 actionability 上耗
     login_error = ("需要登录：点击后弹出了登录窗口（{}），未登录状态不能{}；"
                    "请先扫码登录（douyin_login_start）后重试")
+    # 已有登录墙时更不用等：数字不动就是被墙挡住（_login_reason 会判 needLogin），
+    # 真机实测这一条把「未登录」场景从 70 秒压到十几秒
+    probe = lambda: login_wall or _login_appeared(page, pre_nodes, pre_hits)
 
     # ---- 第 1 次点击 ----
-    _click_button(page, selector, action, timeout_s=timeout_s)
+    _click_button(page, selector, action, timeout_s=timeout_s, login_wall=login_wall)
     clicks = 1
     clicked_at = time.monotonic()
-    after = _wait_change(page, selector, before)
+    after = _wait_change(page, selector, before, login_probe=probe)
     if after == before:
         log("第 1 次点击后仍是 {}（等满 {} 秒无变化）".format(after, _seconds_label(_POLL_LIMIT_S)))
 
@@ -806,9 +857,9 @@ def perform(page, args, action, url=None):
         with contextlib.suppress(Exception):
             page.wait_for_timeout(int(gap * 1000))
     log("第 1 次点击方向不对（{} -> {}），再点一次纠正到「{}」".format(before, first, target_state))
-    _click_button(page, selector, action, timeout_s=timeout_s)
+    _click_button(page, selector, action, timeout_s=timeout_s, login_wall=login_wall)
     clicks = 2
-    after = _wait_change(page, selector, first)
+    after = _wait_change(page, selector, first, login_probe=probe)
     if after == first:
         log("第 2 次点击后仍是 {}（等满 {} 秒无变化）".format(after, _seconds_label(_POLL_LIMIT_S)))
 
@@ -839,7 +890,8 @@ def run(args):
             with contextlib.suppress(Exception):
                 _login_wall_note(page, action)
         try:
-            page.wait_for_selector(ACTION_SELECTOR[action], timeout=int(args.timeout * 1000))
+            page.wait_for_selector(ACTION_SELECTOR[action],
+                                   timeout=min(_BUTTON_WAIT_MS, int(args.timeout * 1000)))
         except Exception:
             pass  # 交给 perform 给明确文案
         return perform(page, args, action, url=opened)
