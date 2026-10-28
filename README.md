@@ -462,4 +462,25 @@ douyin_search  keyword=美食  limit=5  order=click
 | `scripts/douyin_read.py` | 只读查询 CLI：`hot` / `search` / `video` / `comments` / `notes` / `messages` 六个子命令（后两个要登录态，可用 `--url` 覆盖默认地址），统一 `--json` 信封，选择器多候选 + 兜底；`lib/runner.mjs` 的 `SCRIPT_READ` 指向它 |
 | `cordis.patch.yml` | bundle 挂载声明（`id: douyin-audio`） |
 
-改默认行为改 `lib/state.mjs` 的 `DEFAULTS`；改工具签名改 `index.js`；两边要同步（`index.js` 的 `Config` 也要跟着加键，否则 profile 传进来的值会被忽略）。注意 `package.json` 的 `files` 目前**没有**列出 `selfcheck.mjs`（也没有 `_smoke.mjs`），发布到 npm 后包里不会有它，要随包发布得先加进 `files`。
+改默认行为改 `lib/state.mjs` 的 `DEFAULTS`；改工具签名改 `index.js`；两边要同步（`index.js` 的 `Config` 也要跟着加键，否则 profile 传进来的值会被忽略）。
+
+`package.json` 的 `files` 已包含 `selfcheck.mjs`，因此 npm 包里带着它，可以直接 `node node_modules/dsh-douyin-audio/selfcheck.mjs` 自检。新增源文件记得同步加进 `files`，否则不会被发布。
+
+### 发版（npm）
+
+已发布：<https://www.npmjs.com/package/dsh-douyin-audio>（维护者 `queyuan`）
+
+1. **改版本号**（`package.json` 的 `version`），语义化版本：
+   - 修 bug / 改文案 → `1.2.1`
+   - 加功能 → `1.3.0`
+   - 破坏性变更（改配置键名、改工具参数、改返回结构）→ `2.0.0`
+2. **提交并推两个远端**：`git add -A && git commit -m "release: v1.2.1" && git push`
+3. **登录并发布**：
+```bash
+npm login                 # 浏览器授权一次；网络超时就重试，registry 会间歇性抽风
+npm publish --otp=123456  # 123456 换成手机验证器里当前的 6 位码
+```
+   ⚠️ **不要用「绕过 2FA」的令牌发布**：npm 会把这类发布转入分阶段审核（`0.0.0-stage` 占位版本就是这么来的），还得去网页手动批准。用 `npm login` + `--otp` 走正规 2FA 是长期有效路径（2027 年 1 月起，绕过 2FA 的令牌将无法直接发布）。
+4. **验证**：`https://registry.npmjs.org/dsh-douyin-audio` 的 `dist-tags.latest` 应为新版本号。npm 会提示 "may take a few minutes"，实测 1–2 分钟内生效。
+
+> 包里还留着一个 `0.0.0-stage` 占位版本（首次发布被转入分阶段审核时产生）。它不影响 `latest`，安装时只会拉 `latest`，可以无视。
