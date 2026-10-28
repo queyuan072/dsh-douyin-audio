@@ -3,6 +3,7 @@
  * 工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  * 只读查询：douyin_hot / douyin_search / douyin_video / douyin_comments（都走 scripts/douyin_read.py）
  * 通知（② 通知级闸门）：douyin_notes / douyin_messages —— 同样只读，只读页面不发消息、不标已读
+ * 轻互动（③A 轻互动级闸门，默认关）：douyin_react —— 点赞 / 取消赞 / 收藏 / 取消收藏，走 scripts/douyin_action.py
  * 登录（基础能力，不设等级闸门）：douyin_login_start / douyin_login_poll
  *   两种模式：window = 弹真窗口人工扫码/过验证；qr = 后台派生脚本抓二维码给设置页扫
  * 谷时自动刷（基础能力，不设等级闸门）：douyin_duty —— status / run / history，
@@ -510,6 +511,19 @@ const loginLogPath = () => join(loginDir(), 'login.log')
 
 /** 登录脚本路径：这里自己拼，不动 lib/runner.mjs（另一个脚本正在改 douyin_login.py） */
 const SCRIPT_LOGIN = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'douyin_login.py')
+/** 轻互动脚本（③A 档）：CLI 风格与 douyin_read.py 一致 —— 第一位置参数是动作 */
+const SCRIPT_ACTION = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'douyin_action.py')
+
+/** 测试缝（只给 selfcheck 用）：把「脚本路径 / 找 Python / 跑脚本」三步换掉，好断言 argv 而不用真起浏览器。
+ *  生产路径永远是 SCRIPT_ACTION + findPython + runPython；传 null 或省略就保持/复位成真实现。 */
+const REACT_REAL = { script: SCRIPT_ACTION, python: findPython, run: runPython }
+const reactDeps = { ...REACT_REAL }
+export function __reactDeps(next) {
+  for (const k of ['script', 'python', 'run']) {
+    if (next && Object.prototype.hasOwnProperty.call(next, k)) reactDeps[k] = next[k] || REACT_REAL[k]
+  }
+  return { script: reactDeps.script, stubbed: reactDeps.run !== REACT_REAL.run }
+}
 
 /** 插件版本：读本插件 package.json 的 version（给设置页顶栏用）；读不到就 null，绝不抛错 */
 let pluginVersionCache
@@ -936,6 +950,63 @@ export function apply(ctx, config = {}) {
       const lim = checkLimit(args.limit, 20)
       if (lim.error) return { ok: false, reason: lim.error }
       return runRead('messages', ['--limit', String(lim.value)], READ_TIMEOUT.messages)
+    },
+  })
+
+  // ── 4f-bis. 轻互动：点赞 / 取消赞 / 收藏 / 取消收藏（③A 轻互动级闸门）────────
+  /**
+   * 契约（scripts/douyin_action.py，与脚本 argparse 对齐）：动作走 --action，其余沿用 douyin_read.py 那一套：
+   *   python douyin_action.py --url U --action <like|unlike|collect|uncollect> --json
+   *     [--no-headless] [--verify-wait N] [--browser-channel C | --browser-executable P]
+   * stdout 只有一个 JSON 对象 { ok, action, before, after, changed, state, needLogin }，原样透出。
+   * 状态判定在脚本里：点之前读一次 [data-e2e="video-player-digg"] 的 innerText 数字，点完等
+   * 1.5–2.5s（必要时轮询到 6s）再读一次比大小 —— 不靠 class、不靠 aria-label（真机实测都没有）。
+   */
+  const REACT_ACTIONS = ['like', 'unlike', 'collect', 'uncollect']
+  const REACT_TIMEOUT = 150
+  const REACT_HINT = '③A 是写操作：会以你的账号点赞/收藏。抖音对高频互动有风控，建议一天几次、别批量刷。'
+
+  /** 跑一次动作子命令：argv 拼装与 runRead 一致（闸门与参数校验在调用方先做完） */
+  async function runAction(action, url) {
+    if (!existsSync(reactDeps.script)) return { ok: false, reason: '动作脚本不存在（插件版本过旧？）' }
+    const cfg = merged()
+    const python = await reactDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
+    if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
+    const argv = ['--url', url, '--action', action, '--json']
+    if (cfg.readHeadless === false) argv.push('--no-headless')
+    const wait = Math.max(0, Math.round(Number(cfg.verifyWait) || 0))
+    if (wait > 0) argv.push('--verify-wait', String(wait))
+    argv.push(...(await browserArgvFor(python, reactDeps.script, cfg)))
+    // 点完还要等状态变化，超时基数比只读高；人工过验证的时间也要落进预算
+    const budget = REACT_TIMEOUT + (wait > 0 ? wait + 15 : 0)
+    const r = await reactDeps.run(python, reactDeps.script, argv, { timeoutSec: budget, log })
+    const out = String(r.stdout || '')
+    log('react ' + action + ' 结束 code=' + r.code)
+    let parsed = null
+    const start = out.indexOf('{')
+    if (start >= 0) { try { parsed = JSON.parse(out.slice(start)) } catch {} }
+    if (!parsed) {
+      return { ok: false, exitCode: r.code, action, reason: '脚本输出不是 JSON（动作 ' + action + ' 那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
+    }
+    return { ...parsed, exitCode: r.code }
+  }
+
+  tool({
+    name: 'douyin_react',
+    description: '点赞 / 取消赞 / 收藏 / 取消收藏（**写操作**，能力等级③A 轻互动，默认关）：返回脚本的 ok / action / before / after / changed / state / needLogin。不评论、不关注、不发布。' + REACT_HINT,
+    parameters: {
+      url: { type: 'string', description: '视频页链接，如 https://www.douyin.com/video/<id>' },
+      action: { type: 'string', description: '动作：like（点赞）/ unlike（取消赞）/ collect（收藏）/ uncollect（取消收藏）' },
+    },
+    async execute(args) {
+      const deny = requireTier('douyin_react', 'react')
+      if (deny) return deny
+      const u = checkUrl(args.url)
+      if (u.error) return { ok: false, reason: u.error }
+      const action = String(args.action === undefined || args.action === null ? '' : args.action).trim().toLowerCase()
+      if (!action) return { ok: false, reason: 'action 必填：' + REACT_ACTIONS.join(' / '), actions: REACT_ACTIONS }
+      if (!REACT_ACTIONS.includes(action)) return { ok: false, reason: 'action 只能是 ' + REACT_ACTIONS.join(' / ') + '，收到 ' + action, actions: REACT_ACTIONS }
+      return runAction(action, u.value)
     },
   })
 

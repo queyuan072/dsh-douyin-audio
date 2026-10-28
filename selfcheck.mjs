@@ -4,9 +4,10 @@
  * 那类错误提前在本地暴露出来（宿主只会留一句 warning，日志里看不出根因）。
  *
  * 查什么：
- *   a. 恰好注册 14 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
+ *   a. 恰好注册 15 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  *      + douyin_hot / douyin_search / douyin_video / douyin_comments / douyin_note（只读查询）
  *      + douyin_notes / douyin_messages（② 通知，只读）
+ *      + douyin_react（③A 轻互动：点赞 / 收藏 / 取消，**写操作**，默认关）
  *      + douyin_login_start / douyin_login_poll（登录，基础能力不设等级闸门）
  *      + douyin_duty（谷时自动刷，基础能力不设等级闸门）
  *   b. 每个工具都有 description(string) / parameters(对象) / execute(function)
@@ -16,7 +17,10 @@
  *   e. 能力等级闸门：tierRead=false 时五个只读工具（含图文 douyin_note）返回 TIER_DISABLED；
  *      开回来后放行；tierReact/tierComment=true 时 tierRead 视为生效；基础四工具不受限；
  *      tierNotify=false 时 douyin_notes / douyin_messages 返回 TIER_DISABLED(tier=notify)，
- *      打开后放行（② 通知与 ① 只读互相独立）
+ *      打开后放行（② 通知与 ① 只读互相独立）；
+ *      tierReact=false 时 douyin_react 返回 TIER_DISABLED(tier=react)，打开后放行到参数校验，
+ *      再用桩掉的 runPython 断言 argv 里真拼了动作与 url；
+ *      五个等级**全关**时基础工具（douyin_config / douyin_login_poll / douyin_duty）都不受影响
  *   g. 浏览器通道 browserChannel：douyin_config 认得这个键，缺省是 msedge；五个取值
  *      msedge / chrome / chromium / firefox / webkit 都认，未知值仍规整成 msedge；
  *      douyin_status 的 browsers 是五个布尔值 + extras 数组（{id,label,path,exists}），
@@ -38,6 +42,7 @@ const EXPECTED_TOOLS = [
   'douyin_scroll', 'douyin_transcribe', 'douyin_status', 'douyin_config',
   'douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note',
   'douyin_notes', 'douyin_messages',
+  'douyin_react',
   'douyin_login_start', 'douyin_login_poll',
   'douyin_duty',
 ]
@@ -266,6 +271,98 @@ else {
   const fields = Object.keys(loginPoll.parameters || {})
   if (fields.length !== 0) problem('douyin_login_poll 不该有参数，现在是 ' + JSON.stringify(fields))
   else ok('douyin_login_poll 存在（无参数）')
+}
+
+/* ───────── ⑦-bis 轻互动 douyin_react：存在 + 参数契约 + ③A 闸门 + argv ───────── */
+const setReactDeps = (o) => (typeof mod.__reactDeps === 'function' ? mod.__reactDeps(o) : null)
+if (typeof mod.__reactDeps !== 'function') problem('index.js 没导出 __reactDeps 测试缝（argv 没法断言）')
+const reactTool = byName.get('douyin_react')
+if (!reactTool || typeof reactTool.execute !== 'function') problem('少了工具：douyin_react')
+else {
+  const fields = Object.keys(reactTool.parameters || {})
+  if (fields.join(',') !== 'url,action') problem('douyin_react 的参数应是 url + action，现在是 ' + JSON.stringify(fields))
+  else ok('douyin_react 存在（参数 url + action）')
+
+  // ③A 默认关：先被闸门挡住（闸门在跑脚本之前，零子进程）
+  writeCfg({ tierRead: true, tierReact: false })
+  const reactClosed = await callTool('douyin_react', { url: 'https://www.douyin.com/video/1', action: 'like' })
+  if (reactClosed && reactClosed.code === 'TIER_DISABLED' && reactClosed.tier === 'react'
+    && typeof reactClosed.reason === 'string' && typeof reactClosed.hint === 'string') {
+    ok('tierReact=false 时 douyin_react 返回 TIER_DISABLED(tier=react)')
+  } else problem('tierReact=false 时 douyin_react 没被挡住：' + JSON.stringify(reactClosed))
+
+  // 五个等级全关：别的工具不受影响（基础工具本来就不设闸门）
+  writeCfg({ tierRead: false, tierNotify: false, tierReact: false, tierComment: false, tierPublish: false })
+  const cfgLocked = await callTool('douyin_config', { action: 'get' })
+  const pollLocked = await callTool('douyin_login_poll', {})
+  if (cfgLocked && cfgLocked.ok === true && pollLocked && pollLocked.code !== 'TIER_DISABLED') {
+    ok('五个等级全关时 douyin_config / douyin_login_poll 照常可用')
+  } else problem('五个等级全关时别的工具被误伤：' + JSON.stringify([cfgLocked, pollLocked]))
+
+  // tierReact 打开 → 放行（拿参数校验当探针：它排在闸门之后、跑脚本之前）
+  writeCfg({ tierReact: true })
+  const badUrl = await callTool('douyin_react', { url: 'not-a-url', action: 'like' })
+  if (badUrl && badUrl.code !== 'TIER_DISABLED' && /url/.test(String(badUrl.reason || ''))) {
+    ok('tierReact=true 放行（url 非法时走到参数校验）')
+  } else problem('tierReact=true 时没放行：' + JSON.stringify(badUrl))
+
+  // douyin_config set tierReact=true → get 读回来是 true（存/读一致，才谈得上「开关真的解锁」）
+  writeCfg({})
+  const setReact = await callTool('douyin_config', { action: 'set', key: 'tierReact', value: 'true' })
+  const getReact = await callTool('douyin_config', { action: 'get' })
+  const reactNow = getReact && getReact.ok === true && getReact.config ? getReact.config.tierReact : undefined
+  if (setReact && setReact.ok === true && reactNow === true) ok('douyin_config set tierReact=true 后 loadCfg 读回来是 true')
+  else problem('tierReact 存/读不一致（set ok=' + JSON.stringify(setReact && setReact.ok) + '，读回来 ' + JSON.stringify(reactNow) + '）')
+
+  const badAction = await callTool('douyin_react', { url: 'https://www.douyin.com/video/1', action: 'zap' })
+  if (badAction && badAction.code !== 'TIER_DISABLED' && /action/.test(String(badAction.reason || ''))) {
+    ok('action 不在四个取值内被拒（like / unlike / collect / uncollect）')
+  } else problem('非法 action 没被拒：' + JSON.stringify(badAction))
+
+  // 桩掉「找 Python + 跑脚本」：断言工具层真拼了 argv（含动作与 url），不真起浏览器
+  const stubScript = join(SANDBOX_HOME, 'douyin_action_stub.py')
+  try { writeFileSync(stubScript, '# stub：selfcheck 只拿来过 existsSync\n', 'utf8') } catch { /* 写不出来下面的断言会自己报 */ }
+  const seenArgv = []
+  setReactDeps({
+    script: stubScript,
+    python: async () => 'stub-python',
+    run: async (python, script, argv, opts) => {
+      seenArgv.push({ python, script, argv: argv.slice(), timeoutSec: opts && opts.timeoutSec })
+      return {
+        ok: true, code: 0, stderr: '',
+        stdout: JSON.stringify({ ok: true, action: 'like', before: 1671, after: 1672, changed: true, state: 'liked', needLogin: false }),
+      }
+    },
+  })
+  writeCfg({ tierReact: true, browserChannel: 'msedge' })
+  const REACT_URL = 'https://www.douyin.com/video/123456'
+  const reactRan = await callTool('douyin_react', { url: REACT_URL, action: 'like' })
+  const lastCall = seenArgv.length ? seenArgv[seenArgv.length - 1] : null
+  const lastArgv = lastCall ? lastCall.argv : []
+  if (lastArgv[lastArgv.indexOf('--action') + 1] === 'like' && lastArgv[lastArgv.indexOf('--url') + 1] === REACT_URL
+    && lastArgv.includes('--json')) {
+    ok('桩掉 runPython：argv 带 --action like 与 --url → ' + JSON.stringify(lastArgv))
+  } else problem('douyin_react 的 argv 不对：' + JSON.stringify(lastArgv))
+  if (reactRan && reactRan.ok === true && reactRan.before === 1671 && reactRan.after === 1672
+    && reactRan.changed === true && reactRan.state === 'liked' && reactRan.needLogin === false && reactRan.exitCode === 0) {
+    ok('脚本 JSON 原样透出（ok / action / before / after / changed / state / needLogin）')
+  } else problem('douyin_react 没把脚本 JSON 透出：' + JSON.stringify(reactRan))
+
+  // 只读那套参数照样生效：readHeadless=false → --no-headless；verifyWait=30 → --verify-wait 30 + 预算加时
+  writeCfg({ tierReact: true, readHeadless: false, verifyWait: 30 })
+  await callTool('douyin_react', { url: REACT_URL, action: 'collect' })
+  const argvOpt = seenArgv.length ? seenArgv[seenArgv.length - 1].argv : []
+  const budget = seenArgv.length ? seenArgv[seenArgv.length - 1].timeoutSec : 0
+  if (argvOpt[argvOpt.indexOf('--action') + 1] === 'collect' && argvOpt.includes('--no-headless')
+    && argvOpt[argvOpt.indexOf('--verify-wait') + 1] === '30' && budget >= 150 + 30 + 15) {
+    ok('沿用 runRead 那套参数：' + JSON.stringify(argvOpt) + '（预算 ' + budget + 's）')
+  } else problem('douyin_react 没沿用 readHeadless / verifyWait：' + JSON.stringify(argvOpt) + ' 预算 ' + budget)
+
+  // 复位测试缝：生产路径回到 scripts/douyin_action.py + findPython + runPython
+  const depReset = setReactDeps({ script: null, python: null, run: null })
+  if (depReset && depReset.stubbed === false && /douyin_action\.py$/.test(String(depReset.script))) ok('测试缝已复位（生产路径 = 真 runPython）')
+  else problem('测试缝没复位：' + JSON.stringify(depReset))
+  writeCfg({})
 }
 
 /* ───────── ⑧ 谷时自动刷（douyin_duty）：无等级闸门 + action 参数 ───────── */

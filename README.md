@@ -10,7 +10,7 @@
 
 ---
 
-## 1. 十三个工具
+## 1. 十五个工具
 
 ### 1.1 只读查询（5 个）
 
@@ -85,6 +85,23 @@
 
 这两个工具**不受能力等级限制**：读不到登录态，只读/通知那些开关一个也用不上。两种模式的区别、状态文件、图片端点见第 5 节。
 
+### 1.6 轻互动（1 个，③A 轻互动级，**默认关**）
+
+**这是本插件唯一的写操作**：点赞 / 取消赞 / 收藏 / 取消收藏。走 `scripts/douyin_action.py`，闸门是 `tierReact`（③A，默认 `false`）。
+
+| 工具 | 参数 | 对映的 CLI | 返回字段 |
+| --- | --- | --- | --- |
+| `douyin_react` | `url`(string, 必填, http/https) / `action`(`like` \| `unlike` \| `collect` \| `uncollect`, 必填) | `--url U --action like --json`，另可带 `--no-headless` / `--verify-wait N` / `--browser-channel` / `--browser-executable` | `ok` / `action` / `url` / `before` / `after` / `changed` / `state` / `needLogin` / `clicks` / `corrected`（脚本另带 `browser` / `elapsed`，插件补 `exitCode`） |
+
+怎么判断「点上了没有」——**不靠 class、不靠 aria-label**（真机上两者都没有，只有 `data-e2e`）：
+
+1. 只点两个真机核实过的按钮：点赞 `[data-e2e="video-player-digg"]`、收藏 `[data-e2e="video-player-collect"]`（评论 `feed-comment-icon` / 分享 `video-player-share` 只用于定位页面，不会被点）；
+2. **点之前**读一次按钮 `innerText` 里的数字 → `before`；点完等 1.5–2.5 秒（必要时轮询到 6 秒）再读一次 → `after`；
+3. `after > before` → 已点赞 / 已收藏（`changed: true`）；`after < before` → 取消成功；两者相等 → `state: "uncertain"`（没点中、或被风控拦住），**绝不假装成功**。一次没到位脚本会再校一次（`clicks` = 点了几次、`corrected` = 有没有做第二次纠正），两次都校不回来就是 `ok: false` + `state: "uncertain"`；`state` 的取值只有 `liked` / `unliked` / `collected` / `uncollected` / `uncertain`；
+4. 点完页面出现「登录后」字样、或冒出 login 相关的 `data-e2e` 节点 → 直接返回 `needLogin: true`，不再猜状态。
+
+出错时的形状：`url` 不是 http(s) / `action` 不在四个取值内 → `{ ok: false, reason }`（插件层，不会带着坏参数去点）；脚本不存在（插件版本对不上）→ `{ ok: false, reason: "动作脚本不存在（插件版本过旧？）" }`；脚本输出不是 JSON → `{ ok: false, reason: "脚本输出不是 JSON（动作 like 那一步）", output: <日志尾巴> }`；脚本自己失败 → `{ ok: false, error: "一句话原因", state, needLogin, … }` 原样透出（`error` 是脚本层的键，与只读那几个工具一致，退出码挂在 `exitCode`）。超时上限 150s（`verifyWait` > 0 时再加 `verifyWait + 15` 秒）。
+
 ---
 
 ## 2. 安装
@@ -137,8 +154,8 @@
 | `count` | number（正整数） | `3` | 一轮刷几屏。实际调用时夹到 1–200 |
 | `delay` | number | `1.5` | 每屏停留秒数。实际调用时夹到 0.5–30 |
 | `headless` | boolean | `true` | 无头（后台）运行；`false` 会弹窗口（只管 `douyin_scroll`） |
-| `readHeadless` | boolean | `true` | 五个**只读**工具（`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`）是否后台运行。`true`（默认）传 `--headless`、行为与历史完全一致；`false` 时插件给脚本加 `--no-headless`，弹一个**移出屏幕外**的可见窗口（`--window-position=-3000,-3000`）——headless 打开抖音必吃验证码，带窗口的能过风控 |
-| `verifyWait` | number（秒） | `0` | 命中「验证码中间页」时最多等多少秒让人工去过验证，超过就照旧如实报错。`0`（默认）= 不等，行为与历史一致；`>0` 时给脚本加 `--verify-wait N`，并把这次调用的超时预算加上 `N + 15` 秒（否则窗口刚弹出来就被 taskkill） |
+| `readHeadless` | boolean | `true` | 五个**只读**工具（`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`）是否后台运行。`true`（默认）传 `--headless`、行为与历史完全一致；`false` 时插件给脚本加 `--no-headless`，弹一个**移出屏幕外**的可见窗口（`--window-position=-3000,-3000`）——headless 打开抖音必吃验证码，带窗口的能过风控。`douyin_react`（③A 轻互动）也读这把键 |
+| `verifyWait` | number（秒） | `0` | 命中「验证码中间页」时最多等多少秒让人工去过验证，超过就照旧如实报错。`0`（默认）= 不等，行为与历史一致；`>0` 时给脚本加 `--verify-wait N`，并把这次调用的超时预算加上 `N + 15` 秒（否则窗口刚弹出来就被 taskkill）。`douyin_react` 同样认这把键 |
 | `saveAll` | boolean | `true` | 是否逐屏下载视频（关掉就只截图，后续没东西可转写） |
 | `downloadTimeout` | number（正整数，秒） | `300` | 单个视频下载超时 |
 | `transcribeModel` | string | `''` | **当前仅占位**：`config.json` 里有这个键，但没有任何工具读取它（转写模型目录请用 `douyin_transcribe` 的 `modelDir` 参数） |
@@ -155,7 +172,7 @@
 | `uiLayout` | string | `classic` | 设置页布局：`classic` = 一长条平铺；`tabs` = 四标签页（采集 / 转写 / 权限与登录 / 环境与诊断） |
 | `tierRead` | boolean | `true` | **① 只读**：解锁 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` |
 | `tierNotify` | boolean | `false` | **② 通知**：解锁 `douyin_notes` / `douyin_messages`（读通知摘要、私信会话列表；仍然只读，不发消息、不标已读） |
-| `tierReact` | boolean | `false` | **③A 轻互动**：点赞 / 收藏 / 取消（预留；会动你账号的互动记录，但可撤回） |
+| `tierReact` | boolean | `false` | **③A 轻互动**：解锁 `douyin_react`——点赞 / 取消赞 / 收藏 / 取消收藏（见 1.6）。**默认关**；这一档**真的会写**：以你的账号点赞、收藏（可撤回，但会动你的互动记录）。关着时 `douyin_react` 返回 `TIER_DISABLED(tier=react)` |
 | `tierComment` | boolean | `false` | **③B 评论回复**：发评论 / 回复（预留；会以你的账号公开发言，发出后收不回） |
 | `tierPublish` | boolean | `false` | **④ 发布**：上传视频到抖音（预留；会向你的账号投稿） |
 
@@ -406,6 +423,8 @@ python douyin_login.py --out D:\my\cookie.txt
 10. **只读工具依赖页面结构，抖音改版就会失效。** `douyin_read.py` 每个字段都写多候选选择器并逐级兜底，取不到时返回 `{ ok: false, error: "…" }` 而不是半个空列表；真失效了就按 6.2 手动跑同一个脚本，看 `--json` 的 `error` 定位到哪一步，再去补选择器。
 
 11. **通知/私信需要更完整的登录态，抓取规则也比公开页面更容易变。** `douyin_notes` / `douyin_messages` 读的是登录后才有内容的页面：没有 cookie 时脚本在**起浏览器之前**就返回 `{ ok: false, error: "notes: 需要登录态：没读到 cookie（<路径>）…" }`；有 cookie 但登录态过期（页面弹登录墙/只显示半截）时，返回的是「命中 N 个通知节点但内容为空」或「选择器全部未命中」这类**明确 error**，不会是伪装成成功的空列表。另外这两页默认地址（`/notifications` / `/messages`）与 DOM **没有在真机上验证过**，`type` 归类、`unread` 角标都是「多候选 + 兜底」的启发式，抖音改版后可能退化成 `其他` / `0`；这时用 CLI 的 `--url` 指对地址，再按 6.2 手动跑一次看 `--json` 的 `error` 定位到哪一步。
+
+12. **③A（`douyin_react`）是写操作，会撞「互动风控」——建议一天几次、别批量刷。** 点赞/收藏对抖音是计数的互动行为：短时间集中点、脚本式连点、或者本来就被自动化风控打了分的账号，很容易换来 `state: "uncertain"`（点了但数字没变）、或者直接跳登录/验证页（返回 `needLogin: true`）。**一批不要超过几条、每条之间隔几十秒、别拿它刷赞数**；吃到 `uncertain` 就停手，等几小时自然冷却，或按第 9 条的办法过一次验证，不要靠反复重试硬撞。这一档也不适合和只读工具的高频连跑混在一起。
 
 ---
 
