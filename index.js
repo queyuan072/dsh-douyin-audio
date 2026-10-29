@@ -654,6 +654,64 @@ function pluginVersion() {
   return pluginVersionCache
 }
 
+/* ── 检查更新 ──────────────────────────────────────────────────────────────
+ * 问 npm registry 拿 latest，跟本地 package.json 的 version 比。
+ * 只读、不改任何东西；失败不抛错，把原因写成人话返回（离网也能点）。
+ * 测试缝 __updateDeps 让 selfcheck 注入假 fetch，避免测试真的联网。 */
+const UPDATE_REGISTRY = 'https://registry.npmjs.org/dsh-douyin-audio/latest'
+const UPDATE_PAGE = 'https://www.npmjs.com/package/dsh-douyin-audio'
+const UPDATE_INSTALL = 'npm install dsh-douyin-audio@latest'
+const __UPDATE_REAL = { fetch: (u, o) => fetch(u, o) }
+const updateDeps = { ...__UPDATE_REAL }
+
+export function __updateDeps(next) {
+  if (next && Object.prototype.hasOwnProperty.call(next, 'fetch')) updateDeps.fetch = next.fetch || __UPDATE_REAL.fetch
+  return { stubbed: updateDeps.fetch !== __UPDATE_REAL.fetch }
+}
+
+/** 比较两个 semver（只认 x.y.z 的数字段，预发布后缀忽略）：a>b 返回正数 */
+function compareVer(a, b) {
+  const parse = (v) => String(v || '').split('-')[0].split('.').map((x) => parseInt(x, 10) || 0)
+  const pa = parse(a)
+  const pb = parse(b)
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+/** 检查更新：{ ok, current, latest?, hasUpdate?, error? } —— 永不抛错 */
+async function checkUpdate() {
+  const current = pluginVersion()
+  const fail = (error) => ({ ok: false, current, latest: null, hasUpdate: false, error, page: UPDATE_PAGE })
+  let res
+  const ac = new AbortController()
+  const timer = setTimeout(() => ac.abort(), 8000)
+  try {
+    res = await updateDeps.fetch(UPDATE_REGISTRY, { headers: { accept: 'application/json' }, signal: ac.signal })
+  } catch (e) {
+    return fail(e && e.name === 'AbortError' ? '连接 npm 超时（8 秒），稍后再试' : '连不上 npm registry（' + ((e && e.message) || '网络问题') + '）')
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!res || typeof res.ok !== 'boolean') return fail('npm registry 没有正常响应')
+  if (!res.ok) return fail('npm registry 返回 HTTP ' + res.status)
+  let body = null
+  try { body = await res.json() } catch { return fail('npm registry 返回的不是 JSON') }
+  const latest = body && typeof body.version === 'string' ? body.version : ''
+  if (!latest) return fail('npm registry 没给出 version 字段')
+  return {
+    ok: true,
+    current,
+    latest,
+    hasUpdate: compareVer(latest, current) > 0,
+    publishedAt: (body.time && body.time.modified) || null,
+    page: UPDATE_PAGE,
+    install: UPDATE_INSTALL,
+  }
+}
+
 /** cookie 落点：DOUYIN_COOKIE_FILE > ~/.dsh/cookies/douyin_cookies.txt（与脚本默认值一致） */
 function loginCookieFile() {
   const env = String(process.env.DOUYIN_COOKIE_FILE || '').trim()
@@ -1894,6 +1952,8 @@ export function apply(ctx, config = {}) {
             return send(200, { ok: true, token: issueAuthToken(), expiresInMs: AUTH_TOKEN_TTL_MS, header: AUTH_TOKEN_HEADER })
           }
           if (req.method === 'GET' && sub === '/config') return send(200, { ok: true, config: merged() })
+          // 检查更新：问 npm registry 比版本。只读、8 秒超时、失败也是 HTTP 200（把原因写在 error 里）
+          if (req.method === 'GET' && sub === '/update') return send(200, await checkUpdate())
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
           if (req.method === 'GET' && sub === '/sysinfo') {
             let cores = 0

@@ -576,6 +576,31 @@ else {
     if (originSame.status === 200) ok('Origin 与 Host 同源（不带 Sec-Fetch-Site）→ 200，设置页刷新不受影响')
     else problem('同源 Origin 被误拦：' + JSON.stringify(originSame))
 
+    /* ── 检查更新（GET /update）：注入假 fetch，绝不真联网 ── */
+    if (typeof mod.__updateDeps !== 'function') {
+      problem('index.js 没导出 __updateDeps 测试缝（检查更新会真联网）')
+    } else {
+      const fakeRes = (obj) => ({ ok: true, status: 200, json: async () => obj })
+      // 1) registry 有新版本 → hasUpdate true
+      mod.__updateDeps({ fetch: async () => fakeRes({ version: '99.99.99' }) })
+      const upNew = await callRoute('GET', '/api/douyin-audio/update')
+      if (upNew && upNew.ok === true && upNew.latest === '99.99.99' && upNew.hasUpdate === true && /^\d+\.\d+\.\d+/.test(String(upNew.current))) {
+        ok('GET /update：远端更新时 hasUpdate=true（current=' + upNew.current + ' → latest=' + upNew.latest + '）')
+      } else problem('检查更新判断有误：' + JSON.stringify(upNew))
+      // 2) registry 版本旧于本地 → hasUpdate false
+      mod.__updateDeps({ fetch: async () => fakeRes({ version: '0.0.1' }) })
+      const upOld = await callRoute('GET', '/api/douyin-audio/update')
+      if (upOld && upOld.ok === true && upOld.hasUpdate === false) ok('GET /update：远端更旧时 hasUpdate=false')
+      else problem('更旧也报有更新：' + JSON.stringify(upOld))
+      // 3) 网络炸了 → 不抛错，返回 ok:false + 人话
+      mod.__updateDeps({ fetch: async () => { throw new Error('getaddrinfo ENOTFOUND') } })
+      const upFail = await callRoute('GET', '/api/douyin-audio/update')
+      if (upFail && upFail.ok === false && typeof upFail.error === 'string' && upFail.error.length > 4) {
+        ok('GET /update：连不上时返回 ok:false 且不抛错（' + upFail.error.slice(0, 28) + '…）')
+      } else problem('检查更新遇到网络错误没兜住：' + JSON.stringify(upFail))
+      mod.__updateDeps({ fetch: null })   // 还原成真 fetch
+    }
+
     // f. HTTP /config 写 tier*：跨站 403，同源放行（那是用户自己在设置页点开关）
     writeCfg({ tierReact: false })
     const tierCross = await routeRaw('POST', '/api/douyin-audio/config', { key: 'tierReact', value: true }, evilSiteH)

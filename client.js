@@ -314,8 +314,46 @@ window.__ModuleLoader__.load({
       const [forceVenv, setForceVenv] = React.useState(false)   // 强制新建 venv（不复用已有 Python）
       const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
       const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
+      const [upd, setUpd] = React.useState(null)                // 检查更新结果（null = 还没查）
+      const [updBusy, setUpdBusy] = React.useState(false)
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
+
+      /* 通用复制：成功返回 true（navigator.clipboard 不可用时退回 execCommand） */
+      const copyText = async (text) => {
+        try { await navigator.clipboard.writeText(text); return true } catch (e) { /* 兜底 */ }
+        try {
+          const ta = document.createElement('textarea')
+          ta.value = text
+          ta.style.position = 'fixed'
+          ta.style.opacity = '0'
+          document.body.appendChild(ta)
+          ta.select()
+          const ok = document.execCommand && document.execCommand('copy')
+          document.body.removeChild(ta)
+          return !!ok
+        } catch (e2) { return false }
+      }
+
+      /* 检查更新：silent=true 只在顶栏标记，不打断说话（挂载时先静默查一次） */
+      const checkUpd = async (silent) => {
+        if (updBusy) return
+        setUpdBusy(true)
+        try {
+          const r = await jget('/update')
+          const res = r && typeof r === 'object' ? r : { ok: false, error: '宿主没回检查结果' }
+          setUpd(res)
+          if (silent) return
+          if (res.ok && res.hasUpdate) say('有新版本 ' + res.latest + '（当前 ' + res.current + '）—— 点徽章复制升级命令', 'warn')
+          else if (res.ok) say('已是最新：' + res.current, 'good')
+          else say('检查更新失败：' + (res.error || '原因不详'), 'warn')
+        } catch (e) {
+          setUpd({ ok: false, error: errText(e) })
+          if (!silent) say('检查更新失败：' + errText(e), 'warn')
+        } finally {
+          setUpdBusy(false)
+        }
+      }
 
     /** 把结果区原文复制到剪贴板；navigator.clipboard 不可用时退回 execCommand */
     const copyOut = async () => {
@@ -347,6 +385,8 @@ window.__ModuleLoader__.load({
         } catch (e) { setFails((n) => n + 1); say('读不到设置：' + errText(e), 'warn') }
       }
       React.useEffect(() => { reload() }, [])
+      /* 挂载时静默查一次更新：有新版本就在顶栏亮一枚徽章，不打断任何操作 */
+      React.useEffect(() => { checkUpd(true) }, [])
       /* 线程数提示：按本机核数算建议区间，别再写死「8–16」——14 核的机器填 16 会被夹取，说法与事实不符 */
       const threadHint = (cores) => {
         if (!(cores > 0)) {
@@ -818,6 +858,8 @@ window.__ModuleLoader__.load({
         } finally { setBusy('') }
       }
 
+      /* 读不到配置时的兜底页：留一个【检查更新】——
+         装上坏版本（比如 1.2.2 的 403）时，用户正需要知道「新版能修我这个问题」 */
       if (!cfg) {
         return h('div', { 'data-dy-page': '' },
           h('div', { 'data-dy-sec': '' },
@@ -827,7 +869,31 @@ window.__ModuleLoader__.load({
                 ? '读设置失败 ' + fails + ' 次 —— 宿主这版可能还没有 /douyin-audio/config 路由（改完 index.js 要重启 dsh）'
                 : '读设置中…'),
             fails ? h('div', { 'data-dy-row': '' },
-              h('button', { 'data-dy-btn': '', onClick: reload }, '重试')) : null,
+              h('button', { 'data-dy-btn': '', onClick: reload }, '重试'),
+              h('button', {
+                'data-dy-btn': '', 'data-primary': '', disabled: updBusy,
+                title: '问 npm registry 有没有新版本（8 秒超时）',
+                onClick: () => checkUpd(false),
+              }, updBusy ? '查询中…' : '检查更新')) : null,
+            upd
+              ? h('div', { 'data-dy-note': '', 'data-dy-selected': upd.ok && upd.hasUpdate ? '' : undefined },
+                upd.ok
+                  ? (upd.hasUpdate
+                    ? 'npm 上已有 v' + upd.latest + '（当前 v' + upd.current + '）—— 可能就是这个问题的修复：'
+                      + 'npm install dsh-douyin-audio@latest'
+                    : '已是最新版本 v' + upd.current)
+                  : '检查更新失败：' + (upd.error || '原因不详'))
+              : null,
+            upd && upd.ok && upd.hasUpdate
+              ? h('div', { 'data-dy-row': '' },
+                h('button', {
+                  'data-dy-btn': '',
+                  onClick: async () => {
+                    const ok = await copyText('npm install dsh-douyin-audio@latest')
+                    say(ok ? '已复制升级命令' : '复制失败，请手动执行 npm install dsh-douyin-audio@latest', ok ? 'good' : 'warn')
+                  },
+                }, '复制升级命令'))
+              : null,
             msg ? h('div', { 'data-dy-msg': '', 'data-warn': msgTone === 'warn' ? '' : undefined }, msg) : null))
       }
 
@@ -1443,8 +1509,24 @@ window.__ModuleLoader__.load({
               onClick: b.act === 'env' ? () => run('status', {}, '自检')
                 : b.act === 'login' ? focusLogin : undefined,
             }, b.text))
-            : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…')),
+            : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…'),
+          upd && upd.ok && upd.hasUpdate
+            ? h('button', {
+              key: 'badge-upd',
+              'data-dy-badge': '', 'data-warn': '',
+              title: 'npm 上已发布 v' + upd.latest + '（当前 v' + upd.current + '）—— 点这里复制升级命令',
+              onClick: async () => {
+                const ok = await copyText('npm install dsh-douyin-audio@latest')
+                say(ok ? '已复制升级命令：npm install dsh-douyin-audio@latest' : '复制失败，请手动执行 npm install dsh-douyin-audio@latest', ok ? 'good' : 'warn')
+              },
+            }, 'v' + upd.current + ' → v' + upd.latest)
+            : null),
         h('div', { 'data-dy-layout': '' },
+          h('button', {
+            'data-dy-btn': '', disabled: updBusy,
+            title: '问 npm registry 有没有新版本（8 秒超时；离网会提示连不上）',
+            onClick: () => checkUpd(false),
+          }, updBusy ? '查询中…' : '检查更新'),
           h('button', {
             'data-dy-btn': '', 'data-dy-layout-btn': 'classic', 'data-primary': useTabs ? undefined : '',
             disabled: busy === 'uiLayout', title: '一长条平铺的设置页（默认）',
