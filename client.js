@@ -121,6 +121,13 @@ window.__ModuleLoader__.load({
   line-height:15px;white-space:pre-wrap;word-break:break-all;
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   background:var(--dsw-alias-bg-layer-4,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-dy-mask]{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
+  justify-content:center;z-index:60;}
+[data-dy-modal]{width:min(460px,86vw);border-radius:12px;padding:14px 16px;
+  background:var(--dsw-alias-bg-layer-2,#25272b);
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.14));box-shadow:0 12px 32px rgba(0,0,0,.45);}
+[data-dy-modal] [data-dy-modal-title]{font-size:13px;font-weight:600;
+  color:var(--dsw-alias-label-primary,#e8eaed);margin-bottom:6px;}
 [data-dy-advice]{margin:6px 0 0;padding:8px 10px;border-radius:8px;font-size:11px;line-height:17px;
   background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.10));
   border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.10));}
@@ -316,6 +323,8 @@ window.__ModuleLoader__.load({
       const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
       const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
       const [upd, setUpd] = React.useState(null)                // 检查更新结果（null = 还没查）
+      const [updAsk, setUpdAsk] = React.useState(false)          // 升级确认弹窗开着没
+      const [updApply, setUpdApply] = React.useState(null)       // 点「立即升级」后的宿主回执
       const [updBusy, setUpdBusy] = React.useState(false)
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
@@ -334,6 +343,21 @@ window.__ModuleLoader__.load({
           document.body.removeChild(ta)
           return !!ok
         } catch (e2) { return false }
+      }
+
+      /* 用户点「立即升级」：宿主侧判断安装方式，npm 版才真跑 npm install */
+      const doApplyUpdate = async (action) => {
+        setUpdBusy(true)
+        try {
+          const r = await jpost('/update', { action: action || 'apply' })
+          setUpdApply(r && typeof r === 'object' ? r : { ok: false, message: '宿主没回执' })
+          say((r && r.message) || '已请求升级', r && r.ok ? 'good' : 'warn')
+        } catch (e) {
+          setUpdApply({ ok: false, message: errText(e) })
+          say('升级请求失败：' + errText(e), 'warn')
+        } finally {
+          setUpdBusy(false)
+        }
       }
 
       /* 检查更新：silent=true 只在顶栏标记，不打断说话（挂载时先静默查一次） */
@@ -1529,10 +1553,7 @@ window.__ModuleLoader__.load({
               key: 'badge-upd',
               'data-dy-badge': '', 'data-warn': '',
               title: (upd.source ? upd.source + ' 上为 v' : '远端为 v') + upd.latest + '（当前 v' + upd.current + '）—— 点这里复制升级命令',
-              onClick: async () => {
-                const ok = await copyText('npm install dsh-douyin-audio@latest')
-                say(ok ? '已复制升级命令：npm install dsh-douyin-audio@latest' : '复制失败，请手动执行 npm install dsh-douyin-audio@latest', ok ? 'good' : 'warn')
-              },
+              onClick: () => { setUpdApply(null); setUpdAsk(true) },
             }, 'v' + upd.current + ' → v' + upd.latest)
             : null),
         h('div', { 'data-dy-layout': '' },
@@ -1557,8 +1578,46 @@ window.__ModuleLoader__.load({
           onClick: () => run('scroll', { count: runCount }, '刷一轮'),
         }, busy === 'scroll' ? '刷着呢…' : '刷一轮'))
 
+      /* 升级确认弹窗：点黄色版本徽章弹出；「立即升级」只在 npm 安装的机器上给（file: 链接会覆盖源码） */
+      const updModal = updAsk && upd
+        ? h('div', { 'data-dy-mask': '', onClick: () => setUpdAsk(false) },
+          h('div', { 'data-dy-modal': '', onClick: (e) => e.stopPropagation() },
+            h('div', { 'data-dy-modal-title': '' }, upd.ok && upd.hasUpdate ? '发现新版本，要更新吗？' : '检查更新'),
+            h('div', { 'data-dy-note': '' },
+              upd.ok
+                ? '当前 v' + upd.current + (upd.hasUpdate ? ' → 远端 v' + upd.latest : '（已是最新）')
+                  + (upd.source ? '（来自 ' + upd.source + '）' : '')
+                : '检查更新失败：' + (upd.error || '原因不详')),
+            updApply
+              ? h('div', { 'data-dy-note': '', 'data-dy-selected': '' }, updApply.message || '')
+              : null,
+            upd.mode === 'linked'
+              ? h('div', { 'data-dy-note': '' },
+                '当前是源码链接安装：只会在源码目录执行 git pull --ff-only（不覆盖、不删除本地文件），更新后需重启 DSH。')
+              : null,
+            h('div', { 'data-dy-row': '' },
+              upd.ok && upd.hasUpdate
+                ? h('button', {
+                  'data-dy-btn': '', 'data-primary': '', disabled: updBusy,
+                  title: upd.mode === 'linked'
+                    ? '在源码目录执行 git pull --ff-only，不覆盖本地改动；更新后需重启 DSH'
+                    : '在插件目录执行 npm install dsh-douyin-audio@latest，装完需重启 DSH',
+                  onClick: () => doApplyUpdate(upd.mode === 'linked' ? 'pull' : 'apply'),
+                }, updBusy ? '请求中…' : (upd.mode === 'linked' ? '拉取最新源码' : '立即升级'))
+                : null,
+              h('button', {
+                'data-dy-btn': '',
+                onClick: async () => {
+                  const ok = await copyText('npm install dsh-douyin-audio@latest')
+                  say(ok ? '已复制升级命令' : '复制失败，请手动执行', ok ? 'good' : 'warn')
+                },
+              }, '复制命令'),
+              h('button', { 'data-dy-btn': '', onClick: () => setUpdAsk(false) }, '关闭'))))
+        : null
+
       const renderTabs = () => h('div', { 'data-dy-page': '' },
         topBar,
+        updModal,
         /* ── 第二层：四个标签 ── */
         h('div', { 'data-dy-tabs': '' }, tabs.map((t) => h('button', {
           key: 'tab-' + t.key,
@@ -1580,6 +1639,7 @@ window.__ModuleLoader__.load({
       const renderClassic = () => {
       return h('div', { 'data-dy-page': '' },
         topBar,
+        updModal,
 
         /* ── 刷几屏、怎么刷 ── */
         h('div', { 'data-dy-sec': '' },

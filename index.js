@@ -758,6 +758,103 @@ async function checkUpdate() {
   }
 }
 
+const PLUGIN_NAME = 'dsh-douyin-audio'
+
+/** 本插件是怎么装上的：file: 链接（本机源码）还是 npm 包 —— 决定能不能自己升级 */
+function pluginInstallInfo() {
+  const pluginDir = dirname(fileURLToPath(import.meta.url))
+  const profileDir = dirname(dirname(pluginDir))          // …/profiles/<profile>/node_modules/<pkg> → profile
+  let spec = ''
+  try {
+    const pkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
+    const deps = pkg.dependencies || {}
+    const dev = pkg.devDependencies || {}
+    spec = deps[PLUGIN_NAME] || dev[PLUGIN_NAME] || ''
+  } catch { /* 读不到 profile package.json：当未知处理 */ }
+  const linked = !spec || /^file:/i.test(spec)
+  return { pluginDir, profileDir, spec, linked, mode: linked ? 'linked' : 'npm' }
+}
+
+/** 在插件源码目录跑 git pull --ff-only（60 秒上限），把输出带回去 */
+function gitPull(pluginDir) {
+  return new Promise((resolve) => {
+    let out = ''
+    const push = (b) => { out += String(b); if (out.length > 8000) out = out.slice(-8000) }
+    let child
+    try {
+      child = spawn('git', ['pull', '--ff-only'], { cwd: pluginDir, windowsHide: true })
+    } catch (e) {
+      return resolve({ ok: false, code: null, output: String((e && e.message) || e) })
+    }
+    const timer = setTimeout(() => { try { child.kill() } catch { /* 已退出 */ } }, 60000)
+    if (child.stdout && child.stdout.on) child.stdout.on('data', push)
+    if (child.stderr && child.stderr.on) child.stderr.on('data', push)
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, code: null, output: String((e && e.message) || e) }) })
+    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, output: out.trim() }) })
+  })
+}
+
+/** 执行升级：npm 安装 → npm install；源码链接 → git pull（绝不覆盖、绝不删除） */
+async function applyUpdate(action) {
+  const info = pluginInstallInfo()
+  if (info.linked) {
+    if (action !== 'pull') {
+      return {
+        ok: false,
+        mode: 'linked',
+        need: 'pull',
+        spec: info.spec || '(未声明)',
+        command: UPDATE_INSTALL,
+        pluginDir: info.pluginDir,
+        message: '当前是按本机源码链接安装的（profile 里写的是 ' + (info.spec || 'file:…') + '）：'
+          + '插件只会在源码目录执行 git pull，不会覆盖或删除任何文件。',
+      }
+    }
+    const r = await gitPull(info.pluginDir)
+    return {
+      ok: r.ok,
+      mode: 'linked',
+      action: 'pull',
+      pluginDir: info.pluginDir,
+      code: r.code,
+      output: r.output,
+      message: r.ok
+        ? '源码已更新。请重启 DSH 生效。\n' + r.output
+        : 'git pull 没成功（退出码 ' + r.code + '）。可能是本地有改动或没网：\n' + r.output,
+    }
+  }
+  const dir = stateDir()
+  try { mkdirSync(dir, { recursive: true }) } catch { /* 目录已存在 */ }
+  const logf = join(dir, 'update.log')
+  let fd = null
+  try {
+    fd = openSync(logf, 'a')
+    writeFileSync(logf, '\n=== ' + new Date().toISOString() + '  npm install ' + PLUGIN_NAME + '@latest  (cwd ' + info.profileDir + ')\n')
+  } catch { /* 日志打不开也要继续装 */ }
+  try {
+    const child = spawn('npm', ['install', PLUGIN_NAME + '@latest', '--no-audit', '--no-fund'], {
+      cwd: info.profileDir,
+      shell: process.platform === 'win32',
+      detached: true,
+      windowsHide: true,
+      stdio: ['ignore', fd || 'ignore', fd || 'ignore'],
+    })
+    child.unref()
+    return {
+      ok: true,
+      started: true,
+      mode: 'npm',
+      log: logf,
+      profileDir: info.profileDir,
+      message: '已开始升级（npm install ' + PLUGIN_NAME + '@latest）。装完请重启 DSH 生效，日志在 ' + logf,
+    }
+  } catch (e) {
+    return { ok: false, mode: 'npm', log: logf, message: '启动 npm 失败：' + ((e && e.message) || String(e)) }
+  } finally {
+    if (fd !== null) { try { closeSync(fd) } catch { /* 已关 */ } }
+  }
+}
+
 /** 从各源的返回体里取 version：npm 直接给；GitHub/GitCode 的 contents 接口给 base64 content */
 function versionFromBody(body) {
   if (!body || typeof body !== 'object') return ''
@@ -2013,7 +2110,10 @@ export function apply(ctx, config = {}) {
           }
           if (req.method === 'GET' && sub === '/config') return send(200, { ok: true, config: merged() })
           // 检查更新：问 npm registry 比版本。只读、8 秒超时、失败也是 HTTP 200（把原因写在 error 里）
-          if (req.method === 'GET' && sub === '/update') return send(200, await checkUpdate())
+          if (req.method === 'GET' && sub === '/update') {
+            const info = pluginInstallInfo()
+            return send(200, { ...(await checkUpdate()), mode: info.mode, installCommand: UPDATE_INSTALL })
+          }
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
           if (req.method === 'GET' && sub === '/sysinfo') {
             let cores = 0
@@ -2050,6 +2150,11 @@ export function apply(ctx, config = {}) {
             return send(200, await dutyTool.execute({ action }))
           }
           const body = req.method === 'POST' ? await readJson(req) : {}
+          // 升级：只在用户在确认弹窗里点了「立即升级」后才会走到这里
+          if (req.method === 'POST' && sub === '/update') {
+            const act = String(body.action || '')
+            if (act === 'apply' || act === 'pull') return send(200, await applyUpdate(act))
+          }
           if (req.method === 'POST' && sub === '/config') {
             const cfg = cfgAll()
             const key = String(body.key || '')

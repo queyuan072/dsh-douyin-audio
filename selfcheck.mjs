@@ -619,6 +619,22 @@ else {
         ok('GET /update：连不上时返回 ok:false 且不抛错（' + upFail.error.slice(0, 28) + '…）')
       } else problem('检查更新遇到网络错误没兜住：' + JSON.stringify(upFail))
       mod.__updateDeps({ fetch: null })   // 还原成真 fetch
+      // 4) GET /update 要带上「安装方式」，前端据此决定要不要给「立即升级」
+      const upInfo = await callRoute('GET', '/api/douyin-audio/update')
+      if (upInfo && (upInfo.mode === 'linked' || upInfo.mode === 'npm') && typeof upInfo.installCommand === 'string') {
+        ok('GET /update 带安装方式与升级命令（mode=' + upInfo.mode + '）')
+      } else problem('GET /update 没带安装方式：' + JSON.stringify(upInfo).slice(0, 160))
+      // 5) 源码链接安装时，插件**不能**自己覆盖源码目录
+      const upApply = await callRoute('POST', '/api/douyin-audio/update', { action: 'apply' })
+      if (upApply && typeof upApply.ok === 'boolean' && typeof upApply.message === 'string' && upApply.message) {
+        if (upApply.mode === 'linked' && upApply.ok === false && /源码/.test(upApply.message)) {
+          ok('POST /update apply：源码链接安装时拒绝自我覆盖，并说清怎么办')
+        } else if (upApply.mode === 'npm' && upApply.ok === true) {
+          ok('POST /update apply：npm 安装 → 已后台启动升级')
+        } else {
+          problem('apply 回执不符合预期：' + JSON.stringify(upApply).slice(0, 160))
+        }
+      } else problem('apply 没给可用回执：' + JSON.stringify(upApply).slice(0, 160))
     }
 
     // f. HTTP /config 写 tier*：跨站 403，同源放行（那是用户自己在设置页点开关）
