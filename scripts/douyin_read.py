@@ -1881,7 +1881,14 @@ WHOAMI_BODY = """
   };
   const body = document.body ? document.body.innerText : '';
   return {
-    nickname: pickText(['[data-e2e="user-title"]', '[data-e2e="user-info-nickname"]', 'h1']),
+    // 只认明确的昵称节点：退到标题类选择器会把登录墙上的「登录后查看更多」当成昵称
+    nickname: pickText(['[data-e2e="user-title"]', '[data-e2e="user-info-nickname"]']),
+    titleNick: (() => {
+      // 真机实测：个人页的昵称节点没有 data-e2e，但 document.title 是「<昵称>的抖音 - 抖音」。
+      // 只认这个固定句式，其余标题（登录页/推荐页）一律返回空，避免把页面标题当昵称。
+      const m = String(document.title || '').match(/^(.{1,30}?)的抖音/);
+      return m ? m[1].trim() : '';
+    })(),
     uid: pickText(['[data-e2e="user-info-uid"]', '[data-e2e="user-detail"]']),
     hasLoginEntry: !!document.querySelector('[data-e2e="login-button"], #login-button, [data-e2e="login-panel"]'),
     title: document.title || '',
@@ -1897,16 +1904,26 @@ def cmd_whoami(page, args):
     """读 /user/self 上的昵称。个人页是异步渲染的，轮询等它出现；登录墙/验证页一律报错，不猜。"""
     _goto(page, DOUYIN_SELF_URL, args, "whoami")
     data = {}
+    last_err = None
     deadline = time.time() + 20.0
     while time.time() < deadline:
         try:
             data = page.evaluate(_js(WHOAMI_BODY), {}) or {}
-        except Exception:  # 渲染途中执行脚本可能失败，重试即可
+            last_err = None
+        except Exception as exc:  # 渲染途中执行脚本可能失败，重试即可
             data = {}
+            last_err = exc
         if _clean(data.get("nickname"), 60):
             break
-        page.wait_for_timeout(800)
-    nickname = _clean(data.get("nickname"), 60)
+        with contextlib.suppress(Exception):
+            page.wait_for_timeout(800)
+    # 先判登录态，再判昵称：登录墙/验证页上的任何文字都不是昵称，不能被 nickname 非空短路
+    verify_msg = _verify_message(page)
+    if verify_msg:
+        raise StepError("whoami", verify_msg)
+    if data.get("hasLoginEntry") or _login_wall_hint(page):
+        raise StepError("whoami", "没有登录态：页面显示的是登录入口（cookie 可能已过期）")
+    nickname = _clean(data.get("nickname"), 60) or _clean(data.get("titleNick"), 60)
     # uid 那个节点的文本是一大坨（昵称+关注+粉丝+获赞+抖音号…），只取「抖音号：xxx」
     uid_raw = _clean(data.get("uid"), 200)
     uid = ""
@@ -1917,14 +1934,10 @@ def cmd_whoami(page, args):
         elif re.fullmatch(r"\d{5,20}", uid_raw):
             uid = uid_raw
     if not nickname:
-        verify_msg = _verify_message(page)
-        if verify_msg:
-            raise StepError("whoami", verify_msg)
-        if data.get("hasLoginEntry") or _login_wall_hint(page):
-            raise StepError("whoami", "没有登录态：页面显示的是登录入口（cookie 可能已过期）")
-        raise StepError("whoami", "没读到昵称（页面结构可能变了）｜诊断: url={} title={} 正文{}字 e2e={} 开头={}".format(
-            _clean(data.get("url"), 90), _clean(data.get("title"), 40), data.get("bodyLen"),
-            ",".join(data.get("e2e") or []) or "无", _clean(data.get("head"), 150)))
+        raise StepError("whoami", "没读到昵称（页面结构可能变了）｜诊断: url={} title={} 正文{}字 e2e={} 开头={} 末次evaluate={}".format(
+            _clean(data.get("url"), 90), _clean(data.get("title"), 40), data.get("bodyLen") or 0,
+            ",".join(data.get("e2e") or []) or "无", _clean(data.get("head"), 150),
+            _brief(last_err) if last_err else "无"))
     return [{"nickname": nickname, "uid": uid, "url": DOUYIN_SELF_URL}]
 
 
@@ -1983,10 +1996,11 @@ def parse_args(argv=None):
     common = _common_parser()
     ap = argparse.ArgumentParser(
         prog="douyin_read.py",
-        description="抖音只读查询工具：热榜 / 搜索 / 视频详情 / 图文详情 / 评论 / 通知摘要 / 私信会话列表"
+        description="抖音只读查询工具：当前账号 / 热榜 / 搜索 / 视频详情 / 图文详情 / 评论 / 通知摘要 / 私信会话列表"
                     "（不点赞、不关注、不评论、不发布、不发私信、不标记已读）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("示例:\n"
+                "  python douyin_read.py whoami --json\n"
                 "  python douyin_read.py hot --limit 20 --json\n"
                 "  python douyin_read.py search --keyword 关键词 --limit 20 --order totalrank --json\n"
                 "  python douyin_read.py video --url https://www.douyin.com/video/<id> --json\n"
@@ -2001,10 +2015,13 @@ def parse_args(argv=None):
                 "  --browser-executable PATH / --timeout SEC / --json\n"),
     )
     sub = ap.add_subparsers(dest="command",
-                            metavar="{hot,search,video,comments,note,notes,messages}")
+                            metavar="{whoami,hot,search,video,comments,note,notes,messages}")
     sub.required = True
 
-    sub.add_parser("whoami", parents=[common], help="看当前登录的抖音账号（昵称；只读）")
+    sub.add_parser("whoami", parents=[common],
+                   help="看当前登录的抖音账号（昵称 / 抖音号；只读）",
+                   description="读 https://www.douyin.com/user/self 上的昵称与抖音号。"
+                               "没有登录态（页面是登录入口 / 人机验证页）时直接报错，不会拿页面上的其他文字当昵称。")
 
     p_hot = sub.add_parser("hot", parents=[common], help="抖音热榜")
     p_hot.add_argument("--limit", type=int, default=20, help="取几条，默认 20，范围 1-100")

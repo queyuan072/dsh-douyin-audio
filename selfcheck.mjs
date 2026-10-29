@@ -42,7 +42,7 @@
  * 退出码：0 = 全通过；1 = 有问题（宿主里就是 "entry did not activate"）
  * 不依赖 python、不联网：apply() 只建目录 + 注册工具，探测器要等 execute 才会跑。
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -501,7 +501,7 @@ else {
   })
   /* 打路由：默认按「浏览器同源请求」发（同源门要 Sec-Fetch-Site / Origin / token 三选一），
      headers 显式给就能构造跨站 / 无 Origin / 带 token 的请求。返回 { status, body }。 */
-  const routeRaw = (method, url, body, headers) => new Promise((resolve) => {
+  const routeRawOn = (route, method, url, body, headers) => new Promise((resolve) => {
     const req = {
       method,
       url,
@@ -514,13 +514,40 @@ else {
     }
     let out = null
     const res = { statusCode: 0, setHeader() {}, end(text) { try { out = JSON.parse(text) } catch { out = text } } }
-    Promise.resolve(webRoute(req, res)).then(
+    Promise.resolve(route(req, res)).then(
       () => resolve({ status: res.statusCode, body: out }),
       (e) => resolve({ status: res.statusCode, body: { error: String((e && e.message) || e) } }),
     )
   })
+  const routeRaw = (method, url, body, headers) => routeRawOn(webRoute, method, url, body, headers)
   /* 老用法：只要 body（同源 setup_* 那几条断言照旧） */
   const callRoute = async (method, url, body) => (await routeRaw(method, url, body)).body
+  /* index.js 给检查更新加了 3 分钟缓存（updateCache）：同一个模块实例上连打 GET /update
+     只会拿到第一次的答案，后面的用例等于没测。所以每个用例重开一个模块实例
+     （空缓存 + 自己的 __updateDeps 缝），全程仍然不联网。 */
+  let freshSeq = 0
+  const freshUpdateRoute = async (fetchImpl) => {
+    freshSeq += 1
+    let m = null
+    try {
+      m = await import(pathToFileURL(entryPath).href + '?selfcheck-update=' + freshSeq)
+    } catch { return null }
+    let route = null
+    const ctx = {
+      ...fakeCtx,
+      tools: { register: (t) => t },
+      webServer: { register: (r) => { route = r && r.handler ? r.handler : null; return { dispose() {} } } },
+    }
+    try { m.apply(ctx, {}) } catch { return null }
+    if (typeof route !== 'function' || typeof m.__updateDeps !== 'function') return null
+    m.__updateDeps({ fetch: fetchImpl })
+    return route
+  }
+  const callUpdate = async (fetchImpl) => {
+    const route = await freshUpdateRoute(fetchImpl)
+    if (!route) { problem('重开模块实例失败：检查更新那几条用例没跑成'); return null }
+    return (await routeRawOn(route, 'GET', '/api/douyin-audio/update')).body
+  }
   if (typeof webRoute !== 'function') problem('没捕获到 /api/douyin-audio 路由')
   else {
     /* ── 同源门（C1）：不同源又没有 token 的请求必须先 403，且**动作不执行** ── */
@@ -547,6 +574,17 @@ else {
     const siteCrossCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, { host: HOST, 'sec-fetch-site': 'same-site' })
     if (siteCrossCfg.status === 403) ok('GET /config 带 sec-fetch-site: same-site（同域不同端口）→ 403')
     else problem('same-site 被放过了：' + JSON.stringify(siteCrossCfg))
+
+    // b2. 后加的只读端点也必须过同一道门（门在前、处理函数在后：403 就一个字节都读不到）
+    //     先扎住 fetch：万一 /update 的门漏了，也只会拿到桩，不会真联网
+    if (typeof mod.__updateDeps === 'function') {
+      mod.__updateDeps({ fetch: async () => { throw new Error('selfcheck：跨站门后面的 /update 不该真联网') } })
+    }
+    for (const sub of ['/diag', '/account', '/update']) {
+      const cross = await routeRaw('GET', '/api/douyin-audio' + sub, undefined, evilSiteH)
+      if (cross.status === 403) ok('GET ' + sub + ' 跨站（Origin + sec-fetch-site: cross-site）→ 403')
+      else problem('跨站还能读 ' + sub + '（' + cross.status + '）：' + JSON.stringify(cross.body).slice(0, 120))
+    }
 
     // c. token 端点本身也过同源门；同源才发 token
     const crossToken = await routeRaw('GET', '/api/douyin-audio/token', undefined, { host: HOST, origin: 'https://evil.example' })
@@ -581,49 +619,79 @@ else {
       problem('index.js 没导出 __updateDeps 测试缝（检查更新会真联网）')
     } else {
       const fakeRes = (obj) => ({ ok: true, status: 200, json: async () => obj })
+      /* 桩必须记下 (url, opts)：只看返回体等于放过了「打错地址 / 少带头」这类错 */
+      const fetchCalls = []
+      const fakeFetch = (impl) => async (url, opts) => {
+        fetchCalls.push({ url: String(url), opts: opts || {} })
+        return impl(url, opts)
+      }
+      const acceptOf = (c) => {
+        const h = (c && c.opts && c.opts.headers) || {}
+        for (const k of Object.keys(h)) if (k.toLowerCase() === 'accept') return String(h[k])
+        return ''
+      }
       // 1) registry 有新版本 → hasUpdate true
-      mod.__updateDeps({ fetch: async () => fakeRes({ version: '99.99.99' }) })
-      const upNew = await callRoute('GET', '/api/douyin-audio/update')
+      fetchCalls.length = 0
+      const upNew = await callUpdate(fakeFetch(async () => fakeRes({ version: '99.99.99' })))
       if (upNew && upNew.ok === true && upNew.latest === '99.99.99' && upNew.hasUpdate === true && /^\d+\.\d+\.\d+/.test(String(upNew.current))) {
         ok('GET /update：远端更新时 hasUpdate=true（current=' + upNew.current + ' → latest=' + upNew.latest + '）')
       } else problem('检查更新判断有误：' + JSON.stringify(upNew))
+      // 1.1) 两个仓库源都问了、地址对、请求头对（把「错地址 / 少 accept」按死）
+      const upCall1 = fetchCalls[0]
+      const upCall2 = fetchCalls[1]
+      if (upCall1 && /^https:\/\/api\.gitcode\.com\/api\/v5\/repos\/[^/]+\/[^/]+\/contents\/package\.json\?ref=main$/.test(upCall1.url)) {
+        ok('假 fetch 第 1 个请求 = GitCode contents：' + upCall1.url)
+      } else problem('第 1 个请求地址不对（应含 api.gitcode.com/…/contents/package.json?ref=main）：' + JSON.stringify(upCall1 && upCall1.url))
+      if (upCall2 && /^https:\/\/api\.github\.com\/repos\/[^/]+\/[^/]+\/contents\/package\.json\?ref=main$/.test(upCall2.url)) {
+        ok('假 fetch 第 2 个请求 = GitHub contents：' + upCall2.url)
+      } else problem('第 2 个请求地址不对（应含 api.github.com）：' + JSON.stringify(upCall2 && upCall2.url))
+      if (upCall1 && acceptOf(upCall1) === 'application/json') ok('假 fetch 收到了 accept: application/json（GitHub 不带头会 415）')
+      else problem('请求没带 accept: application/json：' + JSON.stringify(upCall1 && upCall1.opts.headers))
       // 2) registry 版本旧于本地 → hasUpdate false
-      mod.__updateDeps({ fetch: async () => fakeRes({ version: '0.0.1' }) })
-      const upOld = await callRoute('GET', '/api/douyin-audio/update')
+      const upOld = await callUpdate(async () => fakeRes({ version: '0.0.1' }))
       if (upOld && upOld.ok === true && upOld.hasUpdate === false) ok('GET /update：远端更旧时 hasUpdate=false')
       else problem('更旧也报有更新：' + JSON.stringify(upOld))
       // 2.5) GitHub 走 contents（base64）→ 也要能解析出真实版本号
       const b64 = Buffer.from(JSON.stringify({ name: 'dsh-douyin-audio', version: '88.88.88' }), 'utf8').toString('base64')
-      mod.__updateDeps({ fetch: async () => fakeRes({ type: 'file', encoding: 'base64', content: b64 }) })
-      const upB64 = await callRoute('GET', '/api/douyin-audio/update')
+      const upB64 = await callUpdate(async () => fakeRes({ type: 'file', encoding: 'base64', content: b64 }))
       if (upB64 && upB64.ok === true && upB64.latest === '88.88.88') ok('GET /update：contents 的 base64 内容能解出版本（88.88.88）')
       else problem('base64 内容解不出：' + JSON.stringify(upB64))
       // 2.6) 第一个源挂掉 → 自动落到第二个源
       let call = 0
-      mod.__updateDeps({ fetch: async () => { call += 1; if (call === 1) throw new Error('ECONNRESET'); return fakeRes({ version: '77.77.77' }) } })
-      const upFallback = await callRoute('GET', '/api/douyin-audio/update')
-      if (upFallback && upFallback.ok === true && upFallback.latest === '77.77.77' && upFallback.source && upFallback.source !== 'AtomGit') {
-        ok('GET /update：首个源失败会自动换源（落到 ' + upFallback.source + '）')
-      } else problem('换源没生效：' + JSON.stringify(upFallback))
+      const upFallback = await callUpdate(async () => { call += 1; if (call === 1) throw new Error('ECONNRESET'); return fakeRes({ version: '77.77.77' }) })
+      if (upFallback && upFallback.ok === true && upFallback.latest === '77.77.77' && upFallback.source === 'GitHub') {
+        ok('GET /update：首个源失败会自动换源（落到 GitHub）')
+      } else problem('换源没生效（应落到 GitHub）：' + JSON.stringify(upFallback))
       // 2.7) 镜像落后（真实踩过：AtomGit 停在 1.2.0、GitHub 已 1.2.3）→ 必须取更高的那个
       let call2 = 0
-      mod.__updateDeps({ fetch: async () => { call2 += 1; return fakeRes({ version: call2 === 1 ? '1.0.0' : '2.0.0' }) } })
-      const upStale = await callRoute('GET', '/api/douyin-audio/update')
+      const upStale = await callUpdate(async () => { call2 += 1; return fakeRes({ version: call2 === 1 ? '1.0.0' : '2.0.0' }) })
       if (upStale && upStale.ok === true && upStale.latest === '2.0.0' && upStale.source === 'GitHub') {
         ok('镜像落后时取更高版本（AtomGit 1.0.0 / GitHub 2.0.0 → 2.0.0，来源 GitHub）')
       } else problem('落后镜像导致误判：' + JSON.stringify(upStale))
       // 3) 网络炸了 → 不抛错，返回 ok:false + 人话
-      mod.__updateDeps({ fetch: async () => { throw new Error('getaddrinfo ENOTFOUND') } })
-      const upFail = await callRoute('GET', '/api/douyin-audio/update')
+      const upFail = await callUpdate(async () => { throw new Error('getaddrinfo ENOTFOUND') })
       if (upFail && upFail.ok === false && typeof upFail.error === 'string' && upFail.error.length > 4) {
         ok('GET /update：连不上时返回 ok:false 且不抛错（' + upFail.error.slice(0, 28) + '…）')
       } else problem('检查更新遇到网络错误没兜住：' + JSON.stringify(upFail))
-      mod.__updateDeps({ fetch: null })   // 还原成真 fetch
+      // 真 fetch 的还原挪到整块末尾：这里一还原，后面的 GET /update 就会真联网
       // 3.5) GET /account：账号缓存形状（没缓存时 known=false，绝不抛错）
       const acctRes = await callRoute('GET', '/api/douyin-audio/account')
       if (acctRes && acctRes.ok === true && typeof acctRes.known === 'boolean' && typeof acctRes.nick === 'string') {
         ok('GET /account：账号缓存可读（known=' + acctRes.known + (acctRes.known ? '，昵称=' + acctRes.nick : '') + '）')
       } else problem('GET /account 形状不对：' + JSON.stringify(acctRes).slice(0, 140))
+      // 3.5-bis) 有缓存时 known=true：往**沙箱** stateDir 写一份 account.json 再看（绝不写用户真目录）
+      if (acctRes && acctRes.known === false) ok('GET /account：没有 account.json 时 known=false（未识别）')
+      else problem('没有 account.json 时 known 应为 false：' + JSON.stringify(acctRes).slice(0, 120))
+      const acctFile = join(SANDBOX_HOME, 'douyin-duty', 'account.json')
+      try {
+        writeFileSync(acctFile, JSON.stringify({ nick: '测试号', uid: 'abc', at: 1700000000000 }), 'utf8')
+      } catch (e) { die('写沙箱 account.json 失败', e) }
+      const acctCached = await callRoute('GET', '/api/douyin-audio/account')
+      if (acctCached && acctCached.ok === true && acctCached.known === true
+        && acctCached.nick === '测试号' && acctCached.uid === 'abc') {
+        ok('GET /account：写了 account.json 后 known=true，昵称=' + acctCached.nick + ' / uid=' + acctCached.uid)
+      } else problem('有 account.json 也认不出账号：' + JSON.stringify(acctCached).slice(0, 140))
+      try { rmSync(acctFile, { force: true }) } catch { /* 删不掉也不影响 */ }
       // 3.6) douyin_status 要带 account 字段（顶栏与登录模块都靠它）
       const stAcct = await callRoute('POST', '/api/douyin-audio/run', { action: 'status' })
       if (stAcct && stAcct.account && typeof stAcct.account.known === 'boolean') {
@@ -637,22 +705,71 @@ else {
         && diagRes.bytes > 200 && typeof diagRes.path === 'string' && /diag-.*\.txt$/.test(diagRes.path)) {
         ok('GET /diag：诊断报告生成并落盘（' + diagRes.bytes + ' 字节 → ' + String(diagRes.path).split(/[\\/]/).pop() + '）')
       } else problem('诊断报告不对：' + JSON.stringify({ ok: diagRes && diagRes.ok, bytes: diagRes && diagRes.bytes, path: diagRes && diagRes.path }).slice(0, 200))
+      // 3.7-bis) 落盘要**真去读那个文件**：只校验返回字符串的话，写没写成/写哪儿都看不出来
+      const diagPath = diagRes && typeof diagRes.path === 'string' ? diagRes.path : ''
+      if (diagPath && existsSync(diagPath)) ok('GET /diag：返回的 path 上真的有文件（' + String(diagPath).split(/[\\/]/).pop() + '）')
+      else problem('GET /diag 返回的 path 上没文件：' + JSON.stringify(diagPath))
+      if (diagPath && diagPath.startsWith(SANDBOX_HOME)) ok('诊断报告落在沙箱 stateDir 里（没碰用户真目录）')
+      else problem('诊断报告没落在沙箱 stateDir：' + JSON.stringify(diagPath))
+      let diagDisk = ''
+      try { diagDisk = String(readFileSync(diagPath, 'utf8')) } catch { diagDisk = '' }
+      if (diagDisk.indexOf('douyin-audio 诊断报告') >= 0) ok('磁盘上的诊断报告含标题「douyin-audio 诊断报告」（' + diagDisk.length + ' 字符）')
+      else problem('磁盘上的诊断报告内容不对（读不到或缺标题）：' + JSON.stringify(diagDisk.slice(0, 80)))
       // 4) GET /update 要带上「安装方式」，前端据此决定要不要给「立即升级」
-      const upInfo = await callRoute('GET', '/api/douyin-audio/update')
+      const upInfo = await callUpdate(async () => fakeRes({ version: '0.0.1' }))
       if (upInfo && (upInfo.mode === 'linked' || upInfo.mode === 'npm') && typeof upInfo.installCommand === 'string') {
         ok('GET /update 带安装方式与升级命令（mode=' + upInfo.mode + '）')
       } else problem('GET /update 没带安装方式：' + JSON.stringify(upInfo).slice(0, 160))
-      // 5) 源码链接安装时，插件**不能**自己覆盖源码目录
-      const upApply = await callRoute('POST', '/api/douyin-audio/update', { action: 'apply' })
-      if (upApply && typeof upApply.ok === 'boolean' && typeof upApply.message === 'string' && upApply.message) {
-        if (upApply.mode === 'linked' && upApply.ok === false && /源码/.test(upApply.message)) {
-          ok('POST /update apply：源码链接安装时拒绝自我覆盖，并说清怎么办')
-        } else if (upApply.mode === 'npm' && upApply.ok === true) {
-          ok('POST /update apply：npm 安装 → 已后台启动升级')
-        } else {
-          problem('apply 回执不符合预期：' + JSON.stringify(upApply).slice(0, 160))
+      /* 5) 升级动作本身：npm 安装方式下它会**真的** spawn npm install（改用户装好的那份），
+         所以先经 __updateDeps 注一个 spawn 桩；缝不在就只报问题、**绝不真跑**。
+         这里是整个「检查更新」块的唯一出口：还原真依赖也放在这儿（提前还原后面就会真联网）。 */
+      const spawnedUpdate = []
+      const stubUpdateSpawn = (cmd, argv, opts) => {
+        spawnedUpdate.push({ cmd: String(cmd), argv: Array.isArray(argv) ? argv.slice() : [], opts: opts || {} })
+        const handlers = {}
+        const child = {
+          stdout: { on() { return this } },
+          stderr: { on() { return this } },
+          on(ev, fn) { handlers[ev] = fn; return this },
+          kill() {}, unref() {},
         }
-      } else problem('apply 没给可用回执：' + JSON.stringify(upApply).slice(0, 160))
+        // applyUpdate 现在是前台等 npm 退出码：不喂 close 事件就会一直挂着（最多挂到 240s 超时）
+        setImmediate(() => { if (typeof handlers.close === 'function') handlers.close(0) })
+        return child
+      }
+      const seamRes = typeof mod.__updateDeps === 'function' ? mod.__updateDeps({ spawn: stubUpdateSpawn }) : null
+      /* 缝必须在**事前**证明生效（返回值里有 spawn 的桩状态）：只有确认桩接管了，才敢调 apply。
+         证明不了就跳过 —— 宁可报一条 ✗，也不能真去装。 */
+      const spawnSeamOn = !!seamRes && typeof seamRes === 'object'
+        && Object.keys(seamRes).some((k) => /spawn/i.test(k) && seamRes[k] === true)
+      if (!spawnSeamOn) {
+        problem('index.js 的 __updateDeps 没收 spawn 桩（POST /update apply 在 npm 安装下会真装包），这里跳过不跑：' + JSON.stringify(seamRes))
+      } else {
+        ok('POST /update 的 spawn 测试缝已生效（桩接管子进程，绝不真装 npm 包）')
+        const upApply = await callRoute('POST', '/api/douyin-audio/update', { action: 'apply' })
+        if (upApply && typeof upApply.ok === 'boolean' && typeof upApply.message === 'string' && upApply.message) {
+          if (upApply.mode === 'linked') {
+            // 源码链接安装：绝不覆盖源码目录，且一个子进程都不许派生
+            if (upApply.ok === false && /源码/.test(upApply.message) && spawnedUpdate.length === 0) {
+              ok('POST /update apply：源码链接安装时拒绝自我覆盖，并说清怎么办（零子进程）')
+            } else problem('linked 下的 apply 不对：' + JSON.stringify(upApply).slice(0, 160))
+          } else if (upApply.mode === 'npm') {
+            // npm 安装：桩必须把这个 spawn 接管掉 —— 否则就是真装了
+            const upArgv = spawnedUpdate.length ? spawnedUpdate[0].argv : []
+            const upCmd = spawnedUpdate.length ? spawnedUpdate[0].cmd : ''
+            // 两种回执形状都认：started:true（后台派生）或 code:0（前台等退出码）
+            const applySettled = upApply.ok === true && (upApply.started === true || upApply.code === 0)
+            if (applySettled && spawnedUpdate.length === 1 && /npm/i.test(upCmd)
+              && upArgv.includes('install') && upArgv.includes('dsh-douyin-audio@latest')
+              && upArgv.includes('--no-audit') && upArgv.includes('--no-fund')) {
+              ok('POST /update apply：npm 安装 → spawn 桩接管（' + upCmd + ' ' + JSON.stringify(upArgv) + '），没真跑 npm')
+            } else problem('npm 安装的 apply 没被 spawn 桩截住 / argv 不对：' + JSON.stringify({ upApply, spawned: spawnedUpdate.map((s) => s.cmd + ' ' + s.argv.join(' ')) }).slice(0, 220))
+          } else {
+            problem('apply 回执不符合预期：' + JSON.stringify(upApply).slice(0, 160))
+          }
+        } else problem('apply 没给可用回执：' + JSON.stringify(upApply).slice(0, 160))
+        mod.__updateDeps({ fetch: null, spawn: null })   // 整块收尾才还原真 fetch / 真 spawn
+      }
     }
 
     // f. HTTP /config 写 tier*：跨站 403，同源放行（那是用户自己在设置页点开关）

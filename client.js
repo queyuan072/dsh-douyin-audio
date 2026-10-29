@@ -341,7 +341,9 @@ window.__ModuleLoader__.load({
       const [acctBusy, setAcctBusy] = React.useState(false)
       const [updAsk, setUpdAsk] = React.useState(false)          // 升级确认弹窗开着没
       const [updApply, setUpdApply] = React.useState(null)       // 点「立即升级」后的宿主回执
-      const [updBusy, setUpdBusy] = React.useState(false)
+      const [updBusy, setUpdBusy] = React.useState(false)       // 检查更新
+      const [diagBusy, setDiagBusy] = React.useState(false)      // 生成错误日志（与升级互不阻塞）
+      const [applyBusy, setApplyBusy] = React.useState(false)    // 执行升级
 
       const say = (text, tone) => { setMsg(text); setMsgTone(tone || '') }
 
@@ -362,13 +364,21 @@ window.__ModuleLoader__.load({
       }
 
       /* 识别账号：跑一次 whoami（读个人页昵称，约 10-15 秒）。silent=true 时只在顶栏更新，不刷提示 */
+      /* 静默识别节流：失败/成功后 1 小时内不再自动重试（否则每开一次设置页就起一个 Chromium） */
+      const WHOAMI_COOLDOWN_MS = 60 * 60 * 1000
+      const whoamiLastAuto = React.useRef(0)
+
       const doWhoami = async (silent) => {
         if (acctBusy) return
+        if (silent && Date.now() - (whoamiLastAuto.current || 0) < WHOAMI_COOLDOWN_MS) return
+        // 与用户的「刷一轮 / 转写」互斥：两个 Chromium 抢同一份 cookie
+        if (busy) { if (!silent) say('正在跑别的任务，等它结束再识别账号', 'warn'); return }
+        if (silent) whoamiLastAuto.current = Date.now()
         setAcctBusy(true)
         try {
           const r = await jpost('/run', { action: 'whoami' })
           if (r && r.ok && r.nick) {
-            setAcct({ known: true, nick: r.nick, uid: r.uid || '' })
+            setAcct({ known: true, nick: r.nick, uid: r.uid || '', at: r.at || null })
             if (!silent) say('已识别账号：' + r.nick + (r.uid ? '（抖音号 ' + r.uid + '）' : ''), 'good')
           } else {
             setAcct({ known: false, nick: '', uid: '', error: (r && (r.error || r.reason)) || '没读到账号' })
@@ -384,7 +394,8 @@ window.__ModuleLoader__.load({
 
       /* 用户点「立即升级」：宿主侧判断安装方式，npm 版才真跑 npm install */
       const doApplyUpdate = async (action) => {
-        setUpdBusy(true)
+        if (applyBusy) return
+        setApplyBusy(true)
         try {
           const r = await jpost('/update', { action: action || 'apply' })
           setUpdApply(r && typeof r === 'object' ? r : { ok: false, message: '宿主没回执' })
@@ -393,7 +404,7 @@ window.__ModuleLoader__.load({
           setUpdApply({ ok: false, message: errText(e) })
           say('升级请求失败：' + errText(e), 'warn')
         } finally {
-          setUpdBusy(false)
+          setApplyBusy(false)
         }
       }
 
@@ -402,12 +413,13 @@ window.__ModuleLoader__.load({
         if (updBusy) return
         setUpdBusy(true)
         try {
-          const r = await jget('/update')
+          // 手动点（silent=false）强制刷新，绕过宿主的 3 分钟缓存
+          const r = await jget('/update' + (silent ? '' : '?force=1'))
           const res = r && typeof r === 'object' ? r : { ok: false, error: '宿主没回检查结果' }
           setUpd(res)
           if (silent) return
           const from = res.source ? '（来自 ' + res.source + '）' : ''
-          if (res.ok && res.hasUpdate) say('有新版本 v' + res.latest + '（当前 v' + res.current + '）' + from + ' —— 点徽章复制升级命令', 'warn')
+          if (res.ok && res.hasUpdate) say('有新版本 v' + res.latest + '（当前 v' + res.current + '）' + from + ' —— 点徽章打开升级确认窗', 'warn')
           else if (res.ok) say('已是最新：v' + res.current + from, 'good')
           else say('检查更新失败：' + (res.error || '原因不详'), 'warn')
         } catch (e) {
@@ -456,8 +468,9 @@ window.__ModuleLoader__.load({
         jget('/account')
           .then((r) => {
             if (!live) return
-            if (r && r.known && r.nick) setAcct({ known: true, nick: r.nick, uid: r.uid || '' })
+            if (r && r.known && r.nick) setAcct({ known: true, nick: r.nick, uid: r.uid || '', at: r.at || null })
             else if (st && st.cookie && st.cookie.exists) doWhoami(true)
+            else if (st && st.cookie && !st.cookie.exists) setAcct(null)   // cookie 没了就别再显示旧昵称
           })
           .catch(() => { /* 读不到就让用户手动点 */ })
         return () => { live = false }
@@ -896,6 +909,7 @@ window.__ModuleLoader__.load({
       const focusEnv = () => jumpTo(envRef, 'diag')
 
       const run = async (action, extra, what) => {
+        if (acctBusy) { say('正在识别账号，稍等几秒再跑', 'warn'); return }
         setBusy(action)
         try {
           const r = await jpost('/run', { action, ...(extra || {}) })
@@ -948,6 +962,30 @@ window.__ModuleLoader__.load({
 
       /* 读不到配置时的兜底页：留一个【检查更新】——
          装上坏版本（比如 1.2.2 的 403）时，用户正需要知道「新版能修我这个问题」 */
+      /* 出错了吗：有警告提示 / 读配置失败 / 上一次结果里 ok:false —— 满足任一就露出「生成错误日志」 */
+      const hasError = msgTone === 'warn' || fails > 0
+        || (typeof out === 'string' && /"ok"\s*:\s*false/.test(out))
+        || (updApply && updApply.ok === false)
+
+      /* 生成错误日志：宿主拼一份报告（环境/配置/各日志尾部）落盘，同时复制到剪贴板 */
+      const doDiag = async () => {
+        if (diagBusy) return
+        setDiagBusy(true)
+        try {
+          const r = await jget('/diag')
+          if (r && r.ok && typeof r.text === 'string') {
+            const ok = await copyText(r.text)
+            say((ok ? '诊断报告已复制到剪贴板' : '复制失败，报告已存到磁盘') + '，文件：' + (r.path || '(未保存)'), 'good')
+          } else {
+            say('生成诊断失败：' + ((r && r.error) || '宿主没回报告'), 'warn')
+          }
+        } catch (e) {
+          say('生成诊断失败：' + errText(e), 'warn')
+        } finally {
+          setDiagBusy(false)
+        }
+      }
+
       if (!cfg) {
         return h('div', { 'data-dy-page': '' },
           h('div', { 'data-dy-sec': '' },
@@ -960,9 +998,14 @@ window.__ModuleLoader__.load({
               h('button', { 'data-dy-btn': '', onClick: reload }, '重试'),
               h('button', {
                 'data-dy-btn': '', 'data-primary': '', disabled: updBusy,
-                title: '问 npm registry 有没有新版本（8 秒超时）',
+                title: '问国内仓库与 npm 有没有新版本（单源 10 秒）',
                 onClick: () => checkUpd(false),
-              }, updBusy ? '查询中…' : '检查更新')) : null,
+              }, updBusy ? '查询中…' : '检查更新'),
+              h('button', {
+                'data-dy-btn': '', disabled: diagBusy,
+                title: '配置读不到正是最需要报告的时候：生成一份诊断日志（版本/目录/各日志尾部）',
+                onClick: doDiag,
+              }, diagBusy ? '生成中…' : '生成错误日志')) : null,
             upd
               ? h('div', { 'data-dy-note': '', 'data-dy-selected': upd.ok && upd.hasUpdate ? '' : undefined },
                 upd.ok
@@ -1188,10 +1231,25 @@ window.__ModuleLoader__.load({
           h('div', { 'data-dy-row': '' },
             h('div', { 'data-dy-label': '', 'data-dy-grow': '' }, 'ffmpeg'),
             h('div', { 'data-dy-note': '', 'data-dy-ffmpeg': '' }, ffmpegText)),
-          h('div', { 'data-dy-note': '' }, '这两项都是点顶栏「环境」徽章（= 自检）时一起取回来的，本页只读')),
+          h('div', { 'data-dy-note': '' }, '这两项都是跑【自检】时一起取回来的（点顶栏「环境」徽章会跳到这里），本页只读')),
       ]
 
       /* ── 3 权限与登录：五个等级开关 + 等级说明 + 登录方式与登录区块 ── */
+      /* 当前账号行：旧版平铺与新版标签页共用（徽章点进来就该看到是谁登录的） */
+      const accountRow = () => h('div', { 'data-dy-acct': '', 'data-known': acct && acct.known ? '' : undefined },
+        h('span', { 'data-dy-acct-label': '' }, '当前账号：'),
+        acct && acct.known
+          ? h('span', { 'data-dy-acct-nick': '' }, acct.nick + (acct.uid ? '（抖音号 ' + acct.uid + '）' : ''))
+          : h('span', { 'data-dy-acct-nick': '' },
+            acctBusy ? '识别中…' : (st && st.cookie && st.cookie.exists ? '还没识别' : '未登录')),
+        h('button', {
+          'data-dy-btn': '', 'data-dy-acct-btn': '', disabled: acctBusy || !(st && st.cookie && st.cookie.exists),
+          title: '打开抖音个人页读昵称（约 10-15 秒；只读，不发任何内容）',
+          onClick: () => doWhoami(false),
+        }, acctBusy ? '识别中…' : (acct && acct.known ? '重新识别' : '识别账号')),
+        acct && acct.known && acct.at
+          ? h('span', { 'data-dy-acct-at': '' }, '识别于 ' + String(acct.at).slice(0, 16).replace('T', ' '))
+          : null)
       const pagePerms = () => [
         h('div', { 'data-dy-sec': '', key: 'perms-tiers' },
           h('div', { 'data-dy-h': '' }, '能力等级'),
@@ -1214,21 +1272,7 @@ window.__ModuleLoader__.load({
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
         h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),
-          /* 当前账号：whoami 读到的昵称（缓存里也有一份，界面上直接显示） */
-          h('div', { 'data-dy-acct': '', 'data-known': acct && acct.known ? '' : undefined },
-            h('span', { 'data-dy-acct-label': '' }, '当前账号：'),
-            acct && acct.known
-              ? h('span', { 'data-dy-acct-nick': '' }, acct.nick + (acct.uid ? '（抖音号 ' + acct.uid + '）' : ''))
-              : h('span', { 'data-dy-acct-nick': '' },
-                acctBusy ? '识别中…' : (st && st.cookie && st.cookie.exists ? '还没识别' : '未登录')),
-            h('button', {
-              'data-dy-btn': '', 'data-dy-acct-btn': '', disabled: acctBusy || !(st && st.cookie && st.cookie.exists),
-              title: '打开抖音个人页读昵称（约 10-15 秒；只读，不发任何内容）',
-              onClick: () => doWhoami(false),
-            }, acctBusy ? '识别中…' : (acct && acct.known ? '重新识别' : '识别账号')),
-            acct && acct.known && acct.at
-              ? h('span', { 'data-dy-acct-at': '' }, '识别于 ' + String(acct.at).slice(0, 16).replace('T', ' '))
-              : null),
+          accountRow(),
           h('div', { 'data-dy-row': '' },
             h('button', {
               'data-dy-btn': '', 'data-dy-loginmode': 'window',
@@ -1572,7 +1616,7 @@ window.__ModuleLoader__.load({
           h('div', { 'data-dy-row': '' },
             h('button', { 'data-dy-btn': '', disabled: busy === 'status', onClick: () => run('status', {}, '自检') }, '自检'),
             h('button', { 'data-dy-btn': '', 'data-primary': '', disabled: busy === 'scroll', onClick: () => run('scroll', { count: 1 }, '刷 1 屏') }, '刷 1 屏'),
-            h('div', { 'data-dy-note': '' }, busy ? '跑着呢…' : '自检 = 查环境（顶上「环境」徽章点一下也是它）；刷 1 屏 = 下滑一屏并下载'))),
+            h('div', { 'data-dy-note': '' }, busy ? '跑着呢…' : '自检 = 查环境（也可以点顶上「环境」徽章跳到这里）；刷 1 屏 = 下滑一屏并下载'))),
         h('div', { 'data-dy-sec': '', key: 'diag-out' },
           h('div', { 'data-dy-h': '' }, '结果'),
           out === null
@@ -1595,29 +1639,6 @@ window.__ModuleLoader__.load({
         /* 宿主还没把 uiLayout 放进白名单时，回来的 config 里没这个键 —— 再压一次，
            免得点了「新版」当场弹回旧版（有没有真存进去，msg 里会说） */
         setCfg((c) => (c ? { ...c, uiLayout: v } : c))
-      }
-
-      /* 出错了吗：有警告提示 / 读配置失败 / 上一次结果里 ok:false —— 满足任一就顶部露出「生成错误日志」 */
-      const hasError = msgTone === 'warn' || fails > 0
-        || (typeof out === 'string' && /"ok"\s*:\s*false/.test(out))
-        || (updApply && updApply.ok === false)
-
-      /* 生成错误日志：宿主拼一份报告（环境/配置/各日志尾部）落盘，同时复制到剪贴板 */
-      const doDiag = async () => {
-        setUpdBusy(true)
-        try {
-          const r = await jget('/diag')
-          if (r && r.ok && typeof r.text === 'string') {
-            const ok = await copyText(r.text)
-            say((ok ? '诊断报告已复制到剪贴板' : '复制失败，报告已存到磁盘') + '，文件：' + (r.path || '(未保存)'), 'good')
-          } else {
-            say('生成诊断失败：' + ((r && r.error) || '宿主没回报告'), 'warn')
-          }
-        } catch (e) {
-          say('生成诊断失败：' + errText(e), 'warn')
-        } finally {
-          setUpdBusy(false)
-        }
       }
 
       /* ── 第一层：顶栏（两版共用）：四枚徽章 + 旧版/新版 + 刷一轮 ── */
@@ -1646,10 +1667,10 @@ window.__ModuleLoader__.load({
         h('div', { 'data-dy-layout': '' },
           hasError
             ? h('button', {
-              'data-dy-btn': '', 'data-dy-diag': '', disabled: updBusy,
+              'data-dy-btn': '', 'data-dy-diag': '', disabled: diagBusy,
               title: '把版本、配置、环境探针与各日志尾部拼成一份报告：复制到剪贴板并存到状态目录',
               onClick: doDiag,
-            }, '生成错误日志')
+            }, diagBusy ? '生成中…' : '生成错误日志')
             : null,
           h('button', {
             'data-dy-btn': '', disabled: updBusy,
@@ -1692,12 +1713,12 @@ window.__ModuleLoader__.load({
             h('div', { 'data-dy-row': '' },
               upd.ok && upd.hasUpdate
                 ? h('button', {
-                  'data-dy-btn': '', 'data-primary': '', disabled: updBusy,
+                  'data-dy-btn': '', 'data-primary': '', disabled: applyBusy,
                   title: upd.mode === 'linked'
                     ? '在源码目录执行 git pull --ff-only，不覆盖本地改动；更新后需重启 DSH'
                     : '在插件目录执行 npm install dsh-douyin-audio@latest，装完需重启 DSH',
                   onClick: () => doApplyUpdate(upd.mode === 'linked' ? 'pull' : 'apply'),
-                }, updBusy ? '请求中…' : (upd.mode === 'linked' ? '拉取最新源码' : '立即升级'))
+                }, applyBusy ? '请求中…' : (upd.mode === 'linked' ? '拉取最新源码' : '立即升级'))
                 : null,
               h('button', {
                 'data-dy-btn': '',
@@ -1844,6 +1865,7 @@ window.__ModuleLoader__.load({
         /* ── 登录 ── */
         h('div', { 'data-dy-sec': '', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),
+          accountRow(),
           h('div', { 'data-dy-row': '' },
             h('button', {
               'data-dy-btn': '', 'data-primary': loginModeCfg === 'window' ? '' : undefined,

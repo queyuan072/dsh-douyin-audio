@@ -12,7 +12,7 @@
  */
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { arch, cpus, platform, tmpdir, totalmem } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -571,6 +571,18 @@ function hostOf(value) {
   try { return new URL(s.includes('://') ? s : 'http://' + s).host.toLowerCase() } catch { return '' }
 }
 
+/* Host 白名单：只接受本机回环地址。
+   DNS rebinding 攻击下 Host 会是攻击者域名（origin 与 host 相等也能过同源判定），
+   所以必须单独限制 Host —— 门后现在是「在 profile 里 npm install」，不能只靠 Origin 比对。 */
+const HOST_ALLOW = ['127.0.0.1', 'localhost', '[::1]', '::1', '::ffff:127.0.0.1']
+
+function hostIsLocal(hostHeader) {
+  const h = String(hostHeader || '').trim().toLowerCase()
+  if (!h) return false
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0]
+  return HOST_ALLOW.indexOf(name) >= 0
+}
+
 /** 同源判定：{ ok, via } —— via 只进日志/返回体，方便排查「为什么被拦」
  *  规则是「**只按正面证据拒绝**」，不是「没有证据就拒绝」：
  *   - 浏览器发出的跨站请求一定会带 Origin / Sec-Fetch-Site，据此拦截；
@@ -578,6 +590,9 @@ function hostOf(value) {
  *     否则设置页会 403（实测过）。本机进程同样能伪造这两个头，但那已经超出
  *     本路由的威胁模型：本机进程本来就能直接改 config.json。 */
 function sameOrigin(req, queryToken) {
+  if (!hostIsLocal(headerOf(req, 'host'))) {
+    return { ok: false, via: null, reason: 'host', host: headerOf(req, 'host') || null }
+  }
   if (authTokenValid(headerOf(req, AUTH_TOKEN_HEADER)) || authTokenValid(queryToken)) return { ok: true, via: 'token' }
   const site = headerOf(req, 'sec-fetch-site').trim().toLowerCase()
   const origin = hostOf(headerOf(req, 'origin'))
@@ -672,12 +687,15 @@ const UPDATE_SOURCES = [
   // 仓库源全都答不上来时才问 npm（境外、常超时，只当兜底）
   { name: 'npm', kind: 'registry', url: 'https://registry.npmjs.org/dsh-douyin-audio/latest' },
 ]
-const __UPDATE_REAL = { fetch: (u, o) => fetch(u, o) }
+const __UPDATE_REAL = { fetch: (u, o) => fetch(u, o), spawn: (...a) => spawn(...a) }
 const updateDeps = { ...__UPDATE_REAL }
 
+/** 测试缝：selfcheck 用它注入假 fetch / 假 spawn，避免测试真的联网、真的装包 */
 export function __updateDeps(next) {
-  if (next && Object.prototype.hasOwnProperty.call(next, 'fetch')) updateDeps.fetch = next.fetch || __UPDATE_REAL.fetch
-  return { stubbed: updateDeps.fetch !== __UPDATE_REAL.fetch }
+  for (const k of ['fetch', 'spawn']) {
+    if (next && Object.prototype.hasOwnProperty.call(next, k)) updateDeps[k] = next[k] || __UPDATE_REAL[k]
+  }
+  return { stubbedFetch: updateDeps.fetch !== __UPDATE_REAL.fetch, stubbedSpawn: updateDeps.spawn !== __UPDATE_REAL.spawn }
 }
 
 /** 比较两个 semver（只认 x.y.z 的数字段，预发布后缀忽略）：a>b 返回正数 */
@@ -693,8 +711,15 @@ function compareVer(a, b) {
 }
 
 /** 检查更新：{ ok, current, latest?, hasUpdate?, error? } —— 永不抛错 */
-async function checkUpdate() {
+const UPDATE_CACHE_MS = 3 * 60 * 1000
+let updateCache = null   // { at, data } —— 3 分钟内重复点不再打远端（GitHub 匿名额度 60 次/小时）
+
+async function checkUpdate(force) {
   const current = pluginVersion()
+  if (!force && updateCache && Date.now() - updateCache.at < UPDATE_CACHE_MS && updateCache.data
+    && updateCache.data.current === current) {
+    return { ...updateCache.data, cached: true }
+  }
   const tried = []
   /* 分源查询：双端仓库优先（raw/API 更快也更稳），npm registry 兜底。
      GitHub 走 API 的 contents（返回 base64）；GitCode 有同形的 v5 接口；npm 直接给 version。 */
@@ -723,8 +748,17 @@ async function checkUpdate() {
       continue
     }
     let body = null
-    try { body = await res.json() } catch {
-      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '返回的不是 JSON' })
+    try {
+      // 只限制到响应头是不够的：源可以发完头再慢慢滴 body，把整个请求拖死
+      body = await Promise.race([
+        res.json(),
+        new Promise((_r, rej) => setTimeout(() => {
+          try { ac.abort() } catch { /* 已结束 */ }
+          rej(new Error('body timeout'))
+        }, UPDATE_TIMEOUT_MS)),
+      ])
+    } catch {
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '响应体读取超时或不是 JSON' })
       continue
     }
     const latest = versionFromBody(body)
@@ -736,7 +770,8 @@ async function checkUpdate() {
     if (!best || compareVer(latest, best.version) > 0) best = { version: latest, source: src.name }
   }
   if (best) {
-    return {
+    updateCache = { at: Date.now(), data: null }
+    const result = {
       ok: true,
       current,
       latest: best.version,
@@ -746,6 +781,8 @@ async function checkUpdate() {
       page: UPDATE_PAGE,
       install: UPDATE_INSTALL,
     }
+    updateCache = { at: Date.now(), data: result }
+    return result
   }
   return {
     ok: false,
@@ -772,7 +809,14 @@ function pluginInstallInfo() {
     spec = deps[PLUGIN_NAME] || dev[PLUGIN_NAME] || ''
   } catch { /* 读不到 profile package.json：当未知处理 */ }
   const linked = !spec || /^file:/i.test(spec)
-  return { pluginDir, profileDir, spec, linked, mode: linked ? 'linked' : 'npm' }
+  // file: 依赖会被 npm 复制到 node_modules（Windows 上是真副本，不是软链），
+  // 所以「源码目录」得从 spec 里取，不能拿 pluginDir 当仓库（那里没有 .git）
+  let srcDir = ''
+  if (/^file:/i.test(spec)) {
+    srcDir = spec.replace(/^file:/i, '').trim().replace(/\\/g, '\/')
+  }
+  const srcIsRepo = !!srcDir && existsSync(join(srcDir, '.git'))
+  return { pluginDir, profileDir, spec, srcDir, srcIsRepo, linked, mode: linked ? 'linked' : 'npm' }
 }
 
 /** 在插件源码目录跑 git pull --ff-only（60 秒上限），把输出带回去 */
@@ -782,7 +826,7 @@ function gitPull(pluginDir) {
     const push = (b) => { out += String(b); if (out.length > 8000) out = out.slice(-8000) }
     let child
     try {
-      child = spawn('git', ['pull', '--ff-only'], { cwd: pluginDir, windowsHide: true })
+      child = updateDeps.spawn('git', ['pull', '--ff-only'], { cwd: pluginDir, windowsHide: true })
     } catch (e) {
       return resolve({ ok: false, code: null, output: String((e && e.message) || e) })
     }
@@ -801,7 +845,7 @@ function npmInstallSpec(profileDir, spec) {
     const push = (b) => { out += String(b); if (out.length > 8000) out = out.slice(-8000) }
     let child
     try {
-      child = spawn('npm', ['install', spec, '--no-audit', '--no-fund'], {
+      child = updateDeps.spawn('npm', ['install', spec, '--no-audit', '--no-fund'], {
         cwd: profileDir, shell: process.platform === 'win32', windowsHide: true,
       })
     } catch (e) {
@@ -815,8 +859,25 @@ function npmInstallSpec(profileDir, spec) {
   })
 }
 
+/* 升级互斥：连点两次不能在同一个 profile 里跑两个 npm / 两个 git pull */
+let updateRunning = false
+/* 识别账号互斥：每次都会起 Python + Chromium，不能并发 */
+let whoamiRunning = false
+
 /** 执行升级：npm 安装 → npm install；源码链接 → git pull（绝不覆盖、绝不删除） */
 async function applyUpdate(action) {
+  if (updateRunning) {
+    return { ok: false, reason: 'busy', message: '已有一个升级在进行中，等它结束再点。' }
+  }
+  updateRunning = true
+  try {
+    return await applyUpdateInner(action)
+  } finally {
+    updateRunning = false
+  }
+}
+
+async function applyUpdateInner(action) {
   const info = pluginInstallInfo()
   if (info.linked) {
     if (action !== 'pull') {
@@ -831,11 +892,28 @@ async function applyUpdate(action) {
           + '插件只会在源码目录执行 git pull，不会覆盖或删除任何文件。',
       }
     }
-    const r = await gitPull(info.pluginDir)
+    // npm 会把 file: 依赖复制到 node_modules；那份副本没有 .git，不能在那儿 pull
+    if (!info.srcIsRepo) {
+      return {
+        ok: false,
+        mode: 'linked',
+        action: 'pull',
+        spec: info.spec || '(未声明)',
+        srcDir: info.srcDir || '',
+        pluginDir: info.pluginDir,
+        command: UPDATE_INSTALL,
+        message: '找不到源码仓库：profile 里写的是 ' + (info.spec || '(未声明)')
+          + (info.srcDir ? '，但 ' + info.srcDir + ' 里没有 .git' : '')
+          + '。插件只会在源码仓库里执行 git pull，不会碰 node_modules 副本。'
+          + '请在源码目录自行更新后重启 DSH，或改用 npm 版（' + UPDATE_INSTALL + '）。',
+      }
+    }
+    const r = await gitPull(info.srcDir)
     if (!r.ok) {
       return {
-        ok: false, mode: 'linked', action: 'pull', pluginDir: info.pluginDir, code: r.code, output: r.output,
-        message: 'git pull 没成功（退出码 ' + r.code + '）。可能是本地有改动或没网：\n' + r.output,
+        ok: false, mode: 'linked', action: 'pull', srcDir: info.srcDir, pluginDir: info.pluginDir,
+        code: r.code, output: r.output,
+        message: 'git pull 没成功（退出码 ' + r.code + '）。可能是本地有改动、没网，或 remote 用 SSH 但没有可用密钥：\n' + r.output,
       }
     }
     // file: 依赖是复制、不是软链 —— 源码拉新后必须让 profile 重装一次，运行中的副本才会跟上
@@ -844,6 +922,7 @@ async function applyUpdate(action) {
       ok: true,
       mode: 'linked',
       action: 'pull',
+      srcDir: info.srcDir,
       pluginDir: info.pluginDir,
       code: r.code,
       output: r.output,
@@ -858,33 +937,47 @@ async function applyUpdate(action) {
   const dir = stateDir()
   try { mkdirSync(dir, { recursive: true }) } catch { /* 目录已存在 */ }
   const logf = join(dir, 'update.log')
-  let fd = null
+  // ⚠️ 必须追加：之前用 writeFileSync（默认 'w'）每次把上一轮 npm 输出清空，
+  //    而诊断报告正是读这几行排查失败原因的
   try {
-    fd = openSync(logf, 'a')
-    writeFileSync(logf, '\n=== ' + new Date().toISOString() + '  npm install ' + PLUGIN_NAME + '@latest  (cwd ' + info.profileDir + ')\n')
-  } catch { /* 日志打不开也要继续装 */ }
+    appendFileSync(logf, '\n=== ' + new Date().toISOString() + '  npm install ' + PLUGIN_NAME + '@latest  (cwd ' + info.profileDir + ')\n')
+  } catch { /* 日志写不进也要继续装 */ }
+  const r = await npmInstallLatest(info.profileDir)
   try {
-    const child = spawn('npm', ['install', PLUGIN_NAME + '@latest', '--no-audit', '--no-fund'], {
-      cwd: info.profileDir,
-      shell: process.platform === 'win32',
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', fd || 'ignore', fd || 'ignore'],
-    })
-    child.unref()
-    return {
-      ok: true,
-      started: true,
-      mode: 'npm',
-      log: logf,
-      profileDir: info.profileDir,
-      message: '已开始升级（npm install ' + PLUGIN_NAME + '@latest）。装完请重启 DSH 生效，日志在 ' + logf,
-    }
-  } catch (e) {
-    return { ok: false, mode: 'npm', log: logf, message: '启动 npm 失败：' + ((e && e.message) || String(e)) }
-  } finally {
-    if (fd !== null) { try { closeSync(fd) } catch { /* 已关 */ } }
+    appendFileSync(logf, String(r.output || '') + '\n--- exit ' + r.code + ' ---\n')
+  } catch { /* 同上 */ }
+  return {
+    ok: r.ok === true,
+    mode: 'npm',
+    code: r.code,
+    log: logf,
+    profileDir: info.profileDir,
+    output: String(r.output || '').slice(-1500),
+    message: r.ok
+      ? '已升级到最新版（npm 退出码 0）。请重启 DSH 生效。日志：' + logf
+      : '升级没成功（npm 退出码 ' + r.code + '）。日志：' + logf + '\n' + String(r.output || '').slice(-500),
   }
+}
+
+/** 在 profile 目录装最新版：前台等退出码（最多 4 分钟），失败原因带回去 */
+function npmInstallLatest(profileDir) {
+  return new Promise((resolve) => {
+    let out = ''
+    const push = (b) => { out += String(b); if (out.length > 20000) out = out.slice(-20000) }
+    let child
+    try {
+      child = updateDeps.spawn('npm', ['install', PLUGIN_NAME + '@latest', '--no-audit', '--no-fund'], {
+        cwd: profileDir, shell: process.platform === 'win32', windowsHide: true,
+      })
+    } catch (e) {
+      return resolve({ ok: false, code: null, output: String((e && e.message) || e) })
+    }
+    const timer = setTimeout(() => { try { child.kill() } catch { /* 已退出 */ } }, 240000)
+    if (child.stdout && child.stdout.on) child.stdout.on('data', push)
+    if (child.stderr && child.stderr.on) child.stderr.on('data', push)
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, code: null, output: String((e && e.message) || e) }) })
+    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, output: out.trim() }) })
+  })
 }
 
 /** 从各源的返回体里取 version：npm 直接给；GitHub/GitCode 的 contents 接口给 base64 content */
@@ -908,11 +1001,25 @@ function buildDiag() {
   const lines = []
   const add = (s) => lines.push(s)
   const head = (t) => { add(''); add('===== ' + t + ' =====') }
+  /* 只读文件尾部 64KB 再切行：setup.log 可能有几十 MB，整读会阻塞事件循环 */
   const tailFile = (p, n) => {
+    let fd = null
     try {
-      const all = String(readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim())
-      return all.slice(-n).join('\n')
-    } catch (e) { return '(读不到: ' + ((e && e.message) || e) + ')' }
+      const size = statSync(p).size
+      const start = Math.max(0, size - 65536)
+      if (start === 0) return String(readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim()).slice(-n).join('\n')
+      const buf = Buffer.alloc(size - start)
+      fd = openSync(p, 'r')
+      readSync(fd, buf, 0, buf.length, start)
+      const text = buf.toString('utf8')
+      const cut = text.indexOf('\n')   // 首行可能被截断一半，丢掉
+      const body = cut >= 0 ? text.slice(cut + 1) : text
+      return body.split(/\r?\n/).filter((l) => l.trim()).slice(-n).join('\n')
+    } catch (e) {
+      return '(读不到: ' + ((e && e.message) || e) + ')'
+    } finally {
+      if (fd !== null) { try { closeSync(fd) } catch { /* 已关 */ } }
+    }
   }
 
   add('douyin-audio 诊断报告')
@@ -936,7 +1043,7 @@ function buildDiag() {
 
   head('环境探针（只看存在性，不跑子进程）')
   try {
-    const cfg = merged()
+    const cfg = cfgAll()   // 模块级函数不能用 apply 闭包里的 merged()
     const pyCfg = typeof cfg.pythonPath === 'string' ? cfg.pythonPath.trim() : ''
     add('pythonPath(配置): ' + (pyCfg || '(空，自动找)'))
     add('venv 目录: ' + (existsSync(venvRoot()) ? '有' : '无') + '  —— ' + venvRoot())
@@ -966,6 +1073,13 @@ function buildDiag() {
     ensureDirs()
     saved = join(stateDir(), 'diag-' + stamp + '.txt')
     writeFileSync(saved, text, 'utf8')
+    // 只留最近 5 份，反复点也不会把状态目录攒满
+    try {
+      const olds = readdirSync(stateDir()).filter((f) => /^diag-.*\.txt$/.test(f)).sort()
+      for (const f of olds.slice(0, Math.max(0, olds.length - 5))) {
+        try { rmSync(join(stateDir(), f), { force: true }) } catch { /* 删不掉不影响 */ }
+      }
+    } catch { /* 列目录失败就算了 */ }
   } catch (e) { saved = '(写文件失败: ' + ((e && e.message) || e) + ')' }
   return { ok: true, at: at.toISOString(), path: saved, bytes: Buffer.byteLength(text, 'utf8'), text }
 }
@@ -986,10 +1100,13 @@ function readAccount() {
 function saveAccount(nick, uid) {
   try {
     ensureDirs()
-    writeFileSync(accountFile(), JSON.stringify({ nick: String(nick || ''), uid: String(uid || ''), at: new Date().toISOString() }, null, 2))
+    // 原子写：并发 GET /account 不能读到半截 JSON（读侧落到 known:false 会静默丢账号）
+    const tmp = accountFile() + '.' + process.pid + '.tmp'
+    writeFileSync(tmp, JSON.stringify({ nick: String(nick || ''), uid: String(uid || ''), at: new Date().toISOString() }, null, 2))
+    renameSync(tmp, accountFile())
     return true
   } catch (e) {
-    log('账号缓存写入失败: ' + ((e && e.message) || e))
+    logLine('账号缓存写入失败: ' + ((e && e.message) || e))
     return false
   }
 }
@@ -2238,7 +2355,9 @@ export function apply(ctx, config = {}) {
           // 检查更新：问 npm registry 比版本。只读、8 秒超时、失败也是 HTTP 200（把原因写在 error 里）
           if (req.method === 'GET' && sub === '/update') {
             const info = pluginInstallInfo()
-            return send(200, { ...(await checkUpdate()), mode: info.mode, installCommand: UPDATE_INSTALL })
+            // ?force=1 跳过 3 分钟缓存：用户刚升级完再点「检查更新」不该看到陈旧结果
+            const force = reqUrl.searchParams.get('force') === '1'
+            return send(200, { ...(await checkUpdate(force)), mode: info.mode, installCommand: UPDATE_INSTALL })
           }
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
           if (req.method === 'GET' && sub === '/account') return send(200, { ok: true, ...readAccount() })
@@ -2312,7 +2431,18 @@ export function apply(ctx, config = {}) {
             }
             // whoami：读当前登录账号（个人页昵称），结果存进 stateDir/account.json
             if (action === 'whoami') {
-              const r = await runRead('whoami', [], 90)
+              // 与 douyin_duty 的 dutyRunning 同理：连点/多标签不能同时起多个 Python+Chromium
+              if (whoamiRunning) return send(200, { ok: false, reason: 'busy', error: '正在识别账号，等它结束再试' })
+              // 只读档位关掉后，这条也不该再开抖音页面
+              const deny = requireTier('douyin_hot', 'read')
+              if (deny) return send(200, { ok: false, error: (deny && (deny.error || deny.reason)) || '能力等级未开启' })
+              whoamiRunning = true
+              let r
+              try {
+                r = await runRead('whoami', [], 90)
+              } finally {
+                whoamiRunning = false
+              }
               if (!r || r.ok === false) {
                 return send(200, { ok: false, error: (r && (r.error || r.reason)) || '没读到账号' })
               }
