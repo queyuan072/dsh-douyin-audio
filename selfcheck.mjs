@@ -629,6 +629,14 @@ else {
       if (stAcct && stAcct.account && typeof stAcct.account.known === 'boolean') {
         ok('douyin_status 带 account 字段（known=' + stAcct.account.known + '）')
       } else problem('status 没带 account：' + JSON.stringify(stAcct && stAcct.account))
+      // 3.7) GET /diag：生成一份错误日志（真跑，检查内容与落盘）
+      const diagRes = await callRoute('GET', '/api/douyin-audio/diag')
+      if (diagRes && diagRes.ok === true && typeof diagRes.text === 'string'
+        && diagRes.text.indexOf('douyin-audio 诊断报告') >= 0
+        && diagRes.text.indexOf('===== 配置（config.json） =====') >= 0
+        && diagRes.bytes > 200 && typeof diagRes.path === 'string' && /diag-.*\.txt$/.test(diagRes.path)) {
+        ok('GET /diag：诊断报告生成并落盘（' + diagRes.bytes + ' 字节 → ' + String(diagRes.path).split(/[\\/]/).pop() + '）')
+      } else problem('诊断报告不对：' + JSON.stringify({ ok: diagRes && diagRes.ok, bytes: diagRes && diagRes.bytes, path: diagRes && diagRes.path }).slice(0, 200))
       // 4) GET /update 要带上「安装方式」，前端据此决定要不要给「立即升级」
       const upInfo = await callRoute('GET', '/api/douyin-audio/update')
       if (upInfo && (upInfo.mode === 'linked' || upInfo.mode === 'npm') && typeof upInfo.installCommand === 'string') {

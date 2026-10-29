@@ -1597,6 +1597,29 @@ window.__ModuleLoader__.load({
         setCfg((c) => (c ? { ...c, uiLayout: v } : c))
       }
 
+      /* 出错了吗：有警告提示 / 读配置失败 / 上一次结果里 ok:false —— 满足任一就顶部露出「生成错误日志」 */
+      const hasError = msgTone === 'warn' || fails > 0
+        || (typeof out === 'string' && /"ok"\s*:\s*false/.test(out))
+        || (updApply && updApply.ok === false)
+
+      /* 生成错误日志：宿主拼一份报告（环境/配置/各日志尾部）落盘，同时复制到剪贴板 */
+      const doDiag = async () => {
+        setUpdBusy(true)
+        try {
+          const r = await jget('/diag')
+          if (r && r.ok && typeof r.text === 'string') {
+            const ok = await copyText(r.text)
+            say((ok ? '诊断报告已复制到剪贴板' : '复制失败，报告已存到磁盘') + '，文件：' + (r.path || '(未保存)'), 'good')
+          } else {
+            say('生成诊断失败：' + ((r && r.error) || '宿主没回报告'), 'warn')
+          }
+        } catch (e) {
+          say('生成诊断失败：' + errText(e), 'warn')
+        } finally {
+          setUpdBusy(false)
+        }
+      }
+
       /* ── 第一层：顶栏（两版共用）：四枚徽章 + 旧版/新版 + 刷一轮 ── */
       const topBar = h('div', { 'data-dy-bar': '' },
         h('div', { 'data-dy-bar-badges': '' },
@@ -1621,9 +1644,16 @@ window.__ModuleLoader__.load({
             }, 'v' + upd.current + ' → v' + upd.latest)
             : null),
         h('div', { 'data-dy-layout': '' },
+          hasError
+            ? h('button', {
+              'data-dy-btn': '', 'data-dy-diag': '', disabled: updBusy,
+              title: '把版本、配置、环境探针与各日志尾部拼成一份报告：复制到剪贴板并存到状态目录',
+              onClick: doDiag,
+            }, '生成错误日志')
+            : null,
           h('button', {
             'data-dy-btn': '', disabled: updBusy,
-            title: '问 npm registry 有没有新版本（8 秒超时；离网会提示连不上）',
+            title: '问远端仓库与 npm 有没有新版本（国内源优先，10 秒超时）',
             onClick: () => checkUpd(false),
           }, updBusy ? '查询中…' : '检查更新'),
           h('button', {

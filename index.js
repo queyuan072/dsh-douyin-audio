@@ -17,7 +17,7 @@ import { arch, cpus, platform, tmpdir, totalmem } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadHostDeps } from './lib/hostdeps.mjs'
-import { ensureDirs, loadCfg, saveCfg, stateDir, log as logLine } from './lib/state.mjs'
+import { ensureDirs, loadCfg, saveCfg, stateDir, logPath, log as logLine } from './lib/state.mjs'
 import { decide, dutyPath, readDuty, recordRun, statusOf } from './lib/duty.mjs'
 import { findPython, runPython, SCRIPT_READ, SCRIPT_SCROLL, SCRIPT_TRANSCRIBE } from './lib/runner.mjs'
 
@@ -899,6 +899,75 @@ function versionFromBody(body) {
     if (pkg && typeof pkg.version === 'string' && pkg.version) return pkg.version
   } catch { /* 解不开就当这个源没给 */ }
   return ''
+}
+
+/** 生成一份可粘贴/可提交的错误日志：环境 + 配置 + 各日志尾部，落到 stateDir/diag-<时间>.txt */
+function buildDiag() {
+  const at = new Date()
+  const stamp = at.toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const lines = []
+  const add = (s) => lines.push(s)
+  const head = (t) => { add(''); add('===== ' + t + ' =====') }
+  const tailFile = (p, n) => {
+    try {
+      const all = String(readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim())
+      return all.slice(-n).join('\n')
+    } catch (e) { return '(读不到: ' + ((e && e.message) || e) + ')' }
+  }
+
+  add('douyin-audio 诊断报告')
+  add('生成时间: ' + at.toISOString() + '  (本地 ' + at.toLocaleString('zh-CN') + ')')
+
+  head('版本与安装')
+  const info = pluginInstallInfo()
+  add('插件版本: ' + (pluginVersion() || '(读不到)'))
+  add('安装方式: ' + info.mode + '  spec=' + (info.spec || '(未声明)'))
+  add('插件目录: ' + info.pluginDir)
+  add('profile 目录: ' + info.profileDir)
+
+  head('系统')
+  add('平台: ' + platform() + ' ' + arch())
+  add('逻辑核: ' + cpus().length + ' / 内存: ' + Math.round(totalmem() / 1024 / 1024 / 1024) + ' GB')
+  add('Node: ' + process.version)
+  add('状态目录: ' + stateDir())
+
+  head('配置（config.json）')
+  try { add(JSON.stringify(cfgAll(), null, 2)) } catch (e) { add('(读配置失败: ' + ((e && e.message) || e) + ')') }
+
+  head('环境探针（只看存在性，不跑子进程）')
+  try {
+    const cfg = merged()
+    const pyCfg = typeof cfg.pythonPath === 'string' ? cfg.pythonPath.trim() : ''
+    add('pythonPath(配置): ' + (pyCfg || '(空，自动找)'))
+    add('venv 目录: ' + (existsSync(venvRoot()) ? '有' : '无') + '  —— ' + venvRoot())
+    add('venv python: ' + (existsSync(venvPython()) ? '有' : '无'))
+    const cf = loginCookieFile()
+    let cookieLines = 0
+    try { cookieLines = String(readFileSync(cf, 'utf8')).split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#')).length } catch { cookieLines = 0 }
+    add('cookie 文件: ' + (existsSync(cf) ? '有（' + cookieLines + ' 条，内容不记录）' : '无') + '  —— ' + cf)
+    const acct = readAccount()
+    add('账号缓存: ' + (acct.known ? acct.nick + (acct.uid ? ' / ' + acct.uid : '') + ' @ ' + acct.at : '未识别'))
+    add('脚本: read=' + existsSync(SCRIPT_READ) + ' scroll=' + existsSync(SCRIPT_SCROLL) + ' transcribe=' + existsSync(SCRIPT_TRANSCRIBE))
+    add('setup-result.json: ' + (() => { try { return String(readFileSync(join(stateDir(), 'setup-result.json'), 'utf8')).slice(0, 800) } catch { return '(没有)' } })())
+  } catch (e) { add('(探针失败: ' + ((e && e.message) || e) + ')') }
+
+  head('宿主日志（最后 60 行）')
+  try { add(tailFile(logPath(), 60)) } catch (e) { add('(读不到: ' + ((e && e.message) || e) + ')') }
+
+  head('setup.log（最后 40 行）')
+  add(tailFile(setupLogPath(), 40))
+
+  head('update.log（最后 20 行）')
+  add(tailFile(join(stateDir(), 'update.log'), 20))
+
+  const text = lines.join('\n')
+  let saved = ''
+  try {
+    ensureDirs()
+    saved = join(stateDir(), 'diag-' + stamp + '.txt')
+    writeFileSync(saved, text, 'utf8')
+  } catch (e) { saved = '(写文件失败: ' + ((e && e.message) || e) + ')' }
+  return { ok: true, at: at.toISOString(), path: saved, bytes: Buffer.byteLength(text, 'utf8'), text }
 }
 
 /** 登录账号缓存：stateDir/account.json —— whoami 读到的昵称存这儿，界面直接显示 */
@@ -2173,6 +2242,10 @@ export function apply(ctx, config = {}) {
           }
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
           if (req.method === 'GET' && sub === '/account') return send(200, { ok: true, ...readAccount() })
+          // 生成错误日志：出问题时点一下就有一份可粘贴/可提交的报告
+          if (req.method === 'GET' && sub === '/diag') {
+            try { return send(200, buildDiag()) } catch (e) { return send(500, { ok: false, error: '生成诊断失败: ' + ((e && e.message) || e) }) }
+          }
           if (req.method === 'GET' && sub === '/sysinfo') {
             let cores = 0
             let totalMemGB = 0
