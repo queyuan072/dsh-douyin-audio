@@ -262,14 +262,14 @@ window.__ModuleLoader__.load({
       } else if (envObj && envObj.canReusePython && !pyPath) {
         env = { text: '环境未配置（可一键配置）', tone: 'warn', act: 'env', title: '本机已有可用 Python' + (envObj.reusePythonPath ? '：' + envObj.reusePythonPath : '') + '，但 pythonPath 还空着 —— 去「环境与诊断」页点「一键配置环境」' }
       } else if (miss.length) {
-        env = { text: '环境缺 ' + miss[0].name, tone: 'warn', act: 'env', title: miss.map((p) => p.why).join('；') + '（点这里重跑自检）' }
+        env = { text: '环境缺 ' + miss[0].name, tone: 'warn', act: 'env', title: miss.map((p) => p.why).join('；') + '（点这里跳到「装入配置环境」）' }
       } else {
-        env = { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里重跑自检）' }
+        env = { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里跳到「装入配置环境」）' }
       }
       /* ⚠️ 只按 cookie 文件在不在说，不写「已登录」—— 真实登录态我们确认不了 */
       const login = s.cookie && s.cookie.exists
-        ? { text: 'cookie 已配置', tone: '', act: 'login', title: '只按 cookie 文件存在判断，不代表当前登录态一定有效（点这里去登录区）' }
-        : { text: '未登录', tone: 'warn', act: 'login', title: 'cookie 文件还没写出来 —— 点这里去「登录」区块扫码' }
+        ? { text: 'cookie 已配置', tone: '', act: 'login', title: '只按 cookie 文件存在判断，不代表当前登录态一定有效（点这里跳到登录区）' }
+        : { text: '未登录', tone: 'warn', act: 'login', title: 'cookie 文件还没写出来 —— 点这里跳到「登录」区块扫码' }
       const n = Array.isArray(s.videos) ? s.videos.length : 0
       const videos = n > 0
         ? { text: '已下载 ' + n + ' 条', tone: '', act: null, title: '本地 videos 目录里有 ' + n + ' 个 mp4' }
@@ -299,6 +299,7 @@ window.__ModuleLoader__.load({
       const [histBusy, setHistBusy] = React.useState(false)
       const [dutyRunning, setDutyRunning] = React.useState(false)  // 「现在刷一轮」跑着的时候禁用按钮
       const loginRef = React.useRef(null)               // 「登录」区块：点登录徽章要滚到这里
+      const envRef = React.useRef(null)                 // 「装入配置环境」区块：点环境徽章要滚到这里
       const [scanBusy, setScanBusy] = React.useState(false)   // 「扫描已安装的浏览器」跑着的时候
       const [scanMsg, setScanMsg] = React.useState('')        // 扫描结果一句话（检测到 Edge、Chrome）
       const [extraOpen, setExtraOpen] = React.useState(false) // 「手动添加」的内联输入区开着没
@@ -797,16 +798,29 @@ window.__ModuleLoader__.load({
         await refreshDuty()
       }
 
-      /* 点「登录」徽章：滚到登录区块并聚焦（滚动参数不被认就退化成默认滚动） */
-      const focusLogin = () => {
-        const el = loginRef && loginRef.current
-        if (!el) return
+      /* 滚到某个区块并聚焦它第一个按钮（滚动参数不被认就退化成默认滚动） */
+      const scrollToRef = (ref) => {
+        const el = ref && ref.current
+        if (!el) return false
         try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }) } catch (e) { /* 老浏览器不认参数 */ }
         try {
           const btn = el.querySelector ? el.querySelector('button') : null
           if (btn && btn.focus) btn.focus()
         } catch (e) { /* 聚焦失败不影响滚动 */ }
+        return true
       }
+
+      /* 徽章跳转：标签页布局下目标可能在别的页里 —— 先切页，等渲染出来再滚。
+         两套布局共用同一套 ref，所以无需分支。 */
+      const jumpTo = (ref, tabName) => {
+        if (scrollToRef(ref)) return
+        if (!tabName || tab === tabName) return
+        setTab(tabName)
+        setTimeout(() => { scrollToRef(ref) }, 90)
+      }
+
+      const focusLogin = () => jumpTo(loginRef, 'perms')
+      const focusEnv = () => jumpTo(envRef, 'diag')
 
       const run = async (action, extra, what) => {
         setBusy(action)
@@ -1416,7 +1430,7 @@ window.__ModuleLoader__.load({
         const running = setupBusy === 'auto' || !!(env && env.setupRunning)
         const line = autoLine(autoRes || (env && env.setupResult) || null)
         return [
-          h('div', { 'data-dy-sec': '', key: 'diag-setup', 'data-dy-setup': '' },
+          h('div', { 'data-dy-sec': '', key: 'diag-setup', 'data-dy-setup': '', ref: envRef },
             h('div', { 'data-dy-h': '' }, '装入配置环境'),
             h('div', { 'data-dy-row': '' },
               h('button', {
@@ -1506,8 +1520,7 @@ window.__ModuleLoader__.load({
               'data-warn': b.tone === 'warn' ? '' : undefined,
               'data-static': b.act ? undefined : '',
               title: b.title || b.text,
-              disabled: b.act === 'env' && busy === 'status',
-              onClick: b.act === 'env' ? () => run('status', {}, '自检')
+              onClick: b.act === 'env' ? focusEnv
                 : b.act === 'login' ? focusLogin : undefined,
             }, b.text))
             : h('div', { 'data-dy-note': '' }, stErr ? '状态读不到：' + stErr : '状态读中…'),
