@@ -664,10 +664,13 @@ const UPDATE_TIMEOUT_MS = 10000
 /* 顺序即优先级：双端仓库在前（用户要求「优先从远端双端查」），npm 兜底。
    GitHub / GitCode 都用 contents 接口（返回 base64），解析统一交给 versionFromBody。 */
 const UPDATE_SOURCES = [
-  // 国内源优先：GitCode(AtomGit) 在国内通常几百毫秒就回；GitHub 次之；npm registry 兜底
-  { name: 'AtomGit', url: 'https://api.gitcode.com/api/v5/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
-  { name: 'GitHub', url: 'https://api.github.com/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
-  { name: 'npm', url: 'https://registry.npmjs.org/dsh-douyin-audio/latest' },
+  // 仓库源：国内 GitCode(AtomGit) 优先（几百毫秒），GitHub 次之。
+  // 两个都问、取最高版本 —— 镜像可能落后（曾出现 AtomGit 停在 1.2.0 而 GitHub 已 1.2.3），
+  // 只信第一个答的会误报「已是最新」。
+  { name: 'AtomGit', kind: 'repo', url: 'https://api.gitcode.com/api/v5/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
+  { name: 'GitHub', kind: 'repo', url: 'https://api.github.com/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
+  // 仓库源全都答不上来时才问 npm（境外、常超时，只当兜底）
+  { name: 'npm', kind: 'registry', url: 'https://registry.npmjs.org/dsh-douyin-audio/latest' },
 ]
 const __UPDATE_REAL = { fetch: (u, o) => fetch(u, o) }
 const updateDeps = { ...__UPDATE_REAL }
@@ -695,7 +698,9 @@ async function checkUpdate() {
   const tried = []
   /* 分源查询：双端仓库优先（raw/API 更快也更稳），npm registry 兜底。
      GitHub 走 API 的 contents（返回 base64）；GitCode 有同形的 v5 接口；npm 直接给 version。 */
+  let best = null   // { version, source } —— 取所有仓库源里最高的那个
   for (const src of UPDATE_SOURCES) {
+    if (src.kind === 'registry' && best) break   // 仓库源已经有答案，npm 就不必问了
     const t0 = Date.now()
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), UPDATE_TIMEOUT_MS)
@@ -727,13 +732,16 @@ async function checkUpdate() {
       tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '没解析出 version' })
       continue
     }
-    tried.push({ name: src.name, ok: true, ms: Date.now() - t0 })
+    tried.push({ name: src.name, ok: true, ms: Date.now() - t0, version: latest })
+    if (!best || compareVer(latest, best.version) > 0) best = { version: latest, source: src.name }
+  }
+  if (best) {
     return {
       ok: true,
       current,
-      latest,
-      hasUpdate: compareVer(latest, current) > 0,
-      source: src.name,
+      latest: best.version,
+      hasUpdate: compareVer(best.version, current) > 0,
+      source: best.source,
       tried,
       page: UPDATE_PAGE,
       install: UPDATE_INSTALL,

@@ -605,6 +605,13 @@ else {
       if (upFallback && upFallback.ok === true && upFallback.latest === '77.77.77' && upFallback.source && upFallback.source !== 'AtomGit') {
         ok('GET /update：首个源失败会自动换源（落到 ' + upFallback.source + '）')
       } else problem('换源没生效：' + JSON.stringify(upFallback))
+      // 2.7) 镜像落后（真实踩过：AtomGit 停在 1.2.0、GitHub 已 1.2.3）→ 必须取更高的那个
+      let call2 = 0
+      mod.__updateDeps({ fetch: async () => { call2 += 1; return fakeRes({ version: call2 === 1 ? '1.0.0' : '2.0.0' }) } })
+      const upStale = await callRoute('GET', '/api/douyin-audio/update')
+      if (upStale && upStale.ok === true && upStale.latest === '2.0.0' && upStale.source === 'GitHub') {
+        ok('镜像落后时取更高版本（AtomGit 1.0.0 / GitHub 2.0.0 → 2.0.0，来源 GitHub）')
+      } else problem('落后镜像导致误判：' + JSON.stringify(upStale))
       // 3) 网络炸了 → 不抛错，返回 ok:false + 人话
       mod.__updateDeps({ fetch: async () => { throw new Error('getaddrinfo ENOTFOUND') } })
       const upFail = await callRoute('GET', '/api/douyin-audio/update')
