@@ -901,6 +901,30 @@ function versionFromBody(body) {
   return ''
 }
 
+/** 登录账号缓存：stateDir/account.json —— whoami 读到的昵称存这儿，界面直接显示 */
+function accountFile() {
+  return join(stateDir(), 'account.json')
+}
+
+function readAccount() {
+  try {
+    const j = JSON.parse(readFileSync(accountFile(), 'utf8'))
+    if (j && typeof j.nick === 'string' && j.nick) return { known: true, nick: j.nick, uid: String(j.uid || ''), at: j.at || null }
+  } catch { /* 没有缓存就返回未识别 */ }
+  return { known: false, nick: '', uid: '', at: null }
+}
+
+function saveAccount(nick, uid) {
+  try {
+    ensureDirs()
+    writeFileSync(accountFile(), JSON.stringify({ nick: String(nick || ''), uid: String(uid || ''), at: new Date().toISOString() }, null, 2))
+    return true
+  } catch (e) {
+    log('账号缓存写入失败: ' + ((e && e.message) || e))
+    return false
+  }
+}
+
 /** cookie 落点：DOUYIN_COOKIE_FILE > ~/.dsh/cookies/douyin_cookies.txt（与脚本默认值一致） */
 function loginCookieFile() {
   const env = String(process.env.DOUYIN_COOKIE_FILE || '').trim()
@@ -1535,7 +1559,8 @@ export function apply(ctx, config = {}) {
         ffmpeg: ff || '(未找到)',
         modelDir: { path: modelDir, exists: existsSync(modelDir) },
         cookie: { path: cookie, exists: existsSync(cookie) },
-        scripts: { scroll: existsSync(SCRIPT_SCROLL), transcribe: existsSync(SCRIPT_TRANSCRIBE), read: existsSync(SCRIPT_READ) },
+        account: readAccount(),
+    scripts: { scroll: existsSync(SCRIPT_SCROLL), transcribe: existsSync(SCRIPT_TRANSCRIBE), read: existsSync(SCRIPT_READ) },
         // 五个内核 + 手动添加项 + 快捷方式发现的浏览器（设置页按它列可选内核）
         browsers,
         // 当前 browserChannel 的解析说明：自定义项路径不在 / id 不存在时在这里说清（正常情况是空串）
@@ -2147,6 +2172,7 @@ export function apply(ctx, config = {}) {
             return send(200, { ...(await checkUpdate()), mode: info.mode, installCommand: UPDATE_INSTALL })
           }
           // 只读：给设置页显示「本机几核」，线程数输入框的上限靠它（拿不到 core 的旧宿主由前端降级）
+          if (req.method === 'GET' && sub === '/account') return send(200, { ok: true, ...readAccount() })
           if (req.method === 'GET' && sub === '/sysinfo') {
             let cores = 0
             let totalMemGB = 0
@@ -2210,6 +2236,19 @@ export function apply(ctx, config = {}) {
               const dutyTool = byName.get('douyin_duty')
               if (!dutyTool) return send(500, { ok: false, error: 'douyin_duty 没注册上' })
               return send(200, await dutyTool.execute({ action: DUTY_ACTIONS[action] }))
+            }
+            // whoami：读当前登录账号（个人页昵称），结果存进 stateDir/account.json
+            if (action === 'whoami') {
+              const r = await runRead('whoami', [], 90)
+              if (!r || r.ok === false) {
+                return send(200, { ok: false, error: (r && (r.error || r.reason)) || '没读到账号' })
+              }
+              const item = Array.isArray(r.items) && r.items[0] ? r.items[0] : {}
+              const nick = String(item.nickname || '')
+              const uid = String(item.uid || '')
+              if (!nick) return send(200, { ok: false, error: '脚本没给昵称' })
+              saveAccount(nick, uid)
+              return send(200, { ok: true, nick, uid, at: new Date().toISOString() })
             }
             // setup_* 是 douyin_setup 的界面入口
             //   setup_auto → **后台派生**（detached），立刻回 started:true —— 首次装依赖几分钟，

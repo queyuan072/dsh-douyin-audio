@@ -619,6 +619,16 @@ else {
         ok('GET /update：连不上时返回 ok:false 且不抛错（' + upFail.error.slice(0, 28) + '…）')
       } else problem('检查更新遇到网络错误没兜住：' + JSON.stringify(upFail))
       mod.__updateDeps({ fetch: null })   // 还原成真 fetch
+      // 3.5) GET /account：账号缓存形状（没缓存时 known=false，绝不抛错）
+      const acctRes = await callRoute('GET', '/api/douyin-audio/account')
+      if (acctRes && acctRes.ok === true && typeof acctRes.known === 'boolean' && typeof acctRes.nick === 'string') {
+        ok('GET /account：账号缓存可读（known=' + acctRes.known + (acctRes.known ? '，昵称=' + acctRes.nick : '') + '）')
+      } else problem('GET /account 形状不对：' + JSON.stringify(acctRes).slice(0, 140))
+      // 3.6) douyin_status 要带 account 字段（顶栏与登录模块都靠它）
+      const stAcct = await callRoute('POST', '/api/douyin-audio/run', { action: 'status' })
+      if (stAcct && stAcct.account && typeof stAcct.account.known === 'boolean') {
+        ok('douyin_status 带 account 字段（known=' + stAcct.account.known + '）')
+      } else problem('status 没带 account：' + JSON.stringify(stAcct && stAcct.account))
       // 4) GET /update 要带上「安装方式」，前端据此决定要不要给「立即升级」
       const upInfo = await callRoute('GET', '/api/douyin-audio/update')
       if (upInfo && (upInfo.mode === 'linked' || upInfo.mode === 'npm') && typeof upInfo.installCommand === 'string') {

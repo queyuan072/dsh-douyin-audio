@@ -121,6 +121,11 @@ window.__ModuleLoader__.load({
   line-height:15px;white-space:pre-wrap;word-break:break-all;
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   background:var(--dsw-alias-bg-layer-4,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-dy-acct]{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 0 6px;font-size:11px;
+  line-height:16px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+[data-dy-acct][data-known] [data-dy-acct-nick]{color:var(--dsw-alias-label-primary,#e8eaed);font-weight:600;}
+[data-dy-acct] [data-dy-acct-label]{color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+[data-dy-acct] [data-dy-acct-at]{color:var(--dsw-alias-label-tertiary,#9aa0a6);font-size:10px;}
 [data-dy-mask]{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
   justify-content:center;z-index:60;}
 [data-dy-modal]{width:min(460px,86vw);border-radius:12px;padding:14px 16px;
@@ -256,7 +261,7 @@ window.__ModuleLoader__.load({
     ]
 
     /** 四枚徽章：{ text, tone(good|warn|''), act(env|login|null), title } */
-    function statusBadges(s) {
+    function statusBadges(s, acct) {
       const envObj = s && s.env && typeof s.env === 'object' ? s.env : null
       const pyPath = String((s && s.cfg && s.cfg.pythonPath) || '').trim()
       const miss = ENV_PARTS.filter((p) => !p.has(s))
@@ -274,8 +279,17 @@ window.__ModuleLoader__.load({
         env = { text: '环境就绪', tone: 'good', act: 'env', title: '四件套都在（点这里跳到「装入配置环境」）' }
       }
       /* ⚠️ 只按 cookie 文件在不在说，不写「已登录」—— 真实登录态我们确认不了 */
+      /* 账号昵称：优先用界面刚 whoami 到的，其次用状态里缓存的 */
+      const nick = (acct && acct.known && acct.nick) ? String(acct.nick) : ''
       const login = s.cookie && s.cookie.exists
-        ? { text: 'cookie 已配置', tone: '', act: 'login', title: '只按 cookie 文件存在判断，不代表当前登录态一定有效（点这里跳到登录区）' }
+        ? {
+          text: nick ? '已登录 · ' + nick : '已登录',
+          tone: nick ? 'good' : '',
+          act: 'login',
+          title: nick
+            ? '登录账号：' + nick + (acct && acct.uid ? '（抖音号 ' + acct.uid + '）' : '') + ' —— 点这里跳到登录区'
+            : 'cookie 文件已就绪，但还没识别账号 —— 点这里跳到登录区，那里有【识别账号】',
+        }
         : { text: '未登录', tone: 'warn', act: 'login', title: 'cookie 文件还没写出来 —— 点这里跳到「登录」区块扫码' }
       const n = Array.isArray(s.videos) ? s.videos.length : 0
       const videos = n > 0
@@ -323,6 +337,8 @@ window.__ModuleLoader__.load({
       const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
       const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
       const [upd, setUpd] = React.useState(null)                // 检查更新结果（null = 还没查）
+      const [acct, setAcct] = React.useState(null)              // 登录账号（{known,nick,uid}）
+      const [acctBusy, setAcctBusy] = React.useState(false)
       const [updAsk, setUpdAsk] = React.useState(false)          // 升级确认弹窗开着没
       const [updApply, setUpdApply] = React.useState(null)       // 点「立即升级」后的宿主回执
       const [updBusy, setUpdBusy] = React.useState(false)
@@ -343,6 +359,27 @@ window.__ModuleLoader__.load({
           document.body.removeChild(ta)
           return !!ok
         } catch (e2) { return false }
+      }
+
+      /* 识别账号：跑一次 whoami（读个人页昵称，约 10-15 秒）。silent=true 时只在顶栏更新，不刷提示 */
+      const doWhoami = async (silent) => {
+        if (acctBusy) return
+        setAcctBusy(true)
+        try {
+          const r = await jpost('/run', { action: 'whoami' })
+          if (r && r.ok && r.nick) {
+            setAcct({ known: true, nick: r.nick, uid: r.uid || '' })
+            if (!silent) say('已识别账号：' + r.nick + (r.uid ? '（抖音号 ' + r.uid + '）' : ''), 'good')
+          } else {
+            setAcct({ known: false, nick: '', uid: '', error: (r && (r.error || r.reason)) || '没读到账号' })
+            if (!silent) say('没识别到账号：' + ((r && (r.error || r.reason)) || 'cookie 可能已过期'), 'warn')
+          }
+        } catch (e) {
+          setAcct({ known: false, nick: '', uid: '', error: errText(e) })
+          if (!silent) say('识别账号失败：' + errText(e), 'warn')
+        } finally {
+          setAcctBusy(false)
+        }
       }
 
       /* 用户点「立即升级」：宿主侧判断安装方式，npm 版才真跑 npm install */
@@ -413,6 +450,18 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { reload() }, [])
       /* 挂载时静默查一次更新：有新版本就在顶栏亮一枚徽章，不打断任何操作 */
       React.useEffect(() => { checkUpd(true) }, [])
+      /* 挂载时读账号缓存；从没识别过且有 cookie → 后台静默识别一次（约 10 秒，不打断） */
+      React.useEffect(() => {
+        let live = true
+        jget('/account')
+          .then((r) => {
+            if (!live) return
+            if (r && r.known && r.nick) setAcct({ known: true, nick: r.nick, uid: r.uid || '' })
+            else if (st && st.cookie && st.cookie.exists) doWhoami(true)
+          })
+          .catch(() => { /* 读不到就让用户手动点 */ })
+        return () => { live = false }
+      }, [st && st.cookie ? st.cookie.exists : false])
       /* 线程数提示：按本机核数算建议区间，别再写死「8–16」——14 核的机器填 16 会被夹取，说法与事实不符 */
       const threadHint = (cores) => {
         if (!(cores > 0)) {
@@ -1165,6 +1214,21 @@ window.__ModuleLoader__.load({
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
         h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),
+          /* 当前账号：whoami 读到的昵称（缓存里也有一份，界面上直接显示） */
+          h('div', { 'data-dy-acct': '', 'data-known': acct && acct.known ? '' : undefined },
+            h('span', { 'data-dy-acct-label': '' }, '当前账号：'),
+            acct && acct.known
+              ? h('span', { 'data-dy-acct-nick': '' }, acct.nick + (acct.uid ? '（抖音号 ' + acct.uid + '）' : ''))
+              : h('span', { 'data-dy-acct-nick': '' },
+                acctBusy ? '识别中…' : (st && st.cookie && st.cookie.exists ? '还没识别' : '未登录')),
+            h('button', {
+              'data-dy-btn': '', 'data-dy-acct-btn': '', disabled: acctBusy || !(st && st.cookie && st.cookie.exists),
+              title: '打开抖音个人页读昵称（约 10-15 秒；只读，不发任何内容）',
+              onClick: () => doWhoami(false),
+            }, acctBusy ? '识别中…' : (acct && acct.known ? '重新识别' : '识别账号')),
+            acct && acct.known && acct.at
+              ? h('span', { 'data-dy-acct-at': '' }, '识别于 ' + String(acct.at).slice(0, 16).replace('T', ' '))
+              : null),
           h('div', { 'data-dy-row': '' },
             h('button', {
               'data-dy-btn': '', 'data-dy-loginmode': 'window',
@@ -1537,7 +1601,7 @@ window.__ModuleLoader__.load({
       const topBar = h('div', { 'data-dy-bar': '' },
         h('div', { 'data-dy-bar-badges': '' },
           st
-            ? statusBadges(st).map((b, i) => h('button', {
+            ? statusBadges(st, acct).map((b, i) => h('button', {
               key: 'badge' + i,
               'data-dy-badge': '',
               'data-good': b.tone === 'good' ? '' : undefined,
