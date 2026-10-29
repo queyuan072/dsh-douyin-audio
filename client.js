@@ -343,6 +343,16 @@ window.__ModuleLoader__.load({
         } catch (e) { setFails((n) => n + 1); say('读不到设置：' + errText(e), 'warn') }
       }
       React.useEffect(() => { reload() }, [])
+      /* 线程数提示：按本机核数算建议区间，别再写死「8–16」——14 核的机器填 16 会被夹取，说法与事实不符 */
+      const threadHint = (cores) => {
+        if (!(cores > 0)) {
+          return '没读到本机核数（宿主这版没有 /sysinfo 路由）：按 1–64 填，建议不超过一半（越大越快，但会占满 CPU）'
+        }
+        const hi = cores
+        const lo = Math.min(hi, Math.max(2, Math.floor(cores / 2)))
+        return '本机 ' + cores + ' 逻辑核；建议 ' + lo + '–' + hi + '（越大越快，但会占满 CPU）'
+      }
+
       /* 只读端点：拿本机逻辑核数，给线程数输入框定上限。旧宿主没有 /sysinfo -> 走降级（1–64），不报错 */
       React.useEffect(() => {
         let live = true
@@ -958,9 +968,7 @@ window.__ModuleLoader__.load({
               })),
             h('div', { 'data-dy-grow': '' },
               h('div', { 'data-dy-note': '' },
-                sys && sys.cores > 0
-                  ? '本机 ' + sys.cores + ' 逻辑核；建议 8–16（越大越快，但会占满 CPU）'
-                  : '没读到本机核数（宿主这版没有 /sysinfo 路由）：按 1–64 填，建议 8–16（越大越快，但会占满 CPU）'))),
+                threadHint(sys && sys.cores)))),
           h(ToggleRow, {
             label: '刷完自动转写 autoTranscribe',
             note: '关 = 刷完只给清单，由你决定转哪条（推荐）；开 = 刷完自动转最近 N 条',
@@ -1532,9 +1540,7 @@ window.__ModuleLoader__.load({
               })),
             h('div', { 'data-dy-grow': '' },
               h('div', { 'data-dy-note': '' },
-                sys && sys.cores > 0
-                  ? '本机 ' + sys.cores + ' 逻辑核；建议 8–16（越大越快，但会占满 CPU）'
-                  : '没读到本机核数（宿主这版没有 /sysinfo 路由）：按 1–64 填，建议 8–16（越大越快，但会占满 CPU）'))),
+                threadHint(sys && sys.cores)))),
           h(ToggleRow, {
             label: '刷完自动转写 autoTranscribe',
             note: '关 = 刷完只给清单，由你决定转哪条（推荐）；开 = 刷完自动转最近 N 条',
