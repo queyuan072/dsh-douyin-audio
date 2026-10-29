@@ -592,6 +592,19 @@ else {
       const upOld = await callRoute('GET', '/api/douyin-audio/update')
       if (upOld && upOld.ok === true && upOld.hasUpdate === false) ok('GET /update：远端更旧时 hasUpdate=false')
       else problem('更旧也报有更新：' + JSON.stringify(upOld))
+      // 2.5) GitHub 走 contents（base64）→ 也要能解析出真实版本号
+      const b64 = Buffer.from(JSON.stringify({ name: 'dsh-douyin-audio', version: '88.88.88' }), 'utf8').toString('base64')
+      mod.__updateDeps({ fetch: async () => fakeRes({ type: 'file', encoding: 'base64', content: b64 }) })
+      const upB64 = await callRoute('GET', '/api/douyin-audio/update')
+      if (upB64 && upB64.ok === true && upB64.latest === '88.88.88') ok('GET /update：contents 的 base64 内容能解出版本（88.88.88）')
+      else problem('base64 内容解不出：' + JSON.stringify(upB64))
+      // 2.6) 第一个源挂掉 → 自动落到第二个源
+      let call = 0
+      mod.__updateDeps({ fetch: async () => { call += 1; if (call === 1) throw new Error('ECONNRESET'); return fakeRes({ version: '77.77.77' }) } })
+      const upFallback = await callRoute('GET', '/api/douyin-audio/update')
+      if (upFallback && upFallback.ok === true && upFallback.latest === '77.77.77' && upFallback.source && upFallback.source !== 'AtomGit') {
+        ok('GET /update：首个源失败会自动换源（落到 ' + upFallback.source + '）')
+      } else problem('换源没生效：' + JSON.stringify(upFallback))
       // 3) 网络炸了 → 不抛错，返回 ok:false + 人话
       mod.__updateDeps({ fetch: async () => { throw new Error('getaddrinfo ENOTFOUND') } })
       const upFail = await callRoute('GET', '/api/douyin-audio/update')

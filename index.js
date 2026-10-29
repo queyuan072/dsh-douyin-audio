@@ -658,9 +658,17 @@ function pluginVersion() {
  * 问 npm registry 拿 latest，跟本地 package.json 的 version 比。
  * 只读、不改任何东西；失败不抛错，把原因写成人话返回（离网也能点）。
  * 测试缝 __updateDeps 让 selfcheck 注入假 fetch，避免测试真的联网。 */
-const UPDATE_REGISTRY = 'https://registry.npmjs.org/dsh-douyin-audio/latest'
 const UPDATE_PAGE = 'https://www.npmjs.com/package/dsh-douyin-audio'
 const UPDATE_INSTALL = 'npm install dsh-douyin-audio@latest'
+const UPDATE_TIMEOUT_MS = 10000
+/* 顺序即优先级：双端仓库在前（用户要求「优先从远端双端查」），npm 兜底。
+   GitHub / GitCode 都用 contents 接口（返回 base64），解析统一交给 versionFromBody。 */
+const UPDATE_SOURCES = [
+  // 国内源优先：GitCode(AtomGit) 在国内通常几百毫秒就回；GitHub 次之；npm registry 兜底
+  { name: 'AtomGit', url: 'https://api.gitcode.com/api/v5/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
+  { name: 'GitHub', url: 'https://api.github.com/repos/queyuan072/dsh-douyin-audio/contents/package.json?ref=main' },
+  { name: 'npm', url: 'https://registry.npmjs.org/dsh-douyin-audio/latest' },
+]
 const __UPDATE_REAL = { fetch: (u, o) => fetch(u, o) }
 const updateDeps = { ...__UPDATE_REAL }
 
@@ -684,32 +692,76 @@ function compareVer(a, b) {
 /** 检查更新：{ ok, current, latest?, hasUpdate?, error? } —— 永不抛错 */
 async function checkUpdate() {
   const current = pluginVersion()
-  const fail = (error) => ({ ok: false, current, latest: null, hasUpdate: false, error, page: UPDATE_PAGE })
-  let res
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), 8000)
-  try {
-    res = await updateDeps.fetch(UPDATE_REGISTRY, { headers: { accept: 'application/json' }, signal: ac.signal })
-  } catch (e) {
-    return fail(e && e.name === 'AbortError' ? '连接 npm 超时（8 秒），稍后再试' : '连不上 npm registry（' + ((e && e.message) || '网络问题') + '）')
-  } finally {
-    clearTimeout(timer)
+  const tried = []
+  /* 分源查询：双端仓库优先（raw/API 更快也更稳），npm registry 兜底。
+     GitHub 走 API 的 contents（返回 base64）；GitCode 有同形的 v5 接口；npm 直接给 version。 */
+  for (const src of UPDATE_SOURCES) {
+    const t0 = Date.now()
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), UPDATE_TIMEOUT_MS)
+    let res
+    try {
+      res = await updateDeps.fetch(src.url, { headers: { accept: 'application/json', 'user-agent': 'dsh-douyin-audio-update' }, signal: ac.signal })
+    } catch (e) {
+      const why = e && e.name === 'AbortError' ? '超时（' + Math.round(UPDATE_TIMEOUT_MS / 1000) + ' 秒）' : ((e && e.message) || '网络问题')
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: why })
+      continue
+    } finally {
+      clearTimeout(timer)
+    }
+    if (!res || typeof res.ok !== 'boolean') {
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '没有正常响应' })
+      continue
+    }
+    if (!res.ok) {
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: 'HTTP ' + res.status })
+      continue
+    }
+    let body = null
+    try { body = await res.json() } catch {
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '返回的不是 JSON' })
+      continue
+    }
+    const latest = versionFromBody(body)
+    if (!latest) {
+      tried.push({ name: src.name, ok: false, ms: Date.now() - t0, error: '没解析出 version' })
+      continue
+    }
+    tried.push({ name: src.name, ok: true, ms: Date.now() - t0 })
+    return {
+      ok: true,
+      current,
+      latest,
+      hasUpdate: compareVer(latest, current) > 0,
+      source: src.name,
+      tried,
+      page: UPDATE_PAGE,
+      install: UPDATE_INSTALL,
+    }
   }
-  if (!res || typeof res.ok !== 'boolean') return fail('npm registry 没有正常响应')
-  if (!res.ok) return fail('npm registry 返回 HTTP ' + res.status)
-  let body = null
-  try { body = await res.json() } catch { return fail('npm registry 返回的不是 JSON') }
-  const latest = body && typeof body.version === 'string' ? body.version : ''
-  if (!latest) return fail('npm registry 没给出 version 字段')
   return {
-    ok: true,
+    ok: false,
     current,
-    latest,
-    hasUpdate: compareVer(latest, current) > 0,
-    publishedAt: (body.time && body.time.modified) || null,
+    latest: null,
+    hasUpdate: false,
+    tried,
+    error: '三个源都没连上：' + tried.map((t) => t.name + '（' + t.error + '）').join('、'),
     page: UPDATE_PAGE,
-    install: UPDATE_INSTALL,
   }
+}
+
+/** 从各源的返回体里取 version：npm 直接给；GitHub/GitCode 的 contents 接口给 base64 content */
+function versionFromBody(body) {
+  if (!body || typeof body !== 'object') return ''
+  if (typeof body.version === 'string' && body.version) return body.version
+  const b64 = typeof body.content === 'string' ? body.content.replace(/\s+/g, '') : ''
+  if (!b64) return ''
+  try {
+    const txt = Buffer.from(b64, 'base64').toString('utf8')
+    const pkg = JSON.parse(txt)
+    if (pkg && typeof pkg.version === 'string' && pkg.version) return pkg.version
+  } catch { /* 解不开就当这个源没给 */ }
+  return ''
 }
 
 /** cookie 落点：DOUYIN_COOKIE_FILE > ~/.dsh/cookies/douyin_cookies.txt（与脚本默认值一致） */

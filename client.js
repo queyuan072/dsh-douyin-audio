@@ -344,8 +344,9 @@ window.__ModuleLoader__.load({
           const res = r && typeof r === 'object' ? r : { ok: false, error: '宿主没回检查结果' }
           setUpd(res)
           if (silent) return
-          if (res.ok && res.hasUpdate) say('有新版本 ' + res.latest + '（当前 ' + res.current + '）—— 点徽章复制升级命令', 'warn')
-          else if (res.ok) say('已是最新：' + res.current, 'good')
+          const from = res.source ? '（来自 ' + res.source + '）' : ''
+          if (res.ok && res.hasUpdate) say('有新版本 v' + res.latest + '（当前 v' + res.current + '）' + from + ' —— 点徽章复制升级命令', 'warn')
+          else if (res.ok) say('已是最新：v' + res.current + from, 'good')
           else say('检查更新失败：' + (res.error || '原因不详'), 'warn')
         } catch (e) {
           setUpd({ ok: false, error: errText(e) })
@@ -879,7 +880,7 @@ window.__ModuleLoader__.load({
               ? h('div', { 'data-dy-note': '', 'data-dy-selected': upd.ok && upd.hasUpdate ? '' : undefined },
                 upd.ok
                   ? (upd.hasUpdate
-                    ? 'npm 上已有 v' + upd.latest + '（当前 v' + upd.current + '）—— 可能就是这个问题的修复：'
+                    ? (upd.source ? upd.source : '远端') + ' 上已有 v' + upd.latest + '（当前 v' + upd.current + '）—— 可能就是这个问题的修复：'
                       + 'npm install dsh-douyin-audio@latest'
                     : '已是最新版本 v' + upd.current)
                   : '检查更新失败：' + (upd.error || '原因不详'))
@@ -1514,7 +1515,7 @@ window.__ModuleLoader__.load({
             ? h('button', {
               key: 'badge-upd',
               'data-dy-badge': '', 'data-warn': '',
-              title: 'npm 上已发布 v' + upd.latest + '（当前 v' + upd.current + '）—— 点这里复制升级命令',
+              title: (upd.source ? upd.source + ' 上为 v' : '远端为 v') + upd.latest + '（当前 v' + upd.current + '）—— 点这里复制升级命令',
               onClick: async () => {
                 const ok = await copyText('npm install dsh-douyin-audio@latest')
                 say(ok ? '已复制升级命令：npm install dsh-douyin-audio@latest' : '复制失败，请手动执行 npm install dsh-douyin-audio@latest', ok ? 'good' : 'warn')
