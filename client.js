@@ -121,6 +121,10 @@ window.__ModuleLoader__.load({
   line-height:15px;white-space:pre-wrap;word-break:break-all;
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   background:var(--dsw-alias-bg-layer-4,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-dy-advice]{margin:6px 0 0;padding:8px 10px;border-radius:8px;font-size:11px;line-height:17px;
+  background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.10));
+  border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.10));}
+[data-dy-advice] [data-dy-advice-item]{color:var(--dsw-alias-label-secondary,#c9ccd1);}
 /* ── 顶栏：徽章 + 刷一轮（抄刷B站那页的样子）── */
 [data-dy-bar]{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:10px;
   border:1px solid var(--dsw-alias-bg-layer-3,rgba(255,255,255,.12));
@@ -351,6 +355,44 @@ window.__ModuleLoader__.load({
         const hi = cores
         const lo = Math.min(hi, Math.max(2, Math.floor(cores / 2)))
         return '本机 ' + cores + ' 逻辑核；建议 ' + lo + '–' + hi + '（越大越快，但会占满 CPU）'
+      }
+
+      /* 建议区：把结果里的原始 JSON 翻译成「下一步该点什么」，不重复贴数据 */
+      const adviceFor = (raw) => {
+        if (raw === null || raw === undefined) {
+          return ['还没跑过 —— 先点【自检】看本机缺什么；缺依赖就点【一键配置环境】补齐']
+        }
+        let o = raw
+        if (typeof raw === 'string') { try { o = JSON.parse(raw) } catch { return [] } }
+        if (!o || typeof o !== 'object') return []
+        const gone = (v) => typeof v === 'string' && v.indexOf('未找到') >= 0
+        const out = []
+        const isSelfCheck = o.env !== undefined || o.pythonScroll !== undefined
+        if (isSelfCheck) {
+          if (gone(o.pythonScroll) || gone(o.pythonAsr)) {
+            out.push('Python 依赖缺失 → 点【一键配置环境】（装 playwright + sherpa-onnx，首次几分钟、要联网）')
+          }
+          if (gone(o.ffmpeg)) out.push('缺 ffmpeg（转写要用）→ 用【一键配置环境】的「完整」模式，或把 ffmpeg.exe 放进 ~/.dsh/bin')
+          if (o.modelDir && o.modelDir.exists === false) out.push('缺 SenseVoice 模型（约 200MB）→「完整」模式会下到 ~/.dsh/models')
+          if (o.cookie && o.cookie.exists === false) out.push('还没登录 → 点【开始登录】，真窗口那条最稳')
+          const sc = o.browsers && Array.isArray(o.browsers.shortcuts) ? o.browsers.shortcuts : []
+          if (sc.length) out.push('发现可选浏览器：' + sc.map((s) => s.name).join('、') + ' → 在「浏览器内核」里一键添加')
+          if (o.ok === true) out.push('环境齐全 → 点【刷 1 屏】试跑一条，确认能下载')
+          return out
+        }
+        if (o.ok === false) {
+          return ['这次失败：' + String(o.error || o.reason || '看上面的原始结果') + ' → 按上面第一条修完再试']
+        }
+        return []
+      }
+
+      /* 建议区渲染：没有可说的就不占位置 */
+      const adviceBlock = (raw) => {
+        const items = adviceFor(raw)
+        if (!items.length) return null
+        return h('div', { 'data-dy-advice': '' },
+          h('div', { 'data-dy-h': '' }, '建议'),
+          items.map((t, i) => h('div', { 'data-dy-advice-item': '', key: 'adv-' + i }, '· ' + t)))
       }
 
       /* 只读端点：拿本机逻辑核数，给线程数输入框定上限。旧宿主没有 /sysinfo -> 走降级（1–64），不报错 */
@@ -1367,6 +1409,7 @@ window.__ModuleLoader__.load({
           out === null
             ? h('div', { 'data-dy-note': '' }, '还没跑过 —— 点上面任意一个按钮，这里会贴宿主返回的原始摘要')
             : h('pre', { 'data-dy-out': '' }, out),
+          adviceBlock(out),
           out === null ? null : h('div', { 'data-dy-row': '' },
             h('button', { 'data-dy-btn': '', 'data-primary': '', onClick: copyOut }, '复制结果'),
             h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))),
@@ -1597,6 +1640,7 @@ window.__ModuleLoader__.load({
           out === null
             ? h('div', { 'data-dy-note': '' }, '还没跑过 —— 点上面任意一个按钮，这里会贴宿主返回的原始摘要')
             : h('pre', { 'data-dy-out': '' }, out),
+          adviceBlock(out),
           out === null ? null : h('div', { 'data-dy-row': '' },
             h('button', { 'data-dy-btn': '', 'data-primary': '', onClick: copyOut }, '复制结果'),
             h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))))
