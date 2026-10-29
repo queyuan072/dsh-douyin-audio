@@ -530,14 +530,12 @@ else {
     const evilSiteH = { host: HOST, origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' }
     const sameH = { host: HOST, 'sec-fetch-site': 'same-origin' }    // 设置页真正发的形状
 
-    // a. 无 Origin 无 token 的 POST /run → 403，且动作没执行
+    // a. 既无 Origin 也无 Sec-Fetch-Site → 放行（Electron 桥接/本机进程的形状；
+    //    DSH 设置页就是这么发的，拦了会 403 —— 真实踩过）
     const bareRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, bareH)
-    if (bareRun.status === 403 && bareRun.body && /forbidden: cross-origin or missing token/.test(String(bareRun.body.error || ''))) {
-      ok('POST /run 无 Origin 无 token → 403（' + bareRun.body.error + '）')
-    } else problem('无 Origin 无 token 的 POST /run 没被挡住：' + JSON.stringify(bareRun))
-    if (bareRun.body && bareRun.body.duty === undefined && bareRun.body.todayScreens === undefined) {
-      ok('被挡住的那次没有执行 duty_status（返回体里没有刷屏数据）')
-    } else problem('403 之后动作还是执行了：' + JSON.stringify(bareRun.body))
+    if (bareRun.status === 200 && bareRun.body && bareRun.body.ok === true) {
+      ok('POST /run 不带 Origin / Sec-Fetch-Site → 放行（设置页与桥接通道需要这条路）')
+    } else problem('无跨站证据的 POST /run 被误拦：' + JSON.stringify(bareRun))
 
     // b. 跨站 Origin → 403（没有 Sec-Fetch-Site 也一样）
     const evilRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, evilH)
@@ -546,14 +544,14 @@ else {
     const evilCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, evilSiteH)
     if (evilCfg.status === 403) ok('GET /config 跨站（sec-fetch-site: cross-site）→ 403')
     else problem('跨站还能读配置：' + JSON.stringify(evilCfg))
-    const bareCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, bareH)
-    if (bareCfg.status === 403) ok('GET /config 无 Origin 无 token → 403（原来直接回整个配置）')
-    else problem('GET /config 还是裸的：' + JSON.stringify(bareCfg))
+    const siteCrossCfg = await routeRaw('GET', '/api/douyin-audio/config', undefined, { host: HOST, 'sec-fetch-site': 'same-site' })
+    if (siteCrossCfg.status === 403) ok('GET /config 带 sec-fetch-site: same-site（同域不同端口）→ 403')
+    else problem('same-site 被放过了：' + JSON.stringify(siteCrossCfg))
 
     // c. token 端点本身也过同源门；同源才发 token
-    const bareToken = await routeRaw('GET', '/api/douyin-audio/token', undefined, bareH)
-    if (bareToken.status === 403) ok('GET /token 无同源 → 403（token 端点自己也得过门）')
-    else problem('GET /token 没被挡住：' + JSON.stringify(bareToken))
+    const crossToken = await routeRaw('GET', '/api/douyin-audio/token', undefined, { host: HOST, origin: 'https://evil.example' })
+    if (crossToken.status === 403) ok('GET /token 跨站 Origin → 403（token 端点自己也过门）')
+    else problem('跨站还能取 token：' + JSON.stringify(crossToken))
     const tokRes = await routeRaw('GET', '/api/douyin-audio/token', undefined, sameH)
     const token = tokRes.status === 200 && tokRes.body && typeof tokRes.body.token === 'string' ? tokRes.body.token : ''
     if (/^[0-9a-f]{32}$/.test(token)) ok('GET /token 带 Sec-Fetch-Site: same-origin → 200，token 是 32 hex')
@@ -564,8 +562,9 @@ else {
     if (tokRun.status === 200 && tokRun.body && tokRun.body.ok === true) {
       ok('带正确 x-dsh-douyin-token 的 POST /run → 200 且 duty_status 真的跑了')
     } else problem('带 token 的 POST /run 没执行：' + JSON.stringify(tokRun))
-    const fakeRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' }, { host: HOST, 'x-dsh-douyin-token': 'deadbeefdeadbeef' })
-    if (fakeRun.status === 403) ok('乱写的 token 不顶用（还是 403）')
+    const fakeRun = await routeRaw('POST', '/api/douyin-audio/run', { action: 'duty_status' },
+      { host: HOST, origin: 'https://evil.example', 'x-dsh-douyin-token': 'deadbeefdeadbeef' })
+    if (fakeRun.status === 403) ok('跨站 + 乱写 token → 403（假 token 不顶用）')
     else problem('假 token 也放行了：' + JSON.stringify(fakeRun))
     // ?token=（给 <img> 那种带不了请求头的地方）
     const qsRun = await routeRaw('POST', '/api/douyin-audio/run?token=' + token, { action: 'duty_status' }, { host: HOST })

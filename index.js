@@ -571,14 +571,29 @@ function hostOf(value) {
   try { return new URL(s.includes('://') ? s : 'http://' + s).host.toLowerCase() } catch { return '' }
 }
 
-/** 同源判定：{ ok, via } —— via 只进日志/返回体，方便排查「为什么被拦」 */
+/** 同源判定：{ ok, via } —— via 只进日志/返回体，方便排查「为什么被拦」
+ *  规则是「**只按正面证据拒绝**」，不是「没有证据就拒绝」：
+ *   - 浏览器发出的跨站请求一定会带 Origin / Sec-Fetch-Site，据此拦截；
+ *   - DSH 的界面（Chromium 之外还有桥接通道）可能两个头都不带，那时放行 ——
+ *     否则设置页会 403（实测过）。本机进程同样能伪造这两个头，但那已经超出
+ *     本路由的威胁模型：本机进程本来就能直接改 config.json。 */
 function sameOrigin(req, queryToken) {
   if (authTokenValid(headerOf(req, AUTH_TOKEN_HEADER)) || authTokenValid(queryToken)) return { ok: true, via: 'token' }
   const site = headerOf(req, 'sec-fetch-site').trim().toLowerCase()
-  if (site === 'same-origin') return { ok: true, via: 'sec-fetch-site' }
   const origin = hostOf(headerOf(req, 'origin'))
-  if (origin && origin === hostOf(headerOf(req, 'host'))) return { ok: true, via: 'origin' }
-  return { ok: false, via: null, site: site || null, origin: headerOf(req, 'origin') || null }
+  const self = hostOf(headerOf(req, 'host'))
+  // 有 Sec-Fetch-Site 就只认 same-origin；same-site 也不行（同域不同端口仍是别的页面）
+  if (site) {
+    if (site === 'same-origin') return { ok: true, via: 'sec-fetch-site' }
+    return { ok: false, via: null, site, origin: origin || null }
+  }
+  // 有 Origin 就必须等于本请求的 Host
+  if (origin) {
+    if (origin === self) return { ok: true, via: 'origin' }
+    return { ok: false, via: null, site: null, origin }
+  }
+  // 两个头都没有：不是浏览器页面发起的（curl / Electron 桥接 / 本机进程），放行
+  return { ok: true, via: 'no-cross-site-evidence' }
 }
 
 /** 数值型配置的硬底线（非法直接拒绝，不夹取） */
