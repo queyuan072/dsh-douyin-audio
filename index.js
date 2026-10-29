@@ -794,6 +794,27 @@ function gitPull(pluginDir) {
   })
 }
 
+/** 在 profile 目录跑 npm install <spec>：file: 依赖是「复制」不是软链，源码拉新后副本不会自动变 */
+function npmInstallSpec(profileDir, spec) {
+  return new Promise((resolve) => {
+    let out = ''
+    const push = (b) => { out += String(b); if (out.length > 8000) out = out.slice(-8000) }
+    let child
+    try {
+      child = spawn('npm', ['install', spec, '--no-audit', '--no-fund'], {
+        cwd: profileDir, shell: process.platform === 'win32', windowsHide: true,
+      })
+    } catch (e) {
+      return resolve({ ok: false, output: String((e && e.message) || e) })
+    }
+    const timer = setTimeout(() => { try { child.kill() } catch { /* 已退出 */ } }, 180000)
+    if (child.stdout && child.stdout.on) child.stdout.on('data', push)
+    if (child.stderr && child.stderr.on) child.stderr.on('data', push)
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, output: String((e && e.message) || e) }) })
+    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, output: out.trim() }) })
+  })
+}
+
 /** 执行升级：npm 安装 → npm install；源码链接 → git pull（绝不覆盖、绝不删除） */
 async function applyUpdate(action) {
   const info = pluginInstallInfo()
@@ -811,16 +832,27 @@ async function applyUpdate(action) {
       }
     }
     const r = await gitPull(info.pluginDir)
+    if (!r.ok) {
+      return {
+        ok: false, mode: 'linked', action: 'pull', pluginDir: info.pluginDir, code: r.code, output: r.output,
+        message: 'git pull 没成功（退出码 ' + r.code + '）。可能是本地有改动或没网：\n' + r.output,
+      }
+    }
+    // file: 依赖是复制、不是软链 —— 源码拉新后必须让 profile 重装一次，运行中的副本才会跟上
+    const sync = await npmInstallSpec(info.profileDir, info.spec)
     return {
-      ok: r.ok,
+      ok: true,
       mode: 'linked',
       action: 'pull',
       pluginDir: info.pluginDir,
       code: r.code,
       output: r.output,
-      message: r.ok
-        ? '源码已更新。请重启 DSH 生效。\n' + r.output
-        : 'git pull 没成功（退出码 ' + r.code + '）。可能是本地有改动或没网：\n' + r.output,
+      synced: sync.ok,
+      syncOutput: String(sync.output || '').slice(-1200),
+      message: (sync.ok
+        ? '源码已更新并同步到安装副本。请重启 DSH 生效。'
+        : '源码已更新，但同步到安装副本失败（可手动在 profile 目录跑 npm install）。请重启 DSH。')
+        + '\n' + r.output,
     }
   }
   const dir = stateDir()
