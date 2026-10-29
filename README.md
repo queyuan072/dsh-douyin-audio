@@ -4,7 +4,8 @@
 
 另外提供 7 个**只读**查询工具：`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`（① 只读级），以及 `douyin_notes` / `douyin_messages`（② 通知级，读通知摘要与私信会话列表）。同样用 Playwright 打开抖音网页版读页面。全程只读——不点赞、不关注、不发评论、不发布任何内容，通知/私信这一档额外保证**不发消息、不标记已读**。
 
-- 包名 `dsh-douyin-audio`，当前版本 `1.2.0`（见 `package.json`）
+- 包名 `dsh-douyin-audio`，当前版本 `1.2.3`（见 `package.json`）
+- **一行装好**：`dsh plugin --profile <你的 profile> add dsh-douyin-audio@latest` —— profile 名怎么查、tgz/源码三种装法见第 2 节
 - 运行要求：Node `>=22`、DSH `>=0.1.7-rc.1`（`package.json` 的 `engines`）
 - 插件对 DSH 的注入：`name = 'douyin-audio'`、`inject = ['tools']`（`index.js`）
 
@@ -132,17 +133,34 @@
 
 本包自带挂载声明（`cordis.patch.yml`），装好后 profile 只要在 `dsh.profile.bundles` 里列出包名即生效，**不需要再手改 profile 自己的 `cordis.patch.yml`**。
 
-1. 把包放进 profile 的插件目录（开发期可以直接链本地目录）：
+### 2.1 先确认你的 profile 名
 
-   ```text
-   dsh plugin --profile web add dsh-douyin-audio
-   # 本地开发：
-   dsh plugin --profile web add link:D:\path\to\dsh-douyin
-   ```
+```text
+目录：%USERPROFILE%\.dsh\profiles\<profile>\        # 里面那个唯一的名字就是它
+```
 
-2. 确认 profile 的 `dsh.profile.bundles` 里出现 `dsh-douyin-audio`。
+常见是 `desktop` 或 `web`。**下面命令里的 `<profile>` 都换成你自己的那个**，写错会提示找不到 profile。
 
-3. **重启 DSH。** bundle 层的 patch 只在启动时叠加，只有 profile 自己那一层是热重载的；改完 `bundles` 不重启不会看到工具。
+### 2.2 三选一
+
+```text
+# ① 从 npm 装（推荐给使用者；当前 latest = 1.2.3）
+dsh plugin --profile <profile> add dsh-douyin-audio@latest
+
+# ② 从本地 tgz 装（不联网、不经 npm 源；tgz 见 Release 或作者给的交付包）
+dsh plugin --profile <profile> add "D:\path\to\dsh-douyin-audio-1.2.3.tgz"
+
+# ③ 从源码目录装（开发/改代码即时生效；npm 会把文件复制进 node_modules，不是软链）
+dsh plugin --profile <profile> add link:D:\path\to\dsh-douyin
+```
+
+> ⚠️ 第 ③ 种是**复制**不是软链：改完源码要让运行中的副本跟上，需要重跑一次这条命令（或点设置页的【检查更新】→「拉取最新源码」，它会自动 `git pull` + `npm install` 同步副本）。
+
+### 2.3 装完
+
+1. 确认 profile 的 `dsh.profile.bundles` 里出现 `dsh-douyin-audio`。
+2. **重启 DSH。** bundle 层的 patch 只在启动时叠加，只有 profile 自己那一层是热重载的；改完 `bundles` 不重启不会看到工具。
+3. 打开设置页 → 「大肥鱼刷抖音网页版」，能读到配置就说明挂上了。
 
 装好后的挂载项（`cordis.patch.yml`）：`id: douyin-audio`、`name: dsh-douyin-audio`、`config.enabled: true`。那个 `id` 同时也是配置命名空间名（在 profile 里写 `douyin-audio: { ... }` 就是给本插件配参数）。
 
