@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-抖音视频声音转写工具 (Transcribe Douyin) v1.2.0
+抖音视频声音转写工具 (Transcribe Douyin) v1.3.0
 ==============================================
 把抖音视频的声音转成文本：ffmpeg 转 16kHz 单声道 WAV → sherpa-onnx SenseVoice 本地转写。
 
@@ -16,6 +16,13 @@
   python transcribe_douyin.py --manifest manifest.txt --json
   python transcribe_douyin.py --manifest list.txt --model-dir D:/models/sense-voice
   python transcribe_douyin.py --file clip.mp4 --threads 8 --start 12 --dur 30 --json
+  python transcribe_douyin.py --file clip.mp4 --srt out.srt      # 另存 .srt 字幕
+
+分片与切点（v1.3）：
+  *) 声音按 --chunk 秒（默认 30）分片喂 SenseVoice——整段一次喂会在超窗后**静默丢内容**；
+  *) 切点默认做「静音吸附」：每片多探 2s，在片尾前 10s ~ 片尾后 2s 的能量包络里挑最安静的
+     位置下刀（等价 silencedetect=noise=-35dB:d=0.25，但不额外起 ffmpeg）；找不到静音退回硬切。
+     --no-snap 可关掉，退回固定硬切（对比用）。
 
 退出码: 0 全部成功 / 1 有条目失败 / 2 用法或环境错误
 """
@@ -32,7 +39,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def _default_threads() -> int:
@@ -260,25 +267,110 @@ def load_recognizer(model_dir: str, threads: int = DEFAULT_THREADS):
 
 CHUNK_SEC = 30.0   # 分片长度：SenseVoice 是离线「单句」模型，整段喂进去会在超窗后静默丢内容
 
+# ---- 静音吸附切点 ----------------------------------------------------------
+# 固定 chunk 秒硬切会把词切两半（输出里能看到「…着，。」「…了。。」这类残句）。
+# 做法：每片解码时多探 SNAP_LOOKAHEAD 秒，在 [chunk-SNAP_LEAD_BACK, chunk+SNAP_LOOKAHEAD]
+# （chunk=30 → [20s, 32s]）的能量包络里挑最安静处下刀，找不到静音就退回硬切。
+# **不为吸附单独扫一遍整段音频**：包络直接算在 _decode_once 已经读出来的 samples 上，
+# 所以每片仍然是「一次 ffmpeg + 一次 decode」，长音频不会变慢。
+SNAP_LEAD_BACK = 10.0    # 搜索窗口从片尾前多少秒开始（chunk=30 → 20s）
+SNAP_LOOKAHEAD = 2.0     # 多探多少秒（chunk=30 → 探到 32s）
+SNAP_MIN_CHUNK = 8.0     # 片比这还短就不吸附（窗口会退化成没意义）
+SNAP_FRAME_SEC = 0.02    # 能量包络帧长
+SNAP_SILENCE_DB = -35.0  # 与 ffmpeg silencedetect=noise=-35dB 同一阈值
+SNAP_SILENCE_MIN = 0.25  # 与 d=0.25 同一最短时长
+SNAP_DIP_DB = 6.0        # 全段没有达标静音时，「比本区间中位数低 6dB」算局部低洼
+
+
+def _frame_db(samples, sr: int, lo: float, hi: float):
+    """[lo, hi] 按 SNAP_FRAME_SEC 分帧算 dBFS 包络 → (dB 数组, 帧长秒, 首帧绝对起点秒)"""
+    import numpy as np
+
+    hop = max(1, int(SNAP_FRAME_SEC * sr))
+    a = min(max(0, int(lo * sr)), len(samples))
+    b = min(len(samples), int(hi * sr))
+    if b - a < hop * 2:
+        return np.zeros(0, dtype=np.float32), hop / float(sr), a / float(sr)
+    frames = (b - a) // hop
+    seg = samples[a:a + frames * hop].reshape(frames, hop).astype(np.float32)
+    rms = np.sqrt(np.mean(seg * seg, axis=1) + 1e-12)
+    return 20.0 * np.log10(rms + 1e-9), hop / float(sr), a / float(sr)
+
+
+def _longest_run(mask) -> tuple[int, int] | None:
+    """布尔序列里最长连续 True 段的下标区间 [start, end)；没有就 None。"""
+    best: tuple[int, int] | None = None
+    run_at: int | None = None
+    for i, flag in enumerate(mask):
+        if flag and run_at is None:
+            run_at = i
+        elif not flag and run_at is not None:
+            if best is None or i - run_at > best[1] - best[0]:
+                best = (run_at, i)
+            run_at = None
+    if run_at is not None and (best is None or len(mask) - run_at > best[1] - best[0]):
+        best = (run_at, len(mask))
+    return best
+
+
+def _pick_quiet_cut(samples, sr: int, lo: float, hi: float) -> float | None:
+    """
+    [lo, hi] 里最安静的切点（相对 samples 起点的秒数）；找不到就 None（调用方退回硬切）。
+
+    等价于 silencedetect=noise=-35dB:d=0.25 的判定，但不用再起一次 ffmpeg：
+      ① 先按 -35dBFS 找 >= 0.25s 的静音区间，取最长那段的中点；
+      ② 整段都没达标静音时，放宽成「比本区间中位数低 6dB」的局部低洼（>= 0.15s）；
+      ③ 两条都不满足 → None（硬切）。
+    """
+    import numpy as np
+
+    db, frame_sec, t0 = _frame_db(samples, sr, lo, hi)
+    if db.size == 0:
+        return None
+    run = _longest_run(db < SNAP_SILENCE_DB)
+    if run and (run[1] - run[0]) * frame_sec >= SNAP_SILENCE_MIN:
+        return t0 + (run[0] + run[1]) / 2.0 * frame_sec
+    floor = float(db.min())
+    if float(np.median(db)) - floor >= SNAP_DIP_DB:
+        run = _longest_run(db <= floor + SNAP_DIP_DB)
+        if run and (run[1] - run[0]) * frame_sec >= 0.15:
+            return t0 + (run[0] + run[1]) / 2.0 * frame_sec
+    return None
+
+
 def _decode_once(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
-                 start: float | None = None, dur: float | None = None) -> str:
-    """转一段（或整段）并按需解码一次。"""
+                 start: float | None = None, dur: float | None = None,
+                 snap: tuple[float, float] | None = None) -> tuple[str, float, bool]:
+    """
+    转一段并解码一次 → (文本, 实际消耗时长秒, 是否吸附到静音)。
+
+    snap=(lo, hi)：wav 探到 hi 秒，在 [lo, hi] 里挑最安静处下刀，**只解切点之前的部分**，
+    下一片从切点接着走 —— 既不多起 ffmpeg，也不会丢音。
+    """
     import numpy as np
     import soundfile as sf
 
     wav_path = os.path.join(tmp_root, f"dyt_{uuid.uuid4().hex[:10]}.wav")
     try:
-        to_wav(ffmpeg, media_path, wav_path, start=start, dur=dur)
+        to_wav(ffmpeg, media_path, wav_path, start=start,
+               dur=(snap[1] if snap else dur))
         samples, sr = sf.read(wav_path, dtype="float32", always_2d=False)
         if sr != 16000:
             raise RuntimeError(f"采样率不是 16k: {sr}")
         if getattr(samples, "ndim", 1) > 1:  # 双声道兜底
             samples = samples.mean(axis=1)
         samples = np.ascontiguousarray(samples, dtype=np.float32)
+        used, snapped = len(samples) / float(sr), False
+        if snap and dur:
+            cut = _pick_quiet_cut(samples, sr, snap[0], min(snap[1], used))
+            if cut is not None:
+                cut = min(max(cut, dur * 0.5), used)  # 别切到片长一半之前，也别超出已解出的音频
+                samples = samples[: int(cut * sr)]
+                used, snapped = len(samples) / float(sr), True
         stream = recognizer.create_stream()
         stream.accept_waveform(sample_rate=16000, waveform=samples)
         recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+        return stream.result.text.strip(), used, snapped
     finally:
         try:
             os.remove(wav_path)
@@ -288,36 +380,93 @@ def _decode_once(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
 
 def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
                      start: float | None = None, dur: float | None = None,
-                     chunk: float = CHUNK_SEC) -> str:
+                     chunk: float = CHUNK_SEC, segments_out: list | None = None,
+                     snap: bool = True) -> str:
     """
     媒体文件 → 转写文本。
 
     ⚠️ 必须分片：SenseVoice 把几十分钟音频整段塞进一次 decode_stream，超出模型窗口后
     会**静默丢弃**后面的内容（退出码照样 0）。实测同一段 120s 音频：整段解码只出 37 字，
     30s 分片出 177 字，且分片更快（3s vs 8s）。这里按 chunk 切片逐段解码再拼接。
+
+    分段：给了 segments_out(list) 就把每片的 {"start","dur","text"} append 进去
+    （start 相对媒体起点，秒）。不传时返回值/行为与从前完全一致 —— 仍是 str。
+    snap=False 关掉静音吸附，退回固定 chunk 秒硬切。
     """
     total = dur if dur is not None else probe_duration(ffmpeg, media_path)
     base = float(start or 0.0)
+    segs: list = [] if segments_out is None else segments_out
     if not total or total <= chunk * 1.5:
-        return _decode_once(recognizer, ffmpeg, media_path, tmp_root, start=start, dur=dur)
+        text, used, _ = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
+                                     start=start, dur=dur)
+        if text:
+            segs.append({"start": round(base, 3), "dur": round(used, 3), "text": text})
+        return text
 
     end = base + float(total)
     parts: list[str] = []
+    lookahead = SNAP_LOOKAHEAD if (snap and chunk >= SNAP_MIN_CHUNK) else 0.0
+    lead_back = min(SNAP_LEAD_BACK, chunk * 0.5)  # 片很短时窗口别倒到片头之前
     idx = 0
     t = base
     while t < end - 0.2:
         idx += 1
-        d = min(chunk, end - t)
+        nominal = min(chunk, end - t)
+        win = None
+        # 只有「后面还有不止一片」时才值得吸附：最后一片本来就到结尾了
+        if lookahead and (end - t) > chunk + 0.2:
+            win = (max(0.0, chunk - lead_back), chunk + lookahead)
         try:
-            piece = _decode_once(recognizer, ffmpeg, media_path, tmp_root, start=t, dur=d)
+            piece, used, snapped = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
+                                                start=t, dur=nominal, snap=win)
         except Exception as exc:  # 单片失败不该毁掉整段
-            eprint(f"      片 {idx} 失败（{t:.0f}s +{d:.0f}s）: {one_line(str(exc), 120)}")
-            piece = ""
+            eprint(f"      片 {idx} 失败（{t:.0f}s +{nominal:.0f}s）: {one_line(str(exc), 120)}")
+            piece, used, snapped = "", nominal, False
+        if used <= 0.05:  # 解出空音频也要往前走，否则死循环
+            used = nominal
         if piece:
             parts.append(piece)
-        eprint(f"      片 {idx}: {t:.0f}s +{d:.0f}s → {len(piece)} 字")
-        t += d
+            segs.append({"start": round(t, 3), "dur": round(used, 3), "text": piece})
+        eprint(f"      片 {idx}: {t:.1f}s +{used:.1f}s"
+               f"（{'静音吸附' if snapped else '硬切'}，名义 {nominal:.1f}s）→ {len(piece)} 字")
+        t += used
     return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------
+# 分段 → .srt
+# --------------------------------------------------------------------------
+def _fmt_ts(sec: float) -> str:
+    """秒 → srt 时间戳 HH:MM:SS,mmm"""
+    ms = int(round(max(0.0, float(sec)) * 1000))
+    hh, ms = divmod(ms, 3600000)
+    mm, ms = divmod(ms, 60000)
+    ss, ms = divmod(ms, 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
+def write_srt(path: str, segments: list) -> int:
+    """分段落 → 标准 .srt（序号 / HH:MM:SS,mmm --> HH:MM:SS,mmm / 文本）。返回写了多少条。"""
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    blocks: list[str] = []
+    for seg in segments or []:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        begin = float(seg.get("start") or 0.0)
+        span = max(0.001, float(seg.get("dur") or 0.0))
+        blocks.append(f"{len(blocks) + 1}\n{_fmt_ts(begin)} --> {_fmt_ts(begin + span)}\n{text}\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(blocks))
+    return len(blocks)
+
+
+def _srt_for(path: str, index: int) -> str:
+    """多个条目共用一次 --srt 时，按条目序号插到扩展名前（a.srt → a.1.srt）。"""
+    root, ext = os.path.splitext(path)
+    return f"{root}.{index}{ext or '.srt'}"
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +601,10 @@ def run(argv: list[str] | None = None) -> int:
                     help="把结果以 JSON 打到 stdout: {ok, threads, items:[{source,text,error,duration}], model, elapsed}")
     ap.add_argument("--chunk", dest="chunk", type=float, default=CHUNK_SEC, metavar="SEC",
                     help=f"分片长度（秒，默认 {CHUNK_SEC:g}）；0 = 不分片、整段一次解码（旧行为，长音频会静默丢内容）")
+    ap.add_argument("--srt", dest="srt", default=None, metavar="PATH",
+                    help="把分段落另存为标准 .srt 字幕（相对/绝对路径都行；多个条目时写成 PATH.1.srt 这种带序号的）")
+    ap.add_argument("--no-snap", dest="no_snap", action="store_true",
+                    help="关掉静音吸附，切点退回固定 chunk 秒硬切（对比用，正常不用给）")
     ap.add_argument("--threads", dest="threads", type=int, default=DEFAULT_THREADS, metavar="N",
                     help=f"本地转写线程数（默认取环境变量 DOUYIN_ASR_THREADS，再默认 {DEFAULT_THREADS}）")
     ap.add_argument("--start", dest="start", type=float, default=None, metavar="SEC",
@@ -543,7 +696,8 @@ def run(argv: list[str] | None = None) -> int:
     for idx, it in enumerate(items, 1):
         label = _label(it)
         eprint(f"[{idx}/{len(items)}] {label}")
-        entry = {"source": it["source"], "text": "", "error": None, "duration": None}
+        entry = {"source": it["source"], "text": "", "error": None, "duration": None,
+                 "segments": []}
         if it["local"] and os.path.exists(it["local"]):  # 本地文件当场量时长：模型不可用时也能报
             entry["duration"] = probe_duration(ffmpeg, it["local"])
         if model_error:
@@ -571,7 +725,9 @@ def run(argv: list[str] | None = None) -> int:
                 chunk = max(0.0, float(getattr(args, "chunk", CHUNK_SEC) or 0.0))
                 entry["text"] = transcribe_media(recognizer, ffmpeg, media, tmp_root,
                                                 start=args.start, dur=args.dur,
-                                                chunk=(chunk if chunk > 0 else 10 ** 9))
+                                                chunk=(chunk if chunk > 0 else 10 ** 9),
+                                                segments_out=entry["segments"],
+                                                snap=not getattr(args, "no_snap", False))
             finally:
                 if downloaded:
                     try:
@@ -584,6 +740,15 @@ def run(argv: list[str] | None = None) -> int:
             entry["error"] = one_line(f"{type(exc).__name__}: {exc}", 400)
             failing += 1
             eprint(f"      → 转写失败: {entry['error']}")
+        if args.srt:
+            if entry["segments"]:
+                srt_path = args.srt if len(items) == 1 else _srt_for(args.srt, idx)
+                try:
+                    eprint(f"      [srt] {write_srt(srt_path, entry['segments'])} 条 → {srt_path}")
+                except Exception as exc:  # 字幕写不出来不该把已经转好的文本算失败
+                    eprint(f"      [srt] 写失败: {type(exc).__name__}: {exc}")
+            else:
+                eprint("      [srt] 这条没有分段文本，跳过")
         result["items"].append(entry)
         title = it.get("title") or os.path.basename(it["source"]).rsplit(".", 1)[0]
         screen = it.get("screen") or "-"
