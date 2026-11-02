@@ -258,13 +258,11 @@ def load_recognizer(model_dir: str, threads: int = DEFAULT_THREADS):
         raise RuntimeError(f"SenseVoice 初始化失败: {type(exc).__name__}: {exc}") from None
 
 
-def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
-                     start: float | None = None, dur: float | None = None) -> str:
-    """
-    媒体文件 → 转写文本。
-    wav 直接落在 tmp_root 下、用唯一文件名，**不新建子目录**：
-    某些沙箱只允许写「子进程启动前就存在」的目录，运行时 mkdtemp 出来的子目录会被拒。
-    """
+CHUNK_SEC = 30.0   # 分片长度：SenseVoice 是离线「单句」模型，整段喂进去会在超窗后静默丢内容
+
+def _decode_once(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
+                 start: float | None = None, dur: float | None = None) -> str:
+    """转一段（或整段）并按需解码一次。"""
     import numpy as np
     import soundfile as sf
 
@@ -286,6 +284,40 @@ def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
             os.remove(wav_path)
         except OSError:
             pass
+
+
+def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
+                     start: float | None = None, dur: float | None = None,
+                     chunk: float = CHUNK_SEC) -> str:
+    """
+    媒体文件 → 转写文本。
+
+    ⚠️ 必须分片：SenseVoice 把几十分钟音频整段塞进一次 decode_stream，超出模型窗口后
+    会**静默丢弃**后面的内容（退出码照样 0）。实测同一段 120s 音频：整段解码只出 37 字，
+    30s 分片出 177 字，且分片更快（3s vs 8s）。这里按 chunk 切片逐段解码再拼接。
+    """
+    total = dur if dur is not None else probe_duration(ffmpeg, media_path)
+    base = float(start or 0.0)
+    if not total or total <= chunk * 1.5:
+        return _decode_once(recognizer, ffmpeg, media_path, tmp_root, start=start, dur=dur)
+
+    end = base + float(total)
+    parts: list[str] = []
+    idx = 0
+    t = base
+    while t < end - 0.2:
+        idx += 1
+        d = min(chunk, end - t)
+        try:
+            piece = _decode_once(recognizer, ffmpeg, media_path, tmp_root, start=t, dur=d)
+        except Exception as exc:  # 单片失败不该毁掉整段
+            eprint(f"      片 {idx} 失败（{t:.0f}s +{d:.0f}s）: {one_line(str(exc), 120)}")
+            piece = ""
+        if piece:
+            parts.append(piece)
+        eprint(f"      片 {idx}: {t:.0f}s +{d:.0f}s → {len(piece)} 字")
+        t += d
+    return "\n".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -418,6 +450,8 @@ def run(argv: list[str] | None = None) -> int:
                     help="把文本结果写到这个文件（不给就打到 stdout）")
     ap.add_argument("--json", dest="as_json", action="store_true",
                     help="把结果以 JSON 打到 stdout: {ok, threads, items:[{source,text,error,duration}], model, elapsed}")
+    ap.add_argument("--chunk", dest="chunk", type=float, default=CHUNK_SEC, metavar="SEC",
+                    help=f"分片长度（秒，默认 {CHUNK_SEC:g}）；0 = 不分片、整段一次解码（旧行为，长音频会静默丢内容）")
     ap.add_argument("--threads", dest="threads", type=int, default=DEFAULT_THREADS, metavar="N",
                     help=f"本地转写线程数（默认取环境变量 DOUYIN_ASR_THREADS，再默认 {DEFAULT_THREADS}）")
     ap.add_argument("--start", dest="start", type=float, default=None, metavar="SEC",
@@ -534,8 +568,10 @@ def run(argv: list[str] | None = None) -> int:
             try:
                 if entry["duration"] is None:  # 下载来的媒体只能到这一步才量
                     entry["duration"] = probe_duration(ffmpeg, media)
+                chunk = max(0.0, float(getattr(args, "chunk", CHUNK_SEC) or 0.0))
                 entry["text"] = transcribe_media(recognizer, ffmpeg, media, tmp_root,
-                                                start=args.start, dur=args.dur)
+                                                start=args.start, dur=args.dur,
+                                                chunk=(chunk if chunk > 0 else 10 ** 9))
             finally:
                 if downloaded:
                     try:
