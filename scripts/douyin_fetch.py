@@ -534,6 +534,46 @@ def _download_media_candidates(cands: list[str], work_dir: str, ds,
     raise FetchError("浏览器兜底", f"拦到 {len(cands)} 条候选直链但都下载失败")
 
 
+_DOUYIN_TITLE_SUFFIX_RE = re.compile(r"\s*[-–—|]\s*抖音$")
+
+
+def _page_meta(page) -> dict:
+    """页面里取标题/作者：og:title → h1 → document.title（去掉「 - 抖音」后缀）；
+    作者沿用 douyin_read.py 视频详情同一套判据（[data-e2e="video-detail"] 内第一个非空
+    a[href*="/user/"]，退而 [class*="author"]），只认显式作者节点。取不到就是空串 —— 绝不编。"""
+    info: dict = {}
+    with contextlib.suppress(Exception):
+        info = page.evaluate(
+            "() => {"
+            "  const m = (sel) => { const e = document.querySelector(sel);"
+            "    return e ? String(e.content || e.textContent || '').trim() : ''; };"
+            "  const detail = document.querySelector('[data-e2e=\"video-detail\"]');"
+            "  let author = '';"
+            "  if (detail) {"
+            "    for (const a of detail.querySelectorAll('a[href*=\"/user/\"]')) {"
+            "      const t = String(a.textContent || '').trim().replace(/\\s+/g, ' ');"
+            "      if (t && t.length <= 40 && t !== '我的') { author = t; break; }"
+            "    }"
+            "    if (!author) {"
+            "      const e = detail.querySelector('[class*=\"author\"]');"
+            "      if (e) author = String(e.textContent || '').trim();"
+            "    }"
+            "  }"
+            "  if (!author) author = m('[data-e2e=\"video-author\"]') || m('[data-e2e=\"video-author-name\"]')"
+            "    || m('meta[property=\"og:author\"]') || m('meta[name=\"author\"]');"
+            "  return {"
+            "    og: m('meta[property=\"og:title\"]') || m('meta[name=\"og:title\"]'),"
+            "    h1: m('h1'),"
+            "    doc: String(document.title || ''),"
+            "    author: author,"
+            "  };"
+            "}") or {}
+    title = " ".join(str(info.get("og") or info.get("h1") or "").split())
+    if not title:
+        title = _DOUYIN_TITLE_SUFFIX_RE.sub("", " ".join(str(info.get("doc") or "").split())).strip()
+    return {"title": title, "author": " ".join(str(info.get("author") or "").split())}
+
+
 def _no_media_reason(page_url: str, page, dr) -> str:
     """没拦到媒体流时把原因说清：图文页 / 验证墙 / 登录墙 / 作品不可用 / 真没流"""
     with contextlib.suppress(Exception):
@@ -559,8 +599,8 @@ def _no_media_reason(page_url: str, page, dr) -> str:
 def resolve_media_by_browser(page_url: str, cookies: str | None, headless: bool,
                              window_offscreen: bool, channel: str, wait_sec: float,
                              timeout: int, work_dir: str,
-                             ffmpeg: str | None) -> tuple[str, str]:
-    """打开抖音页面拦媒体直链并下载带音轨的那条。返回 (本地媒体, 命中直链)；
+                             ffmpeg: str | None) -> tuple[str, str, dict]:
+    """打开抖音页面拦媒体直链并下载带音轨的那条。返回 (本地媒体, 命中直链, {title,author})；
     失败一律抛 FetchError('浏览器兜底', <人话>) —— 登录墙/验证墙/无流/无音轨各有各的说法。"""
     if NOTE_PAGE_RE.search(urllib.parse.urlsplit(page_url).path or page_url):
         raise FetchError("浏览器兜底", "图文页没有音轨，无法转写")  # /note/ 页本就没有音轨，别白开窗口
@@ -622,7 +662,9 @@ def resolve_media_by_browser(page_url: str, cookies: str | None, headless: bool,
             td.eprint(f"[浏览器] 候选直链 {len(cands)} 条，先试音轨嫌疑大的")
             path, media_url = _download_media_candidates(cands, work_dir, ds, timeout)
             td.eprint(f"[浏览器] 已下载含音轨的流 -> {os.path.basename(path)}")
-            return path, media_url
+            meta = _page_meta(page)  # 关页面之前取：标题/作者只有页面里才有
+            td.eprint(f"[浏览器] 页面标题={meta['title'] or '(空)'} 作者={meta['author'] or '(空)'}")
+            return path, media_url, meta
         finally:
             for obj in (page, context):
                 if obj is not None:
@@ -852,7 +894,7 @@ def run(argv: list[str] | None = None) -> int:
                     return fail("；".join(errors) or "拿不到音频")
                 td.eprint("[兜底] yt-dlp 没拿到音轨，改用浏览器打开页面拦媒体直链")
                 try:
-                    media_path, media_url = resolve_media_by_browser(
+                    media_path, media_url, page_meta = resolve_media_by_browser(
                         final_url, cookies, not args.window_offscreen, args.window_offscreen,
                         args.browser_channel, args.browser_wait, args.timeout,
                         work_dir, td.resolve_tool(args.ffmpeg, "ffmpeg"))
@@ -861,6 +903,10 @@ def run(argv: list[str] | None = None) -> int:
                     return fail("；".join(errors))
                 result["resolvedBy"] = "browser"
                 result["mediaUrl"] = desensitize_media_url(media_url)
+                if page_meta.get("title"):
+                    result["title"] = page_meta["title"]
+                if page_meta.get("author"):
+                    result["author"] = page_meta["author"]
                 td.eprint(f"[兜底] 命中直链 {result['mediaUrl']}")
 
         ffmpeg = td.resolve_tool(args.ffmpeg, "ffmpeg")

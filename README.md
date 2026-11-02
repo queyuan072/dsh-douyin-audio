@@ -4,7 +4,7 @@
 
 另外提供 8 个**只读**查询工具：`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note` / `douyin_fetch`（① 只读级；`douyin_fetch` 是「给链接精准要文字」：字幕优先，没字幕才回退本地转写），以及 `douyin_notes` / `douyin_messages`（② 通知级，读通知摘要与私信会话列表）。同样用 Playwright 打开抖音网页版读页面。全程只读——不点赞、不关注、不发评论、不发布任何内容，通知/私信这一档额外保证**不发消息、不标记已读**。
 
-- 包名 `dsh-douyin-audio`，当前版本 `1.3.0`（见 `package.json`）
+- 包名 `dsh-douyin-audio`，当前版本 `1.4.0`（见 `package.json`）
 - **一行装好**：`dsh plugin --profile <你的 profile> add dsh-douyin-audio@latest` —— profile 名怎么查、tgz/源码三种装法见第 2 节
 - 运行要求：Node `>=22`、DSH `>=0.1.7-rc.1`（`package.json` 的 `engines`）
 - 插件对 DSH 的注入：`name = 'douyin-audio'`、`inject = ['tools']`（`index.js`）
