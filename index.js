@@ -1728,7 +1728,7 @@ export function apply(ctx, config = {}) {
   // ── 3. 自检 ───────────────────────────────────────────────
   tool({
     name: 'douyin_status',
-    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。selftest=true 时额外跑一次选择器体检（4 个页面，会真开浏览器），结果放 selectors：{ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?}]}，verdict=ok/missing/unknown。',
+    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。selftest=true 时额外跑一次选择器体检（4 个页面，会真开浏览器），结果放 selectors：{ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?,notFound?}]}，verdict=ok/missing/notfound/unknown（notfound=落地是抖音 404 页「页面不见啦」，地址不存在或已变，不是选择器失效；missing 才是地址对但候选选择器全 0）。',
     parameters: {
       scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' },
       selftest: { type: 'boolean', description: 'true = 额外跑一次选择器体检（热榜/推荐/通知/私信 4 个页面），结果放 selectors 字段；默认 false（一个页面都不开）' },

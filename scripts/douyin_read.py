@@ -35,15 +35,17 @@ items 结构:
                 type: 点赞 / 评论 / @我的 / 关注 / 私信 / 其他（按动作句归类，认不出就是「其他」，不猜）
     messages -> {user, lastText, time, unread}   unread 是整数（"99+" 记 99，读不到记 0）
 
-    selftest -> {name, label, url, selectors: [{sel, count}], verdict, hits, title?, reason?}
-                verdict: ok（该页关键候选组至少命中一个）/ missing（候选组全 0，DOM 可能已变）/
+    selftest -> {name, label, url, selectors: [{sel, count}], verdict, hits, title?,
+                 reason?, notFound?}
+                verdict: ok（该页关键候选组至少命中一个）/
+                         missing（候选组全 0，DOM 可能已变 —— 地址对、选择器失效）/
+                         notfound（候选组全 0 且落地是抖音 404 页「页面不见啦」——
+                                   地址不存在/已变，**不是**选择器失效；items 里另带 notFound:true）/
                          unknown（页面打不开 / 被验证墙拦 / 需要登录态，reason 说原因）
-                        有一个例外：候选组全 0 但页面是抖音的 404 页（正文含「页面不见啦」）时，
-                        仍判 missing 并附 reason —— 那是 URL 变了，不是选择器失效
                 selectors 逐条列出候选选择器在该页的命中数 —— 用来回答「今天真没内容，还是选择器失效了」
 
 退出码: 0 = 成功; 2 = 失败（含无法启动浏览器、选择器全部未命中、被验证页拦截）
-  selftest 例外：verdict=missing 是**体检结论**不是失败，照样 ok:true / exit 0（只有起不了浏览器才 2）
+  selftest 例外：verdict=missing / notfound 是**体检结论**不是失败，照样 ok:true / exit 0（只有起不了浏览器才 2）
 
 已知限制（真机实测）:
   * search 子命令在多数环境下会被抖音"验证码中间页"拦死（页面标题=验证码中间页、正文只剩几个字）。
@@ -77,10 +79,20 @@ except Exception:
     pass
 
 DOUYIN_HOST = "https://www.douyin.com"
-# ② 通知（只读）：通知摘要页 / 私信会话列表页。两个页面都要求登录态；
-# 真机路径未在本仓库验证过，路径变了用 --url 覆盖（见 cmd_notes / cmd_messages）。
+# ② 通知（只读）：通知摘要页 / 私信会话列表页。两个页面都要求登录态。
+# 真机实测（本机 Edge + 有效 cookie，登录态正常）：
+#   私信 —— /chat 是真页面：[data-e2e="conversation-item"] 命中 3（会话列表可见）；
+#           /messages、/message、/im、/msg 都是「页面不见啦」404 页。
+#   通知 —— **Web 端没有独立页面**：/notification、/notifications、/notice、/notice/list、
+#           /notification/list、/notification-center、/noticeCenter、/message-center、
+#           /inbox、/interaction、/msg、/notify、/chat/notice 等 20+ 个候选全部 404
+#           （或落到 error-page）。页面右上角导航岛里的「通知」点开是**页内弹层**
+#           （[data-e2e="listDlgTest-container"] + 接口 /aweme/v1/web/notice/），URL 不变。
+#           所以这里保留历史值、不瞎猜一个能打开的地址；selftest 会把它判成
+#           verdict=notfound（地址不存在，不是选择器失效），一眼能分清是哪种坏。
+# 路径哪天变了，用 --url 覆盖即可（见 cmd_notes / cmd_messages）。
 DOUYIN_NOTES_URL = DOUYIN_HOST + "/notifications"
-DOUYIN_MESSAGES_URL = DOUYIN_HOST + "/messages"
+DOUYIN_MESSAGES_URL = DOUYIN_HOST + "/chat"
 _DEFAULT_COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "cookies", "douyin_cookies.txt")
 
 # 页面跳转只允许抖音自己的域名（防 SSRF：douyin_video --url http://127.0.0.1:8080/
@@ -1292,6 +1304,10 @@ def _items_or_fail(data, step, what, page):
     items = data.get("items") or []
     if items:
         return items
+    # 先排除「地址根本不存在」：那种情况下改选择器是白费功夫，报错必须直说
+    not_found = _page_not_found(page)
+    if not_found:
+        raise StepError(step, "{} 读不到：{}".format(what, not_found))
     hint = _login_wall_hint(page)
     base = "{} 选择器全部未命中（抖音 DOM 可能已变）".format(what)
     raise StepError(step, base + ("；" + hint if hint else ""))
@@ -1821,6 +1837,10 @@ def cmd_notes(page, args):
         verify_msg = _verify_message(page)
         if verify_msg:
             raise StepError("notes", verify_msg)
+        not_found = _page_not_found(page)   # 404 页：地址就不对，别让用户去改选择器
+        if not_found and row_count == 0:
+            raise StepError("notes", "通知列表读不到：{}；Web 端目前没有独立的通知页"
+                                     "（导航岛里的「通知」是页内弹层，不是 URL）".format(not_found))
         hint = _login_wall_hint(page)
         if row_count > 0:
             raise StepError("notes", "命中 {} 个通知节点但内容为空（可能未登录或列表未渲染）{}"
@@ -1855,6 +1875,9 @@ def cmd_messages(page, args):
         verify_msg = _verify_message(page)
         if verify_msg:
             raise StepError("messages", verify_msg)
+        not_found = _page_not_found(page)
+        if not_found and row_count == 0:
+            raise StepError("messages", "私信列表读不到：{}".format(not_found))
         hint = _login_wall_hint(page)
         if row_count > 0:
             raise StepError("messages", "命中 {} 个会话节点但内容为空（可能未登录或列表未渲染）{}"
@@ -1884,7 +1907,9 @@ def cmd_messages(page, args):
 SELFTEST_RECOMMEND = list(VIDEO_LIKE) + list(VIDEO_COMMENT) + list(VIDEO_SHARE)
 SELFTEST_PAGES = (
     ("hot", "热榜", DOUYIN_HOST + "/hot", HOT_ROWS, False),
-    ("recommend", "推荐", DOUYIN_HOST + "/", SELFTEST_RECOMMEND, False),
+    # 推荐组用 /friend：实测 / 会 302 到 /jingxuan（抖音精选落地页，没有播放器按钮），
+    # 只有 /friend 是真信息流（video-player-digg / feed-comment-icon / video-player-share 各命中 1）
+    ("recommend", "推荐", DOUYIN_HOST + "/friend", SELFTEST_RECOMMEND, True),
     ("notes", "通知", DOUYIN_NOTES_URL, NOTES_ROWS, True),
     ("messages", "私信", DOUYIN_MESSAGES_URL, MESSAGES_ROWS, True),
 )
@@ -1901,8 +1926,9 @@ SELFTEST_BODY = r"""
 """
 
 
-# 真机实测（本仓库当前版本）：路径不对时抖音渲染的是「页面不见啦 回首页看看」的 404 页。
-# 这种情况下候选组全 0 是**URL 变了**、不是 DOM 变了 —— 结论必须把这句话带出来，否则会被误读成选择器失效。
+# 真机实测（本仓库当前版本）：路径不对时抖音渲染的是「页面不见啦 回首页看看」的 404 页
+# （正文 159 字、无重定向）。候选组全 0 但落地是 404 页 = **URL 不存在**，不是 DOM 变了：
+# 必须单独判一个 verdict（notfound），否则会被误读成「选择器失效、去改选择器」。
 _NOT_FOUND_MARKERS = ("页面不见啦",)
 
 
@@ -1972,13 +1998,17 @@ def cmd_selftest(page, args):
             entry["verdict"] = "ok"
         else:
             hint = _login_wall_hint(page)   # 全 0 + 页面上有登录墙 = 不是 DOM 变了，是没登录
-            entry["verdict"] = "unknown" if hint else "missing"
+            not_found = None if hint else _page_not_found(page)   # 全 0 + 404 页 = 地址不存在
             if hint:
+                entry["verdict"] = "unknown"
                 entry["reason"] = hint
+            elif not_found:
+                # 三种「全 0」必须能分开：notfound=地址错了 / missing=地址对但 DOM 变了 / unknown=没打开
+                entry["verdict"] = "notfound"
+                entry["notFound"] = True
+                entry["reason"] = not_found
             else:
-                not_found = _page_not_found(page)   # 全 0 + 是 404 页 = URL 变了，也不是选择器失效
-                if not_found:
-                    entry["reason"] = not_found
+                entry["verdict"] = "missing"
         log("体检 {}（{}）: {} 命中 {}（页面标题={}）".format(
             name, label, entry["verdict"], hits, entry["title"] or "空"))
         items.append(entry)
@@ -2177,8 +2207,9 @@ def parse_args(argv=None):
     sub.add_parser("selftest", parents=[common],
                    help="选择器体检：热榜/推荐/通知/私信四个页面各数一遍关键选择器的命中数",
                    description="依次打开热榜 / 推荐 / 通知 / 私信四个页面，报告每页关键选择器候选组的命中数。"
-                               "关键候选组全 0 记 missing，页面打不开或被验证墙拦记 unknown 并附原因；"
-                               "missing 不改退出码（体检如实报告，不当失败）。")
+                               "关键候选组全 0 记 missing；全 0 且落地是抖音 404 页（「页面不见啦」）"
+                               "记 notfound（地址不存在/已变，不是选择器失效）；页面打不开或被验证墙拦记 "
+                               "unknown 并附原因。missing / notfound 都不改退出码（体检如实报告，不当失败）。")
 
     args = ap.parse_args(argv)
     if getattr(args, "limit", None) is not None:
