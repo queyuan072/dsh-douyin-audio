@@ -9,7 +9,11 @@
   1) 字幕：yt-dlp --write-subs --write-auto-subs --sub-langs 'zh.*,zh-Hans,en.*' --skip-download
      → 解析 .vtt / .srt → segments + text，source="subtitle"；**不下载音轨、不跑 ASR**。
   2) 无字幕：yt-dlp 取音轨 → 复用 transcribe_douyin 的分片 + 静音吸附管线 → source="asr"。
-  3) 两条都不通（无 yt-dlp / 网络失败 / 私密视频）→ ok=false，reason 写清是哪一步失败。
+  3) 抖音页面级链接兜底：yt-dlp 报 "Fresh cookies (not necessarily logged in) are needed"
+     （抖音要 a_bogus 类签名）时，用 Playwright 打开该页、拦 douyinvod.com / aweme/v1/play 媒体直链，
+     下载含音轨的那条再走 2) 的分片+静音吸附管线；source 仍是 "asr"，另带 resolvedBy="browser"
+     与脱敏后的 mediaUrl（只留域名+路径）。--no-browser 可关掉这条兜底。
+  4) 三条都不通（无 yt-dlp / 网络失败 / 私密视频 / 验证墙）→ ok=false，reason 写清是哪一步失败。
 
 分段、静音吸附、写 .srt、外部程序探测都直接 import transcribe_douyin 里的实现，不复制一份。
 
@@ -19,11 +23,13 @@
   python scripts/douyin_fetch.py --url <URL> --no-asr            # 只许字幕，没字幕就失败
   python scripts/douyin_fetch.py --url <URL> --no-subtitle       # 跳过字幕，直接下载音轨跑 ASR
   python scripts/douyin_fetch.py --file clip.mp4 --no-asr        # 本地文件 + 同名 .vtt/.srt（测试用）
+  python scripts/douyin_fetch.py --url <抖音页面> --window-offscreen   # headless 被风控拦时用可见离屏窗口
 
 stdout 只输出一个 JSON 对象（进度一律走 stderr），字段：
   {"ok","url","finalUrl","title","author","duration","source","subtitleLang",
    "text","textLength","truncated","segments","reason","elapsed"}
   · textLength = --max-chars 截断前的原长；truncated = 是否截断（segments 始终保持完整时间轴）
+  · 只有「抖音页面 → 浏览器兜底」这条路会多出 resolvedBy="browser" 与 mediaUrl（已脱敏）
 退出码: ok=true → 0；ok=false → 2（沿用本项目其它脚本的约定）
 """
 from __future__ import annotations
@@ -45,13 +51,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import transcribe_douyin as td  # noqa: E402  —— 分片/静音吸附/写 srt/工具探测都复用它
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # 字幕语言优先级：中文优先，英文兜底（抖音自身字幕偶尔是 en 自动生成）
 SUB_LANGS = "zh.*,zh-Hans,en.*"
 SHORT_HOSTS = ("v.douyin.com",)
 SHORT_URL_TIMEOUT = 15.0
 META_TEMPLATE = "%(title)s|%(uploader)s|%(duration)s"
+# 浏览器兜底（见文件头 3)）：只对抖音自己的页面生效
+DOUYIN_PAGE_HOSTS = ("douyin.com", "v.douyin.com")
+BROWSER_CHANNELS = ("msedge", "chrome", "chromium", "firefox", "webkit")
+# DASH 分离流里音轨的 URL 特征（用来越靠前越先试）
+_AUDIO_HINTS = ("media-audio", "audio_mp4", "mime_type=audio")
+NOTE_PAGE_RE = re.compile(r"/note/", re.I)
 
 _TS = r"(?:\d{1,3}:)?\d{1,2}:\d{2}[.,]\d{1,3}"
 _CUE_RE = re.compile(r"^\s*(" + _TS + r")\s*-->\s*(" + _TS + r")")
@@ -435,6 +447,195 @@ def run_asr(media_path: str, model_dir: str, threads: int, chunk: float,
 
 
 # --------------------------------------------------------------------------
+# 抖音页面 → 直链：浏览器兜底（yt-dlp 拿不到 a_bogus 签名时走这条）
+#   拦截/下载/音轨探测全部复用 douyin_scroller.py 里真机验证过的实现，
+#   cookie 记录复用 douyin_read.py 的 _cookie_records（netscape → add_cookies）
+# --------------------------------------------------------------------------
+def _scroller():
+    """延迟导入：只有走兜底才需要 playwright，外站/本地文件不该被它拖累"""
+    import douyin_scroller as ds
+    return ds
+
+
+def is_douyin_page_url(url: str) -> bool:
+    """host 是否属于抖音（后缀判据，解析不出来就当不是）"""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in DOUYIN_PAGE_HOSTS)
+
+
+def desensitize_media_url(url: str) -> str:
+    """直链脱敏：只留 scheme://host/路径；查询串里是签名与过期时间，一律不外传"""
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+    except Exception:
+        return ""
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _browser_args(headless: bool, window_offscreen: bool) -> list[str]:
+    """启动参数：沿用 douyin_scroller / douyin_read 里真机验证过的两组开关"""
+    if headless:
+        return ["--autoplay-policy=no-user-gesture-required"]
+    if window_offscreen:
+        # 真机实测：headless 开抖音容易吃验证码，可见窗口移到屏幕外能过风控
+        return ["--window-position=-3000,-3000", "--window-size=1200,900"]
+    return []
+
+
+def _kick_player(page) -> None:
+    """催一下 <video>：不播就不发媒体请求，response 里就拦不到直链（muted 才允许自动播）"""
+    with contextlib.suppress(Exception):
+        page.evaluate("() => { const v = document.querySelector('video');"
+                      " if (!v) return 'no-video'; v.muted = true;"
+                      " const p = v.play(); if (p && p.catch) p.catch(() => {});"
+                      " return 'ok'; }")
+
+
+def _media_candidates(page, ds) -> list[str]:
+    """候选直链 = DOM 上的 source/currentSrc（scroller 已按同一条视频分组）+ 网络响应里拦到的；
+    去重后把「音轨嫌疑大」的排前面（DASH 会分别下发视频轨和音轨，不该先下视频轨）"""
+    cands: list[str] = []
+    with contextlib.suppress(Exception):
+        cands.extend(ds.grab_media_candidates(page) or [])
+    cands.extend(reversed(ds._video_urls))
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in cands:
+        if u and u not in seen and ds._looks_like_media_url(u):
+            seen.add(u)
+            out.append(u)
+    out.sort(key=lambda u: 0 if any(h in u.lower() for h in _AUDIO_HINTS) else 1)
+    return out
+
+
+def _download_media_candidates(cands: list[str], work_dir: str, ds,
+                               timeout: int) -> tuple[str, str]:
+    """逐个试候选直链，取第一条带音轨的。返回 (本地文件, 命中直链)"""
+    video_only = ""
+    limit = min(len(cands), 8)
+    for idx, url in enumerate(cands[:8], 1):
+        path = os.path.join(work_dir, f"browser_media_{idx}.mp4")
+        if not ds.download_video(url, path, timeout=timeout):
+            td.eprint(f"[浏览器] 直链下载失败（{idx}/{limit}）: {desensitize_media_url(url)}")
+            continue
+        has_audio = ds.has_audio_stream(path)
+        if has_audio or has_audio is None:  # None = ffmpeg 不可用，判不了，先交给 ASR
+            return path, url
+        if not video_only:
+            video_only = path
+        td.eprint(f"[浏览器] 这条只有视频轨，换下一条: {desensitize_media_url(url)}")
+    if video_only:
+        raise FetchError("浏览器兜底", "拦到的媒体流只有视频轨、没有音轨（抖音 DASH 分离流）")
+    raise FetchError("浏览器兜底", f"拦到 {len(cands)} 条候选直链但都下载失败")
+
+
+def _no_media_reason(page_url: str, page, dr) -> str:
+    """没拦到媒体流时把原因说清：图文页 / 验证墙 / 登录墙 / 作品不可用 / 真没流"""
+    with contextlib.suppress(Exception):
+        page_url = page.url or page_url  # 站内可能跳到了 /note/，按真实落地页判
+    if NOTE_PAGE_RE.search(urllib.parse.urlsplit(page_url).path or page_url):
+        return "图文页没有音轨，无法转写"
+    verify = dr._verify_message(page)
+    if verify:
+        return f"{verify}；headless 可能被拦，加 --window-offscreen 再试"
+    login = dr._login_wall_hint(page)
+    if login:
+        return login
+    body = ""
+    with contextlib.suppress(Exception):
+        body = page.evaluate(
+            "() => (document.body ? document.body.innerText : '').slice(0, 4000)") or ""
+    for kw in ("作品已删除", "内容不可见", "该视频不存在", "页面不存在"):
+        if kw in body:
+            return f"页面提示「{kw}」（作品不可用）"
+    return "页面没有拦到媒体流（douyinvod.com / aweme/v1/play 都没命中）"
+
+
+def resolve_media_by_browser(page_url: str, cookies: str | None, headless: bool,
+                             window_offscreen: bool, channel: str, wait_sec: float,
+                             timeout: int, work_dir: str,
+                             ffmpeg: str | None) -> tuple[str, str]:
+    """打开抖音页面拦媒体直链并下载带音轨的那条。返回 (本地媒体, 命中直链)；
+    失败一律抛 FetchError('浏览器兜底', <人话>) —— 登录墙/验证墙/无流/无音轨各有各的说法。"""
+    if NOTE_PAGE_RE.search(urllib.parse.urlsplit(page_url).path or page_url):
+        raise FetchError("浏览器兜底", "图文页没有音轨，无法转写")  # /note/ 页本就没有音轨，别白开窗口
+    try:
+        ds = _scroller()
+        import douyin_read as dr
+    except Exception as exc:
+        raise FetchError("浏览器兜底", "无法导入 douyin_scroller / douyin_read"
+                        f"（playwright 没装？{td.one_line(exc, 200)}）") from None
+    if ffmpeg:
+        ds._FFMPEG_OVERRIDE = ffmpeg   # 让 has_audio_stream 用同一个 ffmpeg
+    if cookies:
+        ds.DOUYIN_COOKIE_FILE = cookies  # 下载直链时附带的 Cookie 头
+    ds._video_urls.clear()
+    # scroller 的 _on_video_response / download_video 会把提示打到 stdout，而 stdout 只许有 JSON
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            pw = ds.sync_playwright().start()
+        except Exception as exc:
+            raise FetchError("浏览器兜底", f"Playwright 启动失败（{td.one_line(exc, 200)}）") from None
+        browser = context = page = None
+        try:
+            try:
+                browser, used = ds.launch_browser(
+                    pw, channel, headless,
+                    extra_args=_browser_args(headless, window_offscreen))
+            except Exception as exc:
+                raise FetchError("浏览器兜底", f"无法启动浏览器（{td.one_line(exc, 240)}）") from None
+            td.eprint(f"[浏览器] 内核={used} headless={headless} "
+                      f"offscreen={bool(window_offscreen and not headless)}")
+            context = ds.open_context(browser, headless, used)
+            records = dr._cookie_records(cookies)
+            if records:
+                try:
+                    context.add_cookies(records)
+                    td.eprint(f"[浏览器] 已注入 {len(records)} 条 cookie")
+                except Exception as exc:
+                    td.eprint(f"[警告] 注入 cookie 失败（继续游客态）: {td.one_line(exc, 160)}")
+            page = context.new_page()
+            page.on("response", ds._on_video_response)
+            try:
+                page.goto(page_url, wait_until="domcontentloaded",
+                          timeout=int(min(timeout, 60)) * 1000)
+            except Exception as exc:
+                td.eprint(f"[警告] 打开页面出错（继续等媒体流）: {td.one_line(exc, 160)}")
+            _kick_player(page)
+            deadline = time.time() + max(1.0, float(wait_sec))
+            next_kick = time.time() + 3.0
+            while time.time() < deadline and not ds._video_urls:
+                time.sleep(0.4)
+                if time.time() >= next_kick:
+                    _kick_player(page)
+                    next_kick = time.time() + 3.0
+            if ds._video_urls:
+                td.eprint(f"[浏览器] 拦到 {len(ds._video_urls)} 条媒体响应")
+            cands = _media_candidates(page, ds)
+            if not cands:
+                raise FetchError("浏览器兜底", _no_media_reason(page_url, page, dr))
+            td.eprint(f"[浏览器] 候选直链 {len(cands)} 条，先试音轨嫌疑大的")
+            path, media_url = _download_media_candidates(cands, work_dir, ds, timeout)
+            td.eprint(f"[浏览器] 已下载含音轨的流 -> {os.path.basename(path)}")
+            return path, media_url
+        finally:
+            for obj in (page, context):
+                if obj is not None:
+                    with contextlib.suppress(Exception):
+                        obj.close()
+            if browser is not None:
+                with contextlib.suppress(Exception):
+                    browser.close()
+            with contextlib.suppress(Exception):
+                pw.stop()
+
+
+# --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
 def truncate_text(text: str, limit: int | None) -> tuple[str, int, bool]:
@@ -456,12 +657,14 @@ def run(argv: list[str] | None = None) -> int:
         epilog=("stdout 只输出一个 JSON 对象（进度走 stderr）：\n"
                 '  {"ok","url","finalUrl","title","author","duration","source",\n'
                 '   "subtitleLang","text","textLength","truncated","segments","reason","elapsed"}\n'
+                '  （浏览器兜底成功时另带 "resolvedBy":"browser" 与脱敏过的 "mediaUrl"）\n'
                 "退出码: ok=true → 0；ok=false → 2\n"
                 "示例:\n"
                 "  douyin_fetch.py --url https://www.douyin.com/video/7xxxxxxxxxxxxxxxx\n"
                 "  douyin_fetch.py --url https://v.douyin.com/xxxx/ --srt out.srt\n"
                 "  douyin_fetch.py --url <URL> --no-asr\n"
                 "  douyin_fetch.py --url <URL> --no-subtitle\n"
+                "  douyin_fetch.py --url <URL> --window-offscreen  # headless 被风控拦时用\n"
                 "  douyin_fetch.py --file clip.mp4 --no-asr   # 本地文件 + 同名 .vtt/.srt\n"),
     )
     ap.add_argument("--url", dest="url", default=None, metavar="URL",
@@ -474,6 +677,17 @@ def run(argv: list[str] | None = None) -> int:
                     help="只允许字幕路径：没有字幕就 ok=false（reason='没有可用字幕且已禁用 ASR'）")
     ap.add_argument("--no-subtitle", dest="no_subtitle", action="store_true",
                     help="关掉字幕优先，跳过 yt-dlp 字幕抓取直接下载音轨跑 ASR")
+    ap.add_argument("--no-browser", dest="no_browser", action="store_true",
+                    help="关掉「抖音页面 → 直链」的浏览器兜底（yt-dlp 失败就直接 ok=false）")
+    ap.add_argument("--browser-channel", dest="browser_channel",
+                    choices=list(BROWSER_CHANNELS), default="msedge",
+                    help="浏览器兜底用哪个内核，默认 msedge（msedge→chrome→内置chromium 互相回退；"
+                         "firefox / webkit 需先 npx playwright install）")
+    ap.add_argument("--window-offscreen", dest="window_offscreen", action="store_true",
+                    help="兜底浏览器用可见窗口（移到屏幕外）而不是 headless："
+                         "真机实测 headless 容易被抖音风控挡成验证码页")
+    ap.add_argument("--browser-wait", dest="browser_wait", type=float, default=25.0, metavar="SEC",
+                    help="兜底时最多等媒体流多少秒（默认 25）")
     ap.add_argument("--srt", dest="srt", default=None, metavar="PATH",
                     help="把 segments 另存为标准 .srt 字幕（复用 transcribe_douyin.write_srt）")
     ap.add_argument("--max-chars", dest="max_chars", type=int, default=0, metavar="N",
@@ -617,15 +831,37 @@ def run(argv: list[str] | None = None) -> int:
         if args.file:
             media_path = media
         else:
+            media_path = ""
             if not yt_dlp:
-                return fail("；".join(errors) or "找不到 yt-dlp，无法拿到音频")
-            try:
-                media_path = download_audio(yt_dlp, final_url, work_dir, cookies,
-                                            timeout=args.timeout)
-                td.eprint(f"[音轨] 已下载 {media_path}")
-            except FetchError as exc:
-                errors.append(exc.reason())
-                return fail("；".join(errors))
+                errors.append("找不到 yt-dlp，无法直接取音频")
+                td.eprint(f"[警告] {errors[-1]}")
+            else:
+                try:
+                    media_path = download_audio(yt_dlp, final_url, work_dir, cookies,
+                                                timeout=args.timeout)
+                    td.eprint(f"[音轨] 已下载 {media_path}")
+                except FetchError as exc:
+                    errors.append(exc.reason())
+                    td.eprint(f"[警告] {exc.reason()}")
+            # yt-dlp 拿不到（抖音要 a_bogus 签名）→ 抖音页面走浏览器兜底拦直链
+            if not media_path:
+                if args.no_browser:
+                    errors.append("已用 --no-browser 关闭浏览器兜底")
+                    return fail("；".join(errors))
+                if not is_douyin_page_url(final_url):
+                    return fail("；".join(errors) or "拿不到音频")
+                td.eprint("[兜底] yt-dlp 没拿到音轨，改用浏览器打开页面拦媒体直链")
+                try:
+                    media_path, media_url = resolve_media_by_browser(
+                        final_url, cookies, not args.window_offscreen, args.window_offscreen,
+                        args.browser_channel, args.browser_wait, args.timeout,
+                        work_dir, td.resolve_tool(args.ffmpeg, "ffmpeg"))
+                except FetchError as exc:
+                    errors.append(exc.reason())
+                    return fail("；".join(errors))
+                result["resolvedBy"] = "browser"
+                result["mediaUrl"] = desensitize_media_url(media_url)
+                td.eprint(f"[兜底] 命中直链 {result['mediaUrl']}")
 
         ffmpeg = td.resolve_tool(args.ffmpeg, "ffmpeg")
         if ffmpeg:
