@@ -4,8 +4,9 @@
  * 那类错误提前在本地暴露出来（宿主只会留一句 warning，日志里看不出根因）。
  *
  * 查什么：
- *   a. 恰好注册 16 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
+ *   a. 恰好注册 17 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  *      + douyin_hot / douyin_search / douyin_video / douyin_comments / douyin_note（只读查询）
+ *      + douyin_fetch（给定链接精准提取，① 只读：字幕优先、无字幕退回本地 ASR）
  *      + douyin_notes / douyin_messages（② 通知，只读）
  *      + douyin_react（③A 轻互动：点赞 / 收藏 / 取消，**写操作**，默认关）
  *      + douyin_login_start / douyin_login_poll（登录，基础能力不设等级闸门）
@@ -37,6 +38,11 @@
  *      （立刻回 started:true，结果读 env.setupResult）、setup_scan 前台回 inventory、setup_start 透传 mode；
  *      douyin_status 返回体带 env 对象（venv / venvPython / venvUsable / basePython / playwright / sherpa /
  *      canReusePython / setupLog / setupLogTail / setupRunning / setupResult），venv 探测同一次运行只探一次
+ *   n. douyin_fetch（给定链接精准提取）：参数 url / preferSubtitle / asr / srt / maxChars；url 非 http(s)
+ *      在插件层就被拒（桩一次都不起）；脚本 stdout 的 JSON 原样透出（source / subtitleLang / segments）；
+ *      字幕+ASR 那次预算 600s、asr=false 时 180s 且带 --no-asr；srt 给了才传 --srt 并挂 srtPath；
+ *      **脚本 ok=false 或输出非 JSON 时工具不抛异常**，只回 { ok:false, reason, output }；
+ *      text 超 maxChars 截断并标记 truncated（原长在 textLength）。全部用 __fetchDeps 注入桩，不联网、不跑脚本。
  *   m. douyin_status(selftest:true) 额外跑一次选择器体检：不传 selftest 时返回里**没有** selectors 字段
  *      （默认零子进程）；传了就返回 { ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?}] }，
  *      verdict 只会是 ok / missing / unknown。用 __readDeps 注入假 runRead 断言，**不真起浏览器**。
@@ -53,6 +59,7 @@ import { pathToFileURL } from 'node:url'
 const EXPECTED_TOOLS = [
   'douyin_scroll', 'douyin_transcribe', 'douyin_status', 'douyin_config',
   'douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note',
+  'douyin_fetch',
   'douyin_notes', 'douyin_messages',
   'douyin_react',
   'douyin_login_start', 'douyin_login_poll',
@@ -201,7 +208,7 @@ for (const t of registered) {
 }
 
 /* ───────── ⑤ 能力等级闸门（tierRead 默认开；③④ 打开时 ① 视为生效） ───────── */
-const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note']
+const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note', 'douyin_fetch']
 const NOTIFY_TOOLS = ['douyin_notes', 'douyin_messages']
 const byName = new Map(registered.map((t) => [t && t.name, t]))
 /** 直接写沙箱里的 config.json（$DSH_HOME 已指到临时目录，不碰真家目录） */
@@ -1124,6 +1131,159 @@ if (typeof mod.__readDeps !== 'function') {
   const selRestored = setReadDeps({ runRead: null })
   if (selRestored && selRestored.stubbed === false) ok('__readDeps({runRead:null}) 已还原真实现')
   else problem('__readDeps 还原失败：' + JSON.stringify(selRestored))
+}
+
+/* ───────── ⑨-septies 给定链接精准提取 douyin_fetch：桩掉 runPython，不联网、不跑脚本 ───────── */
+// 三条硬要求：a) 工具已注册 + 参数校验（url 非法要拒）b) 脚本 ok=false 时不抛异常 c) text 超 maxChars 截断并标记
+const fetchTool = byName.get('douyin_fetch')
+if (!fetchTool || typeof fetchTool.execute !== 'function') problem('少了工具：douyin_fetch')
+else {
+  const setFetchDeps = (o) => (typeof mod.__fetchDeps === 'function' ? mod.__fetchDeps(o) : null)
+  writeCfg({ tierRead: true })
+
+  // a) 参数表 + 桩：脚本路径换成沙箱里的空 .py（只为过 existsSync），run 全程假
+  const fetchFields = Object.keys(fetchTool.parameters || {})
+  if (fetchFields.join(',') === 'url,preferSubtitle,asr,srt,maxChars') ok('douyin_fetch 参数齐：' + fetchFields.join(' / '))
+  else problem('douyin_fetch 的参数不对：' + JSON.stringify(fetchFields))
+
+  if (typeof mod.__fetchDeps !== 'function') {
+    problem('index.js 没导出 __fetchDeps 测试缝（douyin_fetch 会真跑脚本，这里跳过不跑）')
+  } else {
+    const fetchStub = join(SANDBOX_HOME, 'douyin_fetch_stub.py')
+    try { writeFileSync(fetchStub, '# stub：selfcheck 只拿来过 existsSync\n', 'utf8') } catch { /* 写不出来下面的断言会自己报 */ }
+    const fetchCalls = []
+    let fetchNext = null
+    const fetchReset = setFetchDeps({
+      script: fetchStub,
+      python: async () => 'stub-python',
+      run: async (python, script, argv, opts) => {
+        fetchCalls.push({ python, script, argv: argv.slice(), timeoutSec: opts && opts.timeoutSec })
+        return fetchNext || { ok: true, code: 0, stdout: '{}', stderr: '' }
+      },
+    })
+    if (fetchReset && fetchReset.stubbed === true) ok('桩掉 douyin_fetch 的「找 Python + 跑脚本」：不联网、不跑脚本')
+    else problem('__fetchDeps 桩没装上：' + JSON.stringify(fetchReset))
+
+    // a) url 非法：插件层直接拒，桩一次都不该被调
+    for (const badUrl of ['', 'ftp://www.douyin.com/video/1', 'www.douyin.com/video/1']) {
+      const bad = await callTool('douyin_fetch', { url: badUrl })
+      if (bad && bad.ok === false && /url/.test(String(bad.reason || ''))) ok('url 非法被拒（' + JSON.stringify(badUrl) + ' → ' + bad.reason + '）')
+      else problem('非法 url 没被拒：' + JSON.stringify(badUrl) + ' → ' + JSON.stringify(bad))
+    }
+    if (fetchCalls.length === 0) ok('url 非法时一次子进程都没起（校验排在跑脚本之前）')
+    else problem('url 非法也去跑了脚本：' + JSON.stringify(fetchCalls))
+
+    const FETCH_URL = 'https://www.douyin.com/video/777000111'
+    const lastFetchCall = () => (fetchCalls.length ? fetchCalls[fetchCalls.length - 1] : null)
+    const lastFetchArgv = () => { const c = lastFetchCall(); return c ? c.argv : [] }
+    const argOf = (argv, key) => argv[argv.indexOf(key) + 1]
+
+    // 字幕优先那次：脚本 JSON 原样透出，argv 按契约拼
+    fetchNext = {
+      ok: true, code: 0, stderr: '进度行（stderr）\n',
+      stdout: JSON.stringify({
+        ok: true, url: FETCH_URL, finalUrl: FETCH_URL, title: '桩标题', author: '桩作者', duration: 42,
+        source: 'subtitle', subtitleLang: 'zh-CN', text: '字幕正文一二三',
+        segments: [{ start: 0, dur: 1.5, text: '字幕正文' }, { start: 1.5, dur: 1.5, text: '一二三' }], elapsed: 12.3,
+      }),
+    }
+    const fetched = await callTool('douyin_fetch', { url: FETCH_URL })
+    const fArgv = lastFetchArgv()
+    const fBudget = lastFetchCall() ? lastFetchCall().timeoutSec : 0
+    // 契约里 --max-chars 是**可选**的；插件故意不传（脚本会连 segments 一起截，见 index.js runFetch 注释），
+    // 截断在插件层对 text 做 —— 所以这里断言 argv 里没有 --max-chars，别把双截断改回来。
+    if (argOf(fArgv, '--url') === FETCH_URL && fArgv.includes('--json') && !fArgv.includes('--max-chars')
+      && !fArgv.includes('--no-asr') && !fArgv.includes('--srt')) {
+      ok('argv 按 CLI 契约拼：' + JSON.stringify(fArgv))
+    } else problem('douyin_fetch 的 argv 不对：' + JSON.stringify(fArgv))
+    if (fBudget === 600) ok('默认（字幕优先 + 可退回 ASR）预算 600s —— ASR 慢，给足')
+    else problem('默认预算应为 600s，现在是 ' + fBudget)
+    if (fetched && fetched.ok === true && fetched.source === 'subtitle' && fetched.subtitleLang === 'zh-CN'
+      && fetched.text === '字幕正文一二三' && fetched.truncated === false && fetched.textLength === 7
+      && Array.isArray(fetched.segments) && fetched.segments.length === 2 && fetched.segments[1].start === 1.5
+      && fetched.exitCode === 0) {
+      ok('脚本 JSON 原样透出（ok / source=subtitle / subtitleLang / text / segments / elapsed）')
+    } else problem('douyin_fetch 没把脚本 JSON 透出：' + JSON.stringify(fetched))
+
+    // asr=false：带 --no-asr，预算降到 180s
+    await callTool('douyin_fetch', { url: FETCH_URL, asr: false })
+    const noAsrArgv = lastFetchArgv()
+    const noAsrBudget = lastFetchCall() ? lastFetchCall().timeoutSec : 0
+    if (noAsrArgv.includes('--no-asr') && noAsrBudget === 180) ok('asr=false → 带 --no-asr，预算 180s（不跑 ASR 用不着等 10 分钟）')
+    else problem('asr=false 的 argv/预算不对：' + JSON.stringify(noAsrArgv) + ' 预算 ' + noAsrBudget)
+
+    // srt：给了才传 --srt，返回里挂 srtPath；文件没写成时带 srtNote
+    const fetchSrt = join(SANDBOX_HOME, 'fetch-out.srt')
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: 'x', segments: [], elapsed: 1 }) }
+    const srtRes = await callTool('douyin_fetch', { url: FETCH_URL, srt: fetchSrt })
+    const srtArgv = lastFetchArgv()
+    if (argOf(srtArgv, '--srt') === fetchSrt && srtRes && srtRes.srtPath === fetchSrt && typeof srtRes.srtNote === 'string') {
+      ok('srt 给了才传 --srt，返回里挂 srtPath（没写成时带 srtNote）')
+    } else problem('srt 那条不对：' + JSON.stringify(srtArgv) + ' → ' + JSON.stringify(srtRes))
+    // 不给 srt：argv 里不许有 --srt，返回里也不许有 srtPath
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: 'x', segments: [], elapsed: 1 }) }
+    const noSrtRes = await callTool('douyin_fetch', { url: FETCH_URL })
+    if (!lastFetchArgv().includes('--srt') && noSrtRes && !Object.prototype.hasOwnProperty.call(noSrtRes, 'srtPath')) {
+      ok('不给 srt 时既不传 --srt、返回里也没有 srtPath')
+    } else problem('不给 srt 却动了 srt：' + JSON.stringify(lastFetchArgv()) + ' → ' + JSON.stringify(noSrtRes))
+
+    // b) 脚本 ok=false：工具不抛异常，reason 用脚本的，output 带日志尾巴，exitCode=2
+    fetchNext = {
+      ok: false, code: 2, stderr: '下载失败：403\n第 2 行日志\n',
+      stdout: JSON.stringify({ ok: false, url: FETCH_URL, title: '', text: '', segments: [], source: 'none', reason: '没有字幕且 ASR 已关闭', elapsed: 3.1 }),
+    }
+    const failRes = await callTool('douyin_fetch', { url: FETCH_URL, asr: false })
+    if (failRes && failRes.ok === false && failRes.reason === '没有字幕且 ASR 已关闭' && !/execute 抛错/.test(String(failRes.reason))
+      && typeof failRes.output === 'string' && failRes.exitCode === 2) {
+      ok('脚本 ok=false 时工具不抛异常（ok=false / reason / output / exitCode=2 都在）')
+    } else problem('脚本 ok=false 那条不对：' + JSON.stringify(failRes))
+
+    // 脚本输出不是 JSON：同样只回 ok:false + 日志尾巴
+    fetchNext = { ok: false, code: 2, stderr: '', stdout: '这不是 JSON\n只有两行日志\n' }
+    const notJson = await callTool('douyin_fetch', { url: FETCH_URL, asr: false })
+    if (notJson && notJson.ok === false && /不是 JSON/.test(String(notJson.reason)) && typeof notJson.output === 'string') {
+      ok('脚本输出不是 JSON → ok:false + output 尾巴（不抛异常）')
+    } else problem('非 JSON 那条不对：' + JSON.stringify(notJson))
+
+    // c) text 超 maxChars：截断 + 标记 truncated，原长留在 textLength
+    const longText = '字'.repeat(30000)
+    fetchNext = {
+      ok: true, code: 0, stderr: '',
+      stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: '长文本', source: 'asr', text: longText,
+        segments: [{ start: 0, dur: 1, text: 'a' }], elapsed: 90 }),
+    }
+    const truncRes = await callTool('douyin_fetch', { url: FETCH_URL, maxChars: 1000 })
+    if (truncRes && truncRes.ok === true && typeof truncRes.text === 'string' && truncRes.text.length === 1000
+      && truncRes.truncated === true && truncRes.textLength === 30000 && truncRes.maxChars === 1000
+      && typeof truncRes.truncateNote === 'string' && truncRes.segments.length === 1) {
+      ok('text 超 maxChars 被截断到 1000 并标记 truncated=true（原长 textLength=30000，segments 不动）')
+    } else problem('截断那条不对：' + JSON.stringify({ len: truncRes && String(truncRes.text || '').length, truncated: truncRes && truncRes.truncated, textLength: truncRes && truncRes.textLength }))
+
+    // maxChars 越界：拒绝，不夹取、也不去跑脚本
+    const beforeBadMc = fetchCalls.length
+    const badMc = await callTool('douyin_fetch', { url: FETCH_URL, maxChars: 0 })
+    if (badMc && badMc.ok === false && /maxChars/.test(String(badMc.reason)) && fetchCalls.length === beforeBadMc) {
+      ok('maxChars 越界（0）被拒，且没去跑脚本')
+    } else problem('maxChars 越界没被拒：' + JSON.stringify(badMc))
+
+    // preferSubtitle=false：契约里没有这个开关，不许自己加参数；只在返回里记一笔
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: 'x', segments: [], elapsed: 1 }) }
+    const preRes = await callTool('douyin_fetch', { url: FETCH_URL, preferSubtitle: false })
+    if (preRes && typeof preRes.subtitleNote === 'string' && !lastFetchArgv().some((a) => a === '--no-subtitle')) {
+      ok('preferSubtitle=false 不越契约加参数（argv 里没有 --no-subtitle，只回 subtitleNote）')
+    } else problem('preferSubtitle=false 那条不对：' + JSON.stringify(lastFetchArgv()))
+    // 两条路都关掉：直接拒，别白跑一次
+    const bothOff = await callTool('douyin_fetch', { url: FETCH_URL, preferSubtitle: false, asr: false })
+    if (bothOff && bothOff.ok === false && /两条路都关了/.test(String(bothOff.reason))) ok('preferSubtitle=false + asr=false 直接拒（不白跑脚本）')
+    else problem('两条路都关掉时没拒：' + JSON.stringify(bothOff))
+
+    // 复位测试缝：生产路径回到 scripts/douyin_fetch.py + findPython + runPython
+    const fetchRestored = setFetchDeps({ script: null, python: null, run: null })
+    if (fetchRestored && fetchRestored.stubbed === false && /douyin_fetch\.py$/.test(String(fetchRestored.script))) {
+      ok('__fetchDeps 已复位（生产路径 = scripts/douyin_fetch.py + 真 runPython）')
+    } else problem('__fetchDeps 没复位：' + JSON.stringify(fetchRestored))
+  }
+  writeCfg({})
 }
 
 /* ───────── ⑩ 结论 ───────── */

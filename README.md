@@ -2,7 +2,7 @@
 
 给 DSH 用的「刷抖音 + 音频转写」插件：用 Playwright 打开抖音网页版自动下滑、逐屏截图并把视频下载到本地，再用 ffmpeg + sherpa-onnx SenseVoice 在**本机**把声音转成文字（不联网调 ASR 服务）。
 
-另外提供 7 个**只读**查询工具：`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`（① 只读级），以及 `douyin_notes` / `douyin_messages`（② 通知级，读通知摘要与私信会话列表）。同样用 Playwright 打开抖音网页版读页面。全程只读——不点赞、不关注、不发评论、不发布任何内容，通知/私信这一档额外保证**不发消息、不标记已读**。
+另外提供 8 个**只读**查询工具：`douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note` / `douyin_fetch`（① 只读级；`douyin_fetch` 是「给链接精准要文字」：字幕优先，没字幕才回退本地转写），以及 `douyin_notes` / `douyin_messages`（② 通知级，读通知摘要与私信会话列表）。同样用 Playwright 打开抖音网页版读页面。全程只读——不点赞、不关注、不发评论、不发布任何内容，通知/私信这一档额外保证**不发消息、不标记已读**。
 
 - 包名 `dsh-douyin-audio`，当前版本 `1.3.0`（见 `package.json`）
 - **一行装好**：`dsh plugin --profile <你的 profile> add dsh-douyin-audio@latest` —— profile 名怎么查、tgz/源码三种装法见第 2 节
@@ -11,7 +11,7 @@
 
 ---
 
-## 1. 十六个工具
+## 1. 十七个工具
 
 ### 1.1 只读查询（5 个）
 
@@ -129,6 +129,23 @@
 
 装到哪、怎么复用、升级后为什么要重装 —— 见第 3.5 节。
 
+### 1.8 给定链接精准提取（1 个，① 只读级）
+
+前面几件都是「先刷 / 先打开页面，再抠元数据」；这一件是**给一个链接，直接要正文文字**：走 `scripts/douyin_fetch.py`。
+
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| `douyin_fetch` | `url`(string, 必填, http/https) / `preferSubtitle`(boolean, 默认 true) / `asr`(boolean, 默认 true) / `srt`(string, 可选路径) / `maxChars`(number, 默认 20000) | **字幕优先**：页面有现成字幕（人工 / AI）就直接取，返回 `source: "subtitle"` 与 `subtitleLang`（哪一路），**完全不跑 ASR**；字幕拿不到才退回本地 SenseVoice 转写，返回 `source: "asr"`；两条都不成是 `source: "none"` + `reason`。返回 `text` 与带时间轴的 `segments:[{start, dur, text}]` |
+
+- 参数怎么落到 CLI（契约两边共用，要改得一起改）：`--url U --json` 必带；`asr=false` → `--no-asr`；`srt` 给了 → `--srt <绝对路径>`。脚本 stdout 只有**一个** JSON（进度一律走 stderr），退出码 `ok=true → 0`、`ok=false → 2`。
+- `maxChars` **不传给脚本**（契约里 `--max-chars` 是可选的）：脚本那个参数会把 `segments` 一起截掉（时间轴缺尾巴），也看不出原文多长；所以截断只在插件层对 `text` 做，这样才能如实给 `truncated` / `textLength`。
+- 超时预算：默认 **600s**（字幕那条几秒就回，慢的是退回 ASR 那条）；`asr=false` 时 **180s**。
+- `text` 按 `maxChars` 截断并标记 `truncated: true`，原长在 `textLength`，另带一句 `truncateNote`；`segments` **不跟着截断**（时间轴保持完整）。
+- `srt` 给了才有 `srtPath`；文件其实没写成时带一句 `srtNote`（脚本可能跳过了落盘），不假装写成功。
+- `preferSubtitle=false` **透传不了**：脚本 CLI 契约里没有「关掉字幕优先」的开关，本次仍按字幕优先跑，返回里用 `subtitleNote` 说明。想**只认字幕、别跑 ASR** 就用 `asr=false`；两个都关（`asr=false` + `preferSubtitle=false`）直接拒（两条路都关了，拿不到文字）。
+- 失败**不抛异常**：脚本 `ok=false` → `{ ok: false, reason: <脚本给的原因>, output: <日志尾巴>, exitCode: 2 }`；输出不是 JSON → `{ ok: false, reason: "脚本输出不是 JSON（douyin_fetch 那一步）", output: <尾巴> }`；`maxChars` 越界 → `{ ok: false, reason }`（不夹取，也不去跑脚本）。
+- 这条**不读** `readHeadless` / `verifyWait`：脚本 CLI 没有 `--no-headless` / `--verify-wait` 这两个参数（要弹窗过验证就直接跑脚本，见 7.2 那种用法）。闸门是 ① 只读（`tierRead`）：不发评论、不点赞。
+
 ## 2. 安装
 
 本包自带挂载声明（`cordis.patch.yml`），装好后 profile 只要在 `dsh.profile.bundles` 里列出包名即生效，**不需要再手改 profile 自己的 `cordis.patch.yml`**。
@@ -170,14 +187,14 @@ dsh plugin --profile <profile> add link:D:\path\to\dsh-douyin
 
 ## 3. 依赖与自检
 
-不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、16 个工具是否齐全，不依赖 Python、不联网。
+不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、17 个工具是否齐全，不依赖 Python、不联网。
 
 装完跑一次 `douyin_status`。它的 `ok` 字段 = 「Python(playwright) 找到」且「Python(sherpa_onnx) 找到」且「`~/.dsh/bin/ffmpeg.exe` 存在」且「模型目录存在」。
 
 | 依赖 | 用在哪 | 缺失时会发生什么 |
 | --- | --- | --- |
-| Python + `playwright`（脚本用 `channel="msedge"`，需本机有 Edge） | `douyin_scroll`；五个只读工具 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`；两个通知工具 `douyin_notes` / `douyin_messages`（还需登录态 cookie） | 该工具直接返回 `{ ok: false, reason: '找不到带 playwright 的 Python…' }`，不启动浏览器。探测顺序：`pythonPath` 配置 → `DSH_PYTHON` → `PYTHON3` → `PYTHON` → `python3` → `python`，每个候选跑一次 `python -c "import playwright"`，单个候选最多等 15 秒 |
-| Python + `sherpa_onnx` | `douyin_transcribe` | 返回 `{ ok: false, reason: '找不到带 sherpa_onnx 的 Python…' }`。两个能力可以装在**不同**解释器里，插件分别探测 |
+| Python + `playwright`（脚本用 `channel="msedge"`，需本机有 Edge） | `douyin_scroll`；五个只读工具 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note`；两个通知工具 `douyin_notes` / `douyin_messages`（还需登录态 cookie）；`douyin_fetch`（取现成字幕那一步，没字幕才回退 `sherpa_onnx` 转写） | 该工具直接返回 `{ ok: false, reason: '找不到带 playwright 的 Python…' }`，不启动浏览器。探测顺序：`pythonPath` 配置 → `DSH_PYTHON` → `PYTHON3` → `PYTHON` → `python3` → `python`，每个候选跑一次 `python -c "import playwright"`，单个候选最多等 15 秒 |
+| Python + `sherpa_onnx` | `douyin_transcribe`；`douyin_fetch`（没有字幕、退回 ASR 时） | 返回 `{ ok: false, reason: '找不到带 sherpa_onnx 的 Python…' }`。两个能力可以装在**不同**解释器里，插件分别探测 |
 | `ffmpeg` | ① 下载后校验是否有音轨；② 转写前把音频转成 16kHz 单声道 WAV | `douyin_status` 的 `ok` 变 `false`；音轨校验退化为「未知」，于是每个视频的第一个候选都被认为可用，也就不再写 `# NO_AUDIO` 标记；转写则整条以「找不到 ffmpeg」失败。`douyin_status` 只认 `~/.dsh/bin/ffmpeg.exe`，而转写脚本还会去 `PATH` 找 —— 可能出现「自检说没有、转写却能跑」，把 ffmpeg 放 `~/.dsh/bin/` 最稳 |
 | SenseVoice 模型目录 | 转写推理 | 转写失败（模型加载不到）。默认路径 `~/.dsh/models/sherpa-sense-voice/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`；可用 `douyin_transcribe` 的 `modelDir` 参数或脚本的 `--model-dir` 指向别处。`douyin_status` 检查模型目录时认环境变量 `DOUYIN_MODEL_DIR`，但该变量**不会**被传给转写脚本，想换目录请用 `modelDir` / `--model-dir` |
 | cookie 文件 `~/.dsh/cookies/douyin_cookies.txt`（netscape 格式，可选） | 下载视频、转写脚本抓直链时带上，避免 CDN 降级只给视频流 | 没有也能跑，但更容易拿到**无音轨**的纯视频流，从而出现 `# NO_AUDIO` |
@@ -539,7 +556,7 @@ python douyin_login.py --out D:\my\cookie.txt
 node selfcheck.mjs
 ```
 
-退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 16 个工具（原有 4 + 只读 5 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
+退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 17 个工具（原有 4 + 只读 6 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
 
 **第 2 步：环境自检**
 
@@ -624,7 +641,7 @@ douyin_search  keyword=美食  limit=5  order=click
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.js` | 16 个工具的实现（原有 4 + 只读 5 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
+| `index.js` | 17 个工具的实现（原有 4 + 只读 6 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
 | `selfcheck.mjs` | 本地预检：假 ctx 跑一次 `apply()`，校验工具注册与参数 schema；`node selfcheck.mjs`，退出码 0=通过 |
 | `lib/state.mjs` | 家的路径（`DSH_HOME`）、`DEFAULTS`、`loadCfg`/`saveCfg`、日志轮转 |
 | `lib/runner.mjs` | Python 探测（按模块名 import 试探）、脚本执行、pipe→cmd 沙箱降级、`childEnv()` 注入 `DSH_DOUYIN_TMP` |
@@ -632,6 +649,7 @@ douyin_search  keyword=美食  limit=5  order=click
 | `scripts/douyin_scroller.py` | Playwright 刷屏 + 截图 + 下载（候选分组 + SHA256 去重 + 音轨校验）+ manifest；启动时把 stdout/stderr 钉成 UTF-8，避免 GBK 控制台打印中文抛异常吞掉主流程 |
 | `scripts/transcribe_douyin.py` | ffmpeg 转 WAV → SenseVoice 本地转写，v1.2.0 CLI，`--json` 输出给工具层解析 |
 | `scripts/douyin_read.py` | 只读查询 CLI：`hot` / `search` / `video` / `comments` / `notes` / `messages` 六个子命令（后两个要登录态，可用 `--url` 覆盖默认地址），统一 `--json` 信封，选择器多候选 + 兜底；`lib/runner.mjs` 的 `SCRIPT_READ` 指向它 |
+| `scripts/douyin_fetch.py` | 给定链接精准提取文字：**字幕优先**（有现成字幕就不跑 ASR），没有才在本地 SenseVoice 转写；stdout 只有一个 JSON（进度走 stderr），CLI 是 `--url` / `--json` / `--no-asr` / `--srt` / `--max-chars` / `--cookies`，退出码 `0`=成功、`2`=失败 |
 | `cordis.patch.yml` | bundle 挂载声明（`id: douyin-audio`） |
 
 改默认行为改 `lib/state.mjs` 的 `DEFAULTS`；改工具签名改 `index.js`；两边要同步（`index.js` 的 `Config` 也要跟着加键，否则 profile 传进来的值会被忽略）。

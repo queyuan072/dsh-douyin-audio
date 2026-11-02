@@ -2,6 +2,7 @@
  * dsh-douyin-audio —— 刷抖音 + 音频转写（host 半端）
  * 工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  * 只读查询：douyin_hot / douyin_search / douyin_video / douyin_comments（都走 scripts/douyin_read.py）
+ * 给定链接精准提取（① 只读）：douyin_fetch —— 字幕优先、无字幕退回本地 ASR，走 scripts/douyin_fetch.py
  * 通知（② 通知级闸门）：douyin_notes / douyin_messages —— 同样只读，只读页面不发消息、不标已读
  * 轻互动（③A 轻互动级闸门，默认关）：douyin_react —— 点赞 / 取消赞 / 收藏 / 取消收藏，走 scripts/douyin_action.py
  * 装入配置环境（基础能力，不设等级闸门）：douyin_setup —— mode=auto 扫描→复用或装 venv，装完写 pythonPath
@@ -14,7 +15,7 @@ import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { arch, cpus, platform, tmpdir, totalmem } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { ensureDirs, loadCfg, saveCfg, stateDir, logPath, log as logLine } from './lib/state.mjs'
@@ -654,6 +655,20 @@ export function __reactDeps(next) {
     if (next && Object.prototype.hasOwnProperty.call(next, k)) reactDeps[k] = next[k] || REACT_REAL[k]
   }
   return { script: reactDeps.script, stubbed: reactDeps.run !== REACT_REAL.run }
+}
+
+/** 给定链接精准提取的脚本（① 只读）：CLI 契约见 runFetch 上面那段注释 */
+const SCRIPT_FETCH = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'douyin_fetch.py')
+
+/** 测试缝（只给 selfcheck 用）：douyin_fetch 的「脚本路径 / 找 Python / 跑脚本」三步换掉。
+ *  生产路径永远是 SCRIPT_FETCH + findPython + runPython；传 null 或省略就复位成真实现。 */
+const FETCH_REAL = { script: SCRIPT_FETCH, python: findPython, run: runPython }
+const fetchDeps = { ...FETCH_REAL }
+export function __fetchDeps(next) {
+  for (const k of ['script', 'python', 'run']) {
+    if (next && Object.prototype.hasOwnProperty.call(next, k)) fetchDeps[k] = next[k] || FETCH_REAL[k]
+  }
+  return { script: fetchDeps.script, stubbed: fetchDeps.run !== FETCH_REAL.run }
 }
 
 /** 测试缝（只给 selfcheck 用）：把 douyin_status 的体检那条路径换成假 runRead，体检不必真起浏览器。
@@ -1895,6 +1910,14 @@ export function apply(ctx, config = {}) {
     return { value: s }
   }
 
+  /** maxChars：不给就 20000；给了就必须是 1-1000000 的整数（越界直接报错，不夹取） */
+  const checkMaxChars = (v) => {
+    if (v === undefined || v === null || v === '') return { value: 20000 }
+    const n = Number(v)
+    if (!Number.isInteger(n) || n < 1 || n > 1000000) return { error: 'maxChars 需是 1-1000000 的整数，收到 ' + JSON.stringify(v) }
+    return { value: n }
+  }
+
   /** 跑一次只读子命令：从 stdout 第一个 { 开始解析，脚本的 ok:false 原样带回 */
   async function runRead(sub, extra, timeoutSec) {
     if (!existsSync(SCRIPT_READ)) return { ok: false, reason: '只读脚本不存在: ' + SCRIPT_READ }
@@ -1921,6 +1944,69 @@ export function apply(ctx, config = {}) {
     if (parsed.ok === false) return { ...parsed, exitCode: r.code }
     if (!r.ok) return { ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', items: parsed.items || [], output: tail(r.stderr, 8) }
     return { ...parsed, ok: true, exitCode: r.code }
+  }
+
+  /* ── 4d-3. 给定链接精准提取（只读）────────────────────────────
+   * scripts/douyin_fetch.py 的 CLI 契约（两边共用，别各自改）：
+   *   python scripts/douyin_fetch.py --url U [--json] [--no-asr] [--srt PATH] [--max-chars N] [--cookies FILE]
+   *   stdout 只有**一个** JSON：{ ok, url, finalUrl?, title, author?, duration?, source: subtitle|asr|none,
+   *   subtitleLang?, text, segments:[{start,dur,text}], reason?, elapsed }；进度一律写 stderr。
+   *   退出码：ok=true → 0；ok=false → 2（与本项目其它脚本一致）。
+   * 字幕优先：有现成字幕就直接用（source=subtitle），拿不到才本地 SenseVoice 转写（source=asr），
+   * 所以 ASR 那条要给足预算，只认字幕那条可以短很多。 */
+  const FETCH_TIMEOUT_SEC = { asr: 600, noAsr: 180 }
+
+  /** 调一次 douyin_fetch.py：stdout 从第一个 { 开始解析，脚本的 ok:false 原样带回，**绝不抛** */
+  async function runFetch({ url, asr, preferSubtitle, srt, maxChars }) {
+    if (!existsSync(fetchDeps.script)) return { ok: false, reason: '抓取脚本不存在: ' + fetchDeps.script }
+    const cfg = merged()
+    const python = await fetchDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
+    if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
+    // 故意**不**传 --max-chars：脚本的 --max-chars 会连 segments 一起截（truncate_to），
+    // 那样既丢掉时间轴尾巴，也让下面 truncated / textLength 变成假话。截断只在插件层对 text 做。
+    const argv = ['--url', url, '--json']
+    if (!asr) argv.push('--no-asr')
+    if (srt) argv.push('--srt', srt)
+    const budget = asr ? FETCH_TIMEOUT_SEC.asr : FETCH_TIMEOUT_SEC.noAsr
+    const r = await fetchDeps.run(python, fetchDeps.script, argv, { timeoutSec: budget, log })
+    const out = String(r.stdout || '')
+    log('fetch 结束 code=' + r.code + '（预算 ' + budget + 's，asr=' + asr + '）')
+    let parsed = null
+    const start = out.indexOf('{')
+    if (start >= 0) { try { parsed = JSON.parse(out.slice(start)) } catch { /* 下面按「不是 JSON」报 */ } }
+    if (!parsed) {
+      return { ok: false, exitCode: r.code, reason: '脚本输出不是 JSON（douyin_fetch 那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
+    }
+    if (parsed.ok === false) {
+      // 脚本自己说的原因优先；再把日志尾巴带上，好定位到哪一步（下载 / 字幕 / ASR）
+      return { ...parsed, ok: false, reason: parsed.reason || parsed.error || '抓取失败（脚本 ok=false）',
+        exitCode: r.code, output: tail(out, 10) || tail(r.stderr, 8) }
+    }
+    if (!r.ok) {
+      return { ...parsed, ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', output: tail(r.stderr, 8) }
+    }
+    // text 按 maxChars 截断（标记 + 原长），segments 原样留着：时间轴不该跟着被砍
+    const text = typeof parsed.text === 'string' ? parsed.text : ''
+    const truncated = text.length > maxChars
+    const res = {
+      ...parsed,
+      ok: true,
+      text: truncated ? text.slice(0, maxChars) : text,
+      truncated,
+      textLength: text.length,
+      maxChars,
+      exitCode: r.code,
+    }
+    if (truncated) res.truncateNote = 'text 已按 maxChars=' + maxChars + ' 截断（原长 ' + text.length + ' 字符）；segments 仍是完整时间轴'
+    if (srt) {
+      res.srtPath = srt
+      if (!existsSync(srt)) res.srtNote = '这个 srt 文件没写成（脚本可能跳过了落盘）'
+    }
+    if (!preferSubtitle) {
+      // 脚本 CLI 里没有「关掉字幕优先」的开关（契约固定，不能自己加参数）：老实说一句，不假装生效
+      res.subtitleNote = 'preferSubtitle=false 无法透传：脚本 CLI 契约里没有这个开关，本次仍按字幕优先跑'
+    }
+    return res
   }
 
   /**
@@ -2039,6 +2125,37 @@ export function apply(ctx, config = {}) {
       const u = checkUrl(args.url)
       if (u.error) return { ok: false, reason: u.error }
       return runRead('note', ['--url', u.value], READ_TIMEOUT.video)
+    },
+  })
+
+  // ── 4d-3. 给定链接精准提取（只读）──────────────────────────
+  // 与「盲刷推荐流」互补的一条路：给链接就要文字。字幕优先（现成字幕不跑 ASR），没有才本地 SenseVoice 转写。
+  // 不走 douyin_read.py（那支只读页面元数据），单独一支 scripts/douyin_fetch.py，CLI 契约见 runFetch 上面。
+  tool({
+    name: 'douyin_fetch',
+    description: '按链接精准提取文字（只读）：字幕优先——有现成字幕（人工/AI）就直接用，不跑 ASR；字幕拿不到才退回本地 SenseVoice 转写。返回 text 与带时间轴的 segments（{start,dur,text}）。不点赞、不收藏、不评论。',
+    parameters: {
+      url: { type: 'string', description: '视频/图文页链接或短链，如 https://www.douyin.com/video/<id>' },
+      preferSubtitle: { type: 'boolean', description: '字幕优先，默认 true。脚本 CLI 契约里没有「关掉字幕优先」的开关，传 false 只在返回里记一笔（subtitleNote）' },
+      asr: { type: 'boolean', description: '字幕拿不到时是否退回本地 ASR，默认 true。false = 只认字幕（预算也从 600s 降到 180s）' },
+      srt: { type: 'string', description: '可选：把字幕写成 SRT 落到这个路径（返回里有 srtPath；没写成会带 srtNote）' },
+      maxChars: { type: 'number', description: 'text 最多回多少字符，默认 20000；超出截断并标记 truncated（原长在 textLength）' },
+    },
+    async execute(args) {
+      const deny = requireTier('douyin_fetch', 'read')
+      if (deny) return deny
+      const u = checkUrl(args.url)
+      if (u.error) return { ok: false, reason: u.error }
+      const asr = args.asr === undefined ? true : !!args.asr
+      const preferSubtitle = args.preferSubtitle === undefined ? true : !!args.preferSubtitle
+      if (!asr && !preferSubtitle) {
+        return { ok: false, reason: 'asr=false 且 preferSubtitle=false：字幕与 ASR 两条路都关了，拿不到 text' }
+      }
+      const mc = checkMaxChars(args.maxChars)
+      if (mc.error) return { ok: false, reason: mc.error }
+      let srt = null
+      if (args.srt !== undefined && args.srt !== null && String(args.srt).trim() !== '') srt = resolve(String(args.srt).trim())
+      return runFetch({ url: u.value, asr, preferSubtitle, srt, maxChars: mc.value })
     },
   })
 
