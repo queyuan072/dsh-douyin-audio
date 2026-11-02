@@ -37,6 +37,9 @@
  *      （立刻回 started:true，结果读 env.setupResult）、setup_scan 前台回 inventory、setup_start 透传 mode；
  *      douyin_status 返回体带 env 对象（venv / venvPython / venvUsable / basePython / playwright / sherpa /
  *      canReusePython / setupLog / setupLogTail / setupRunning / setupResult），venv 探测同一次运行只探一次
+ *   m. douyin_status(selftest:true) 额外跑一次选择器体检：不传 selftest 时返回里**没有** selectors 字段
+ *      （默认零子进程）；传了就返回 { ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?}] }，
+ *      verdict 只会是 ok / missing / unknown。用 __readDeps 注入假 runRead 断言，**不真起浏览器**。
  *
  * 用法：node selfcheck.mjs [入口文件，默认 ./index.js]
  * 退出码：0 = 全通过；1 = 有问题（宿主里就是 "entry did not activate"）
@@ -1063,6 +1066,65 @@ if (stShort && stShort.browsers && Array.isArray(stShort.browsers.shortcuts)) {
   ok('douyin_status.browsers.shortcuts 是数组（' + stShort.browsers.shortcuts.length + ' 条）')
 } else problem('douyin_status.browsers.shortcuts 不是数组：' + JSON.stringify(stShort && stShort.browsers && stShort.browsers.shortcuts))
 writeCfg({})
+
+/* ───────── ⑨-sexies 选择器体检：douyin_status(selftest) → selectors ───────── */
+// m. 不传 selftest：返回里不许有 selectors（默认行为一个字段都不变，也不多起一个子进程）
+const stNoSel = await callTool('douyin_status', {})
+if (stNoSel && !Object.prototype.hasOwnProperty.call(stNoSel, 'selectors')) {
+  ok('douyin_status 不传 selftest 时没有 selectors 字段')
+} else problem('douyin_status 不传 selftest 却带了 selectors：' + JSON.stringify(stNoSel && stNoSel.selectors))
+
+// n. 传 selftest:true：注入假 runRead 断言结构（桩一装，体检那条路径就不碰 python / 浏览器）
+const setReadDeps = (o) => (typeof mod.__readDeps === 'function' ? mod.__readDeps(o) : null)
+if (typeof mod.__readDeps !== 'function') {
+  problem('index.js 没导出 __readDeps 测试缝（selftest 会真起浏览器，这里跳过不跑）')
+} else {
+  const selCalls = []
+  const fakeSelftest = {
+    ok: true,
+    exitCode: 0,
+    items: [
+      { name: 'hot', label: '热榜', url: 'https://www.douyin.com/hot', verdict: 'ok', hits: 20,
+        selectors: [{ sel: '[data-e2e="scroll-list"] > li', count: 20 }] },
+      { name: 'recommend', label: '推荐', url: 'https://www.douyin.com/', verdict: 'missing', hits: 0,
+        selectors: [{ sel: '[data-e2e="video-player-digg"]', count: 0 }] },
+      { name: 'notes', label: '通知', url: 'https://www.douyin.com/notifications', verdict: 'unknown',
+        selectors: [], reason: '被抖音人机验证拦截（页面标题=验证码中间页，正文 20 字）' },
+    ],
+  }
+  setReadDeps({ runRead: async (sub, extra, timeoutSec) => { selCalls.push({ sub, extra, timeoutSec }); return fakeSelftest } })
+
+  const stSel = await callTool('douyin_status', { selftest: true })
+  const sel = stSel && stSel.selectors
+  const selVerdicts = sel && Array.isArray(sel.items) ? sel.items.map((it) => it && it.verdict) : []
+  const selShapeOk = sel && typeof sel === 'object' && sel.ok === true && Array.isArray(sel.items)
+    && sel.items.length === 3 && selVerdicts.join(',') === 'ok,missing,unknown'
+    && Array.isArray(sel.items[0].selectors) && typeof sel.items[0].selectors[0].count === 'number'
+    && typeof sel.items[2].reason === 'string'
+  if (selShapeOk) ok('douyin_status(selftest:true) 的 selectors 结构对：verdict=' + JSON.stringify(selVerdicts))
+  else problem('douyin_status(selftest:true) 的 selectors 结构不对：' + JSON.stringify(sel))
+  // 常规字段一个都不能少（附加 selectors 不该挤掉原有返回体）
+  if (stSel && typeof stSel.version === 'string' && stSel.browsers && Array.isArray(stSel.videos)) {
+    ok('selftest:true 时原有返回体仍然完整（version / browsers / videos 都在）')
+  } else problem('selftest:true 把原有返回体挤掉了：' + JSON.stringify(Object.keys(stSel || {})))
+
+  // 只跑一次 selftest 子命令、参数为空（页面由脚本自己定）、带超时预算
+  const c0 = selCalls[0]
+  if (selCalls.length === 1 && c0 && c0.sub === 'selftest' && Array.isArray(c0.extra) && c0.extra.length === 0
+    && typeof c0.timeoutSec === 'number' && c0.timeoutSec > 0) {
+    ok('体检只跑一次、子命令=selftest、超时预算 ' + c0.timeoutSec + 's（桩，不真跑浏览器）')
+  } else problem('体检的调用方式不对：' + JSON.stringify(selCalls))
+
+  // 不传 selftest 时桩一次都不该被调用
+  await callTool('douyin_status', {})
+  if (selCalls.length === 1) ok('不传 selftest 时桩 runRead 一次都没被调（零子进程）')
+  else problem('不传 selftest 却也跑了体检：' + JSON.stringify(selCalls))
+
+  // 桩把体检脚本换掉了：还原真实现，后面的用例不受影响
+  const selRestored = setReadDeps({ runRead: null })
+  if (selRestored && selRestored.stubbed === false) ok('__readDeps({runRead:null}) 已还原真实现')
+  else problem('__readDeps 还原失败：' + JSON.stringify(selRestored))
+}
 
 /* ───────── ⑩ 结论 ───────── */
 if (problems.length > failCountBefore) {

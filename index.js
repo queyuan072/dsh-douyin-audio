@@ -656,6 +656,14 @@ export function __reactDeps(next) {
   return { script: reactDeps.script, stubbed: reactDeps.run !== REACT_REAL.run }
 }
 
+/** 测试缝（只给 selfcheck 用）：把 douyin_status 的体检那条路径换成假 runRead，体检不必真起浏览器。
+ *  只影响 selftest 分支（其它只读工具直接用真 runRead）；传 null 或省略就复位成真实现。 */
+const readDeps = { runRead: null }
+export function __readDeps(next) {
+  if (next && Object.prototype.hasOwnProperty.call(next, 'runRead')) readDeps.runRead = next.runRead || null
+  return { stubbed: !!readDeps.runRead }
+}
+
 /** 插件版本：读本插件 package.json 的 version（给设置页顶栏用）；读不到就 null，绝不抛错 */
 let pluginVersionCache
 function pluginVersion() {
@@ -1720,8 +1728,11 @@ export function apply(ctx, config = {}) {
   // ── 3. 自检 ───────────────────────────────────────────────
   tool({
     name: 'douyin_status',
-    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。',
-    parameters: { scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' } },
+    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。selftest=true 时额外跑一次选择器体检（4 个页面，会真开浏览器），结果放 selectors：{ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?}]}，verdict=ok/missing/unknown。',
+    parameters: {
+      scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' },
+      selftest: { type: 'boolean', description: 'true = 额外跑一次选择器体检（热榜/推荐/通知/私信 4 个页面），结果放 selectors 字段；默认 false（一个页面都不开）' },
+    },
     async execute(args) {
       const cfg = merged()
       const pyScroll = await findPython(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
@@ -1737,7 +1748,7 @@ export function apply(ctx, config = {}) {
       try {
         browsers.shortcuts = mergeShortcutList(await scanShortcuts(!!(args && args.scan)), browsers.paths)
       } catch { browsers.shortcuts = [] }
-      return {
+      const out = {
         ok: !!(pyScroll && pyAsr && ff && existsSync(modelDir)),
         version: pluginVersion(),
         pythonScroll: pyScroll || '(未找到，需带 playwright)',
@@ -1758,6 +1769,9 @@ export function apply(ctx, config = {}) {
         videos,
         cfg,
       }
+      // 选择器体检是显式的额外动作：不传 selftest 时返回体与历史逐字段一致（也不多起一个子进程）
+      if (args && args.selftest === true) out.selectors = await selftestReport()
+      return out
     },
   })
 
@@ -1861,7 +1875,7 @@ export function apply(ctx, config = {}) {
   // 契约（scripts/douyin_read.py）：一律 --json，stdout 只有一个 JSON 对象，进度走 stderr。
   // 这几个工具只读：不点赞、不关注、不收藏、不评论、不发布。
   const READ_ORDERS = ['totalrank', 'click', 'pubdate']
-  const READ_TIMEOUT = { hot: 120, search: 150, video: 150, comments: 180, notes: 150, messages: 180 }
+  const READ_TIMEOUT = { hot: 120, search: 150, video: 150, comments: 180, notes: 150, messages: 180, selftest: 300 }
   /** 只读工具的公共补充说明：撞验证码时怎么自救（配置写在 lib/state.mjs + EXTRA_DEFAULTS 那一层） */
   const HINT = '可用配置 readHeadless/verifyWait 切到可见窗口并在人工过验证后继续。'
 
@@ -1907,6 +1921,23 @@ export function apply(ctx, config = {}) {
     if (parsed.ok === false) return { ...parsed, exitCode: r.code }
     if (!r.ok) return { ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', items: parsed.items || [], output: tail(r.stderr, 8) }
     return { ...parsed, ok: true, exitCode: r.code }
+  }
+
+  /**
+   * 选择器体检（douyin_status 的可选 selftest 分支）：跑脚本的 selftest 子命令，结果原样放进 selectors。
+   * 体检要开 4 个页面，比单次查询慢，所以只在你显式要的时候才跑；失败也只回报原因，绝不把 douyin_status 弄挂。
+   */
+  async function selftestReport() {
+    let r = null
+    try {
+      r = await (readDeps.runRead || runRead)('selftest', [], READ_TIMEOUT.selftest)
+    } catch (e) {
+      return { ok: false, items: [], reason: '体检抛错: ' + String((e && e.message) || e) }
+    }
+    const out = { ok: !!(r && r.ok === true), items: Array.isArray(r && r.items) ? r.items : [] }
+    if (r && r.exitCode !== undefined && r.exitCode !== null) out.exitCode = r.exitCode
+    if (!out.ok) out.reason = (r && (r.reason || r.error)) || '体检没跑起来'
+    return out
   }
 
   // ── 4a. 热榜（只读）───────────────────────────────────────

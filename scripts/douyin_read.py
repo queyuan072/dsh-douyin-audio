@@ -14,6 +14,7 @@
     python douyin_read.py note --url https://www.douyin.com/note/<id> --json
     python douyin_read.py notes --limit 20 --json
     python douyin_read.py messages --limit 20 --json
+    python douyin_read.py selftest --json      # 选择器体检（热榜/推荐/通知/私信 4 个页面）
 
 输出统一:
     成功 {"ok": true,  "items": [...], "elapsed": 1.2}
@@ -34,7 +35,15 @@ items 结构:
                 type: 点赞 / 评论 / @我的 / 关注 / 私信 / 其他（按动作句归类，认不出就是「其他」，不猜）
     messages -> {user, lastText, time, unread}   unread 是整数（"99+" 记 99，读不到记 0）
 
+    selftest -> {name, label, url, selectors: [{sel, count}], verdict, hits, title?, reason?}
+                verdict: ok（该页关键候选组至少命中一个）/ missing（候选组全 0，DOM 可能已变）/
+                         unknown（页面打不开 / 被验证墙拦 / 需要登录态，reason 说原因）
+                        有一个例外：候选组全 0 但页面是抖音的 404 页（正文含「页面不见啦」）时，
+                        仍判 missing 并附 reason —— 那是 URL 变了，不是选择器失效
+                selectors 逐条列出候选选择器在该页的命中数 —— 用来回答「今天真没内容，还是选择器失效了」
+
 退出码: 0 = 成功; 2 = 失败（含无法启动浏览器、选择器全部未命中、被验证页拦截）
+  selftest 例外：verdict=missing 是**体检结论**不是失败，照样 ok:true / exit 0（只有起不了浏览器才 2）
 
 已知限制（真机实测）:
   * search 子命令在多数环境下会被抖音"验证码中间页"拦死（页面标题=验证码中间页、正文只剩几个字）。
@@ -1868,6 +1877,114 @@ def cmd_messages(page, args):
     return items
 
 
+# ---- selftest：选择器体检（只读；DOM 一变工具会静默返回空数组，这里能随时查出是哪种） ----
+# 关键选择器候选组一律**复用上面的常量**，不另造一套：
+#   热榜 -> HOT_ROWS；推荐页 -> VIDEO_LIKE/COMMENT/SHARE（推荐页和详情页是同一个播放器组件的按钮）；
+#   通知页 -> NOTES_ROWS；私信页 -> MESSAGES_ROWS（未读角标 MESSAGES_BADGE 不算关键）。
+SELFTEST_RECOMMEND = list(VIDEO_LIKE) + list(VIDEO_COMMENT) + list(VIDEO_SHARE)
+SELFTEST_PAGES = (
+    ("hot", "热榜", DOUYIN_HOST + "/hot", HOT_ROWS, False),
+    ("recommend", "推荐", DOUYIN_HOST + "/", SELFTEST_RECOMMEND, False),
+    ("notes", "通知", DOUYIN_NOTES_URL, NOTES_ROWS, True),
+    ("messages", "私信", DOUYIN_MESSAGES_URL, MESSAGES_ROWS, True),
+)
+
+SELFTEST_BODY = r"""
+  const out = [];
+  for (const s of (cfg.sels || [])) {
+    let n = 0;
+    try { n = document.querySelectorAll(s).length; } catch (err) { n = 0; }
+    out.push({ sel: s, count: n });
+  }
+  return { selectors: out, pageTitle: document.title || '',
+           bodyLen: (document.body ? (document.body.innerText || '').length : 0) };
+"""
+
+
+# 真机实测（本仓库当前版本）：路径不对时抖音渲染的是「页面不见啦 回首页看看」的 404 页。
+# 这种情况下候选组全 0 是**URL 变了**、不是 DOM 变了 —— 结论必须把这句话带出来，否则会被误读成选择器失效。
+_NOT_FOUND_MARKERS = ("页面不见啦",)
+
+
+def _page_not_found(page):
+    """命中抖音 404 页就返回一句话原因，否则 None"""
+    try:
+        body = page.evaluate("() => (document.body ? document.body.innerText : '').slice(0, 4000)")
+    except Exception:
+        return None
+    for kw in _NOT_FOUND_MARKERS:
+        if kw in (body or ""):
+            return "页面不存在（正文含「{}」），URL 可能已变 —— 不是选择器失效".format(kw)
+    return None
+
+
+def _selftest_counts(page, sels, step):
+    """每个候选选择器在该页的命中数。列表是异步渲染的：全 0 时等 1.5 秒再数一次，别把慢渲染当失效。"""
+    counts = [{"sel": s, "count": 0} for s in sels]
+    last_exc = None
+    for attempt in range(2):
+        try:
+            data = page.evaluate(_js(SELFTEST_BODY), {"sels": list(sels)}) or {}
+            got = [it for it in (data.get("selectors") or []) if isinstance(it, dict)]
+            if got:
+                counts = [{"sel": str(it.get("sel") or ""),
+                           "count": max(0, int(it.get("count") or 0))} for it in got]
+            last_exc = None
+        except Exception as exc:
+            last_exc = exc
+        if any(c["count"] > 0 for c in counts):
+            return counts
+        if attempt == 0:
+            with contextlib.suppress(Exception):
+                page.wait_for_timeout(1500)
+    if last_exc is not None:
+        raise StepError(step, "页面内统计脚本执行失败: {}".format(_brief(last_exc)))
+    return counts
+
+
+def cmd_selftest(page, args):
+    """依次体检 4 个页面：关键候选组全 0 -> missing；页面打不开/被验证墙拦/要登录 -> unknown 附原因。
+    这是**体检工具**：missing 也如实返回（ok:true），绝不因为选择器失效就把整个命令判失败。"""
+    has_login = bool(_cookie_records(args.cookies))
+    cookie_path = _resolve_cookie_file(args.cookies)
+    items = []
+    for name, label, url, sels, login_only in SELFTEST_PAGES:
+        entry = {"name": name, "label": label, "url": url, "selectors": []}
+        if login_only and not has_login:
+            # 没登录就不去开这一页：开了也只会把「登录墙」误报成「选择器失效」
+            entry["verdict"] = "unknown"
+            entry["reason"] = "需要登录态：没读到 cookie（{}）".format(cookie_path)
+            items.append(entry)
+            continue
+        try:
+            _goto(page, url, args, "selftest")
+            counts = _selftest_counts(page, sels, "selftest")
+        except StepError as exc:
+            entry["verdict"] = "unknown"
+            entry["reason"] = exc.reason
+            items.append(entry)
+            continue
+        hits = sum(c["count"] for c in counts)
+        entry["selectors"] = counts
+        entry["hits"] = hits
+        entry["title"] = _page_title(page)   # 落地页标题：区分「DOM 变了」和「打开的不是那一页」
+        if hits > 0:
+            entry["verdict"] = "ok"
+        else:
+            hint = _login_wall_hint(page)   # 全 0 + 页面上有登录墙 = 不是 DOM 变了，是没登录
+            entry["verdict"] = "unknown" if hint else "missing"
+            if hint:
+                entry["reason"] = hint
+            else:
+                not_found = _page_not_found(page)   # 全 0 + 是 404 页 = URL 变了，也不是选择器失效
+                if not_found:
+                    entry["reason"] = not_found
+        log("体检 {}（{}）: {} 命中 {}（页面标题={}）".format(
+            name, label, entry["verdict"], hits, entry["title"] or "空"))
+        items.append(entry)
+    return items
+
+
 # ---- whoami：看当前登录的是哪个号（只读，不发任何东西）--------------------
 DOUYIN_SELF_URL = "https://www.douyin.com/user/self"
 
@@ -1950,6 +2067,7 @@ HANDLERS = {
     "note": cmd_note,
     "notes": cmd_notes,
     "messages": cmd_messages,
+    "selftest": cmd_selftest,
 }
 
 
@@ -2008,14 +2126,16 @@ def parse_args(argv=None):
                 "  python douyin_read.py note --url https://www.douyin.com/note/<id> --json\n"
                 "  python douyin_read.py notes --limit 20 --json\n"
                 "  python douyin_read.py messages --limit 20 --json\n"
+                "  python douyin_read.py selftest --json\n"
                 "\n"
                 "公共选项（写在各子命令后面，例如 hot --browser-channel chrome --json）:\n"
                 "  --cookies FILE / --headless / --no-headless / --verify-wait SEC /\n"
                 "  --window-offscreen / --browser-channel {msedge,chrome,chromium,firefox,webkit} /\n"
                 "  --browser-executable PATH / --timeout SEC / --json\n"),
     )
-    sub = ap.add_subparsers(dest="command",
-                            metavar="{whoami,hot,search,video,comments,note,notes,messages}")
+    sub = ap.add_subparsers(
+        dest="command",
+        metavar="{whoami,hot,search,video,comments,note,notes,messages,selftest}")
     sub.required = True
 
     sub.add_parser("whoami", parents=[common],
@@ -2053,6 +2173,13 @@ def parse_args(argv=None):
         p.add_argument("--url", default=None,
                        help="页面地址，默认 {}".format(default_url))
 
+    # 体检：DOM 一变只读工具就静默返回空数组 —— 这个子命令随时回答「今天真没内容，还是选择器失效了」
+    sub.add_parser("selftest", parents=[common],
+                   help="选择器体检：热榜/推荐/通知/私信四个页面各数一遍关键选择器的命中数",
+                   description="依次打开热榜 / 推荐 / 通知 / 私信四个页面，报告每页关键选择器候选组的命中数。"
+                               "关键候选组全 0 记 missing，页面打不开或被验证墙拦记 unknown 并附原因；"
+                               "missing 不改退出码（体检如实报告，不当失败）。")
+
     args = ap.parse_args(argv)
     if getattr(args, "limit", None) is not None:
         args.limit = max(1, min(int(args.limit), 100))
@@ -2078,6 +2205,14 @@ def _emit(payload, as_json):
     items = payload.get("items") or []
     if not items:
         print("（无数据）")
+    if items and isinstance(items[0], dict) and "verdict" in items[0]:
+        for it in items:
+            hits = sum(int(c.get("count") or 0) for c in (it.get("selectors") or []))
+            print("{:<7} {:<9} 命中={:<4} {}{}".format(
+                it.get("verdict") or "?", it.get("name") or "?",
+                it.get("hits", hits), it.get("url") or "",
+                "  （{}）".format(it["reason"]) if it.get("reason") else ""))
+        return
     for it in items:
         print(" | ".join("{}={}".format(k, v) for k, v in it.items()))
 
