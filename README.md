@@ -138,11 +138,11 @@
 | `douyin_fetch` | `url`(string, 必填, http/https) / `preferSubtitle`(boolean, 默认 true) / `asr`(boolean, 默认 true) / `srt`(string, 可选路径) / `maxChars`(number, 默认 20000) | **字幕优先**：页面有现成字幕（人工 / AI）就直接取，返回 `source: "subtitle"` 与 `subtitleLang`（哪一路），**完全不跑 ASR**；字幕拿不到才退回本地 SenseVoice 转写，返回 `source: "asr"`；两条都不成是 `source: "none"` + `reason`。返回 `text` 与带时间轴的 `segments:[{start, dur, text}]` |
 
 - 参数怎么落到 CLI（契约两边共用，要改得一起改）：`--url U --json` 必带；`asr=false` → `--no-asr`；`srt` 给了 → `--srt <绝对路径>`。脚本 stdout 只有**一个** JSON（进度一律走 stderr），退出码 `ok=true → 0`、`ok=false → 2`。
-- `maxChars` **不传给脚本**（契约里 `--max-chars` 是可选的）：脚本那个参数会把 `segments` 一起截掉（时间轴缺尾巴），也看不出原文多长；所以截断只在插件层对 `text` 做，这样才能如实给 `truncated` / `textLength`。
+- `maxChars` 透传成 `--max-chars N`：脚本**只截 `text`**、`segments` 保持完整时间轴，并回报 `textLength`（截断前原长）/ `truncated`；插件层**不再截一遍**（避免双截断让标记失真）。uncated` / `textLength`。
 - 超时预算：默认 **600s**（字幕那条几秒就回，慢的是退回 ASR 那条）；`asr=false` 时 **180s**。
 - `text` 按 `maxChars` 截断并标记 `truncated: true`，原长在 `textLength`，另带一句 `truncateNote`；`segments` **不跟着截断**（时间轴保持完整）。
 - `srt` 给了才有 `srtPath`；文件其实没写成时带一句 `srtNote`（脚本可能跳过了落盘），不假装写成功。
-- `preferSubtitle=false` **透传不了**：脚本 CLI 契约里没有「关掉字幕优先」的开关，本次仍按字幕优先跑，返回里用 `subtitleNote` 说明。想**只认字幕、别跑 ASR** 就用 `asr=false`；两个都关（`asr=false` + `preferSubtitle=false`）直接拒（两条路都关了，拿不到文字）。
+- `preferSubtitle=false` 透传成 `--no-subtitle`：跳过字幕抓取、直接下音轨跑 ASR。想**只认字幕、别跑 ASR** 用 `asr=false`；两个都关（`--no-subtitle` + `--no-asr` 互相矛盾）直接拒绝。e`；两个都关（`asr=false` + `preferSubtitle=false`）直接拒（两条路都关了，拿不到文字）。
 - 失败**不抛异常**：脚本 `ok=false` → `{ ok: false, reason: <脚本给的原因>, output: <日志尾巴>, exitCode: 2 }`；输出不是 JSON → `{ ok: false, reason: "脚本输出不是 JSON（douyin_fetch 那一步）", output: <尾巴> }`；`maxChars` 越界 → `{ ok: false, reason }`（不夹取，也不去跑脚本）。
 - 这条**不读** `readHeadless` / `verifyWait`：脚本 CLI 没有 `--no-headless` / `--verify-wait` 这两个参数（要弹窗过验证就直接跑脚本，见 7.2 那种用法）。闸门是 ① 只读（`tierRead`）：不发评论、不点赞。
 

@@ -40,9 +40,11 @@
  *      canReusePython / setupLog / setupLogTail / setupRunning / setupResult），venv 探测同一次运行只探一次
  *   n. douyin_fetch（给定链接精准提取）：参数 url / preferSubtitle / asr / srt / maxChars；url 非 http(s)
  *      在插件层就被拒（桩一次都不起）；脚本 stdout 的 JSON 原样透出（source / subtitleLang / segments）；
- *      字幕+ASR 那次预算 600s、asr=false 时 180s 且带 --no-asr；srt 给了才传 --srt 并挂 srtPath；
+ *      字幕+ASR 那次预算 600s、asr=false 时 180s 且带 --no-asr；maxChars 透传成 --max-chars N；
+ *      preferSubtitle=false 透传成 --no-subtitle；srt 给了才传 --srt 并挂 srtPath；
  *      **脚本 ok=false 或输出非 JSON 时工具不抛异常**，只回 { ok:false, reason, output }；
- *      text 超 maxChars 截断并标记 truncated（原长在 textLength）。全部用 __fetchDeps 注入桩，不联网、不跑脚本。
+ *      truncated / textLength 一律用脚本回报的值（插件层**不再截一遍**，避免双截断）。
+ *      全部用 __fetchDeps 注入桩，不联网、不跑脚本。
  *   m. douyin_status(selftest:true) 额外跑一次选择器体检：不传 selftest 时返回里**没有** selectors 字段
  *      （默认零子进程）；传了就返回 { ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?}] }，
  *      verdict 只会是 ok / missing / unknown。用 __readDeps 注入假 runRead 断言，**不真起浏览器**。
@@ -1183,17 +1185,17 @@ else {
       ok: true, code: 0, stderr: '进度行（stderr）\n',
       stdout: JSON.stringify({
         ok: true, url: FETCH_URL, finalUrl: FETCH_URL, title: '桩标题', author: '桩作者', duration: 42,
-        source: 'subtitle', subtitleLang: 'zh-CN', text: '字幕正文一二三',
+        source: 'subtitle', subtitleLang: 'zh-CN', text: '字幕正文一二三', textLength: 7, truncated: false,
         segments: [{ start: 0, dur: 1.5, text: '字幕正文' }, { start: 1.5, dur: 1.5, text: '一二三' }], elapsed: 12.3,
       }),
     }
     const fetched = await callTool('douyin_fetch', { url: FETCH_URL })
     const fArgv = lastFetchArgv()
     const fBudget = lastFetchCall() ? lastFetchCall().timeoutSec : 0
-    // 契约里 --max-chars 是**可选**的；插件故意不传（脚本会连 segments 一起截，见 index.js runFetch 注释），
-    // 截断在插件层对 text 做 —— 所以这里断言 argv 里没有 --max-chars，别把双截断改回来。
-    if (argOf(fArgv, '--url') === FETCH_URL && fArgv.includes('--json') && !fArgv.includes('--max-chars')
-      && !fArgv.includes('--no-asr') && !fArgv.includes('--srt')) {
+    // maxChars 必须透传给脚本（脚本只截 text、segments 保持完整，并回报 textLength / truncated）；
+    // 插件层**不再截一遍**，否则就是双截断、truncated 也成了假话。
+    if (argOf(fArgv, '--url') === FETCH_URL && fArgv.includes('--json') && argOf(fArgv, '--max-chars') === '20000'
+      && !fArgv.includes('--no-asr') && !fArgv.includes('--no-subtitle') && !fArgv.includes('--srt')) {
       ok('argv 按 CLI 契约拼：' + JSON.stringify(fArgv))
     } else problem('douyin_fetch 的 argv 不对：' + JSON.stringify(fArgv))
     if (fBudget === 600) ok('默认（字幕优先 + 可退回 ASR）预算 600s —— ASR 慢，给足')
@@ -1245,19 +1247,29 @@ else {
       ok('脚本输出不是 JSON → ok:false + output 尾巴（不抛异常）')
     } else problem('非 JSON 那条不对：' + JSON.stringify(notJson))
 
-    // c) text 超 maxChars：截断 + 标记 truncated，原长留在 textLength
-    const longText = '字'.repeat(30000)
+    // c) 截断由脚本回报：text 已经是截好的 1000 字，truncated=true / textLength=30000（原长）原样透出，
+    //    插件层**不许再截一遍**（否则 text 被二次切断、textLength 也失真）
+    const cutText = '字'.repeat(1000)
     fetchNext = {
       ok: true, code: 0, stderr: '',
-      stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: '长文本', source: 'asr', text: longText,
-        segments: [{ start: 0, dur: 1, text: 'a' }], elapsed: 90 }),
+      stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: '长文本', source: 'asr', text: cutText,
+        textLength: 30000, truncated: true,
+        segments: [{ start: 0, dur: 1, text: 'a' }, { start: 1, dur: 1, text: 'b' }], elapsed: 90 }),
     }
     const truncRes = await callTool('douyin_fetch', { url: FETCH_URL, maxChars: 1000 })
-    if (truncRes && truncRes.ok === true && typeof truncRes.text === 'string' && truncRes.text.length === 1000
+    const truncArgv = lastFetchArgv()
+    if (argOf(truncArgv, '--max-chars') === '1000' && truncRes && truncRes.ok === true
       && truncRes.truncated === true && truncRes.textLength === 30000 && truncRes.maxChars === 1000
-      && typeof truncRes.truncateNote === 'string' && truncRes.segments.length === 1) {
-      ok('text 超 maxChars 被截断到 1000 并标记 truncated=true（原长 textLength=30000，segments 不动）')
-    } else problem('截断那条不对：' + JSON.stringify({ len: truncRes && String(truncRes.text || '').length, truncated: truncRes && truncRes.truncated, textLength: truncRes && truncRes.textLength }))
+      && truncRes.text === cutText && typeof truncRes.truncateNote === 'string' && truncRes.segments.length === 2) {
+      ok('脚本回报 truncated=true / textLength=30000 → 原样透出（argv 带 --max-chars 1000；插件层不二次截断，text 1000 字未动、segments 2 段完整）')
+    } else problem('截断透传那条不对：' + JSON.stringify({ argv: truncArgv, len: truncRes && String(truncRes.text || '').length, truncated: truncRes && truncRes.truncated, textLength: truncRes && truncRes.textLength }))
+
+    // 脚本没回报那两个字段时兜底：truncated=false、textLength=text.length（不炸，也不假装截过）
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: '一二三', segments: [], elapsed: 1 }) }
+    const fbRes = await callTool('douyin_fetch', { url: FETCH_URL })
+    if (fbRes && fbRes.ok === true && fbRes.truncated === false && fbRes.textLength === 3) {
+      ok('脚本没回报 truncated / textLength 时兜底成 false / text.length（3）')
+    } else problem('兜底那条不对：' + JSON.stringify(fbRes))
 
     // maxChars 越界：拒绝，不夹取、也不去跑脚本
     const beforeBadMc = fetchCalls.length
@@ -1266,12 +1278,14 @@ else {
       ok('maxChars 越界（0）被拒，且没去跑脚本')
     } else problem('maxChars 越界没被拒：' + JSON.stringify(badMc))
 
-    // preferSubtitle=false：契约里没有这个开关，不许自己加参数；只在返回里记一笔
-    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: 'x', segments: [], elapsed: 1 }) }
+    // preferSubtitle=false → 带 --no-subtitle（脚本跳过 yt-dlp 字幕抓取，直接下音轨跑 ASR），不再只是「说明」
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'asr', text: 'x', textLength: 1, truncated: false, segments: [], elapsed: 30 }) }
     const preRes = await callTool('douyin_fetch', { url: FETCH_URL, preferSubtitle: false })
-    if (preRes && typeof preRes.subtitleNote === 'string' && !lastFetchArgv().some((a) => a === '--no-subtitle')) {
-      ok('preferSubtitle=false 不越契约加参数（argv 里没有 --no-subtitle，只回 subtitleNote）')
-    } else problem('preferSubtitle=false 那条不对：' + JSON.stringify(lastFetchArgv()))
+    const preArgv = lastFetchArgv()
+    if (preArgv.includes('--no-subtitle') && !preArgv.includes('--no-asr') && argOf(preArgv, '--max-chars') === '20000'
+      && preRes && preRes.ok === true && preRes.source === 'asr' && preRes.subtitleNote === undefined) {
+      ok('preferSubtitle=false → argv 含 --no-subtitle（直接走 ASR，不再只是 subtitleNote）：' + JSON.stringify(preArgv))
+    } else problem('preferSubtitle=false 那条不对：' + JSON.stringify(preArgv) + ' → ' + JSON.stringify(preRes))
     // 两条路都关掉：直接拒，别白跑一次
     const bothOff = await callTool('douyin_fetch', { url: FETCH_URL, preferSubtitle: false, asr: false })
     if (bothOff && bothOff.ok === false && /两条路都关了/.test(String(bothOff.reason))) ok('preferSubtitle=false + asr=false 直接拒（不白跑脚本）')

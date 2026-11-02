@@ -1962,10 +1962,10 @@ export function apply(ctx, config = {}) {
     const cfg = merged()
     const python = await fetchDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
     if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
-    // 故意**不**传 --max-chars：脚本的 --max-chars 会连 segments 一起截（truncate_to），
-    // 那样既丢掉时间轴尾巴，也让下面 truncated / textLength 变成假话。截断只在插件层对 text 做。
-    const argv = ['--url', url, '--json']
+    // maxChars 交给脚本：--max-chars 只截 text，segments 保持完整时间轴，并回报 textLength / truncated
+    const argv = ['--url', url, '--json', '--max-chars', String(maxChars)]
     if (!asr) argv.push('--no-asr')
+    if (!preferSubtitle) argv.push('--no-subtitle')  // 关掉字幕优先：跳过 yt-dlp 字幕抓取，直接下音轨跑 ASR
     if (srt) argv.push('--srt', srt)
     const budget = asr ? FETCH_TIMEOUT_SEC.asr : FETCH_TIMEOUT_SEC.noAsr
     const r = await fetchDeps.run(python, fetchDeps.script, argv, { timeoutSec: budget, log })
@@ -1985,26 +1985,16 @@ export function apply(ctx, config = {}) {
     if (!r.ok) {
       return { ...parsed, ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', output: tail(r.stderr, 8) }
     }
-    // text 按 maxChars 截断（标记 + 原长），segments 原样留着：时间轴不该跟着被砍
+    // 截断在脚本层做（--max-chars 只截 text，segments 保持完整时间轴）：插件层**不再截一遍**，
+    // textLength（截断前原长）/ truncated 一律用脚本回报的值；脚本没给才按「没截断」兜底。
     const text = typeof parsed.text === 'string' ? parsed.text : ''
-    const truncated = text.length > maxChars
-    const res = {
-      ...parsed,
-      ok: true,
-      text: truncated ? text.slice(0, maxChars) : text,
-      truncated,
-      textLength: text.length,
-      maxChars,
-      exitCode: r.code,
-    }
-    if (truncated) res.truncateNote = 'text 已按 maxChars=' + maxChars + ' 截断（原长 ' + text.length + ' 字符）；segments 仍是完整时间轴'
+    const res = { ...parsed, ok: true, text, maxChars, exitCode: r.code }
+    if (typeof res.textLength !== 'number') res.textLength = text.length
+    if (typeof res.truncated !== 'boolean') res.truncated = false
+    if (res.truncated) res.truncateNote = 'text 已在脚本层按 maxChars=' + maxChars + ' 截断（原长 ' + res.textLength + ' 字符）；segments 仍是完整时间轴'
     if (srt) {
       res.srtPath = srt
       if (!existsSync(srt)) res.srtNote = '这个 srt 文件没写成（脚本可能跳过了落盘）'
-    }
-    if (!preferSubtitle) {
-      // 脚本 CLI 里没有「关掉字幕优先」的开关（契约固定，不能自己加参数）：老实说一句，不假装生效
-      res.subtitleNote = 'preferSubtitle=false 无法透传：脚本 CLI 契约里没有这个开关，本次仍按字幕优先跑'
     }
     return res
   }
@@ -2136,10 +2126,10 @@ export function apply(ctx, config = {}) {
     description: '按链接精准提取文字（只读）：字幕优先——有现成字幕（人工/AI）就直接用，不跑 ASR；字幕拿不到才退回本地 SenseVoice 转写。返回 text 与带时间轴的 segments（{start,dur,text}）。不点赞、不收藏、不评论。',
     parameters: {
       url: { type: 'string', description: '视频/图文页链接或短链，如 https://www.douyin.com/video/<id>' },
-      preferSubtitle: { type: 'boolean', description: '字幕优先，默认 true。脚本 CLI 契约里没有「关掉字幕优先」的开关，传 false 只在返回里记一笔（subtitleNote）' },
+      preferSubtitle: { type: 'boolean', description: '字幕优先，默认 true。false = 带 --no-subtitle 跳过字幕抓取，直接下音轨跑 ASR（与 asr=false 冲突，会直接拒）' },
       asr: { type: 'boolean', description: '字幕拿不到时是否退回本地 ASR，默认 true。false = 只认字幕（预算也从 600s 降到 180s）' },
       srt: { type: 'string', description: '可选：把字幕写成 SRT 落到这个路径（返回里有 srtPath；没写成会带 srtNote）' },
-      maxChars: { type: 'number', description: 'text 最多回多少字符，默认 20000；超出截断并标记 truncated（原长在 textLength）' },
+      maxChars: { type: 'number', description: 'text 最多保留多少字符，默认 20000（透传 --max-chars）；超了由脚本截断并回报 truncated / textLength，segments 保持完整时间轴' },
     },
     async execute(args) {
       const deny = requireTier('douyin_fetch', 'read')
@@ -2149,7 +2139,7 @@ export function apply(ctx, config = {}) {
       const asr = args.asr === undefined ? true : !!args.asr
       const preferSubtitle = args.preferSubtitle === undefined ? true : !!args.preferSubtitle
       if (!asr && !preferSubtitle) {
-        return { ok: false, reason: 'asr=false 且 preferSubtitle=false：字幕与 ASR 两条路都关了，拿不到 text' }
+        return { ok: false, reason: 'asr=false 且 preferSubtitle=false 互相矛盾：字幕与 ASR 两条路都关了，拿不到 text' }
       }
       const mc = checkMaxChars(args.maxChars)
       if (mc.error) return { ok: false, reason: mc.error }
