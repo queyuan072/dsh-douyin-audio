@@ -106,12 +106,30 @@ C1 插件 HTTP 路由加同源门（token / Sec-Fetch-Site / Origin==Host + **Ho
 
 ### 9.2 进行中：通知改走接口（P0-1）
 - 目标：`douyin_notes` 改拦 `/aweme/v1/web/notice/` 的 XHR（入口是页内弹层 `[data-e2e="listDlgTest-container"]`），不再抓不存在的通知页；返回结构保持 `type/user/text/time/url`
-- 上一轮探路因「开启子代理模型选择并重启」中止；断点笔记在 `D:\大肥鱼\工作区\notice-probe-notes.md`（存在就先读它，别从零重探）
-- 重启后的分工（用户 2026-11-04 定）：**GLM-5.3 负责实现，千问 `qwen3.8-flash` 负责独立只读复核**
-- 约束：子代理模型选择开关只对**新会话**生效；`codegeex-4` 不支持工具调用不能当子代理；`glm-4.5v` 是识图模型；headless 被风控拦时可 `--window-offscreen` 或弹可见窗口（最多等 5 分钟，超时如实失败）
+- **探路结论（2026-11-04，captures=0）：一条响应都没抓到，JSON 结构/分页/类型差异全部「未探到」**。完整断点笔记：`D:\大肥鱼\工作区\notice-probe-notes.md`（先读它，别从零重探）
+
+#### 9.2.1 三个硬卡点（决定「怎么验证」，务必先读）
+1. **沙箱禁 asyncio 命名管道 → playwright 在沙箱内起不来**：任何 playwright 脚本在启动驱动阶段 `PermissionError: [WinError 5]`（`asyncio/windows_utils.py` 建 `\\.\\pipe\\...`）；普通 subprocess 匿名管道反而正常。→ 子代理**不能**用沙箱内 python 做真机验证
+2. **宿主工具跑的是安装副本**（`C:\Users\20155\.dsh\profiles\desktop\node_modules\dsh-douyin-audio\scripts\*`），改仓库副本不生效 → 每次真机验证前**必须先同步安装副本**（脚本是每次调用现读，`.py` 改完即时生效，**不需要重启**；只有 `index.js`/`client.js` 改动才要重启）
+3. **`douyin_notes` 被能力闸门挡**：直接调返回 `{"ok":false,"code":"TIER_DISABLED","tier":"notify"}`。无闸门的真机入口只有 **`douyin_status({selftest:true})`**（跑 `scripts/douyin_read.py selftest`，预算 300s，真开浏览器）
+
+#### 9.2.2 探路过程中确认为真的坑
+- headless 在**热榜/推荐页**没被风控拦（selftest 实测 hot=ok/hits=71、recommend=ok/hits=3），但**不代表通知弹层安全**
+- Edge CDP 必须加 `--remote-allow-origins=*`，否则 WS 连上即断（`no close frame received or sent`）
+- CDP 不要用后台 reader task 并发收发；顺序 send→recv 才连得住
+- 每次换新 `--user-data-dir` + 新端口，否则新 Edge 把参数转交旧实例后自己退出
+- 注入 cookie 必须过滤已过期 `expires`（`douyin_read.py:224-227` 注释：37 条会掉到 35 条，抖音随后回验证码中间页）
+- 现成探针脚本在 `D:\大肥鱼\工作区\_diag\notes-probe\`（`probe_cdp.py` 直连 page 端点即可续跑 / `cdp_smoke.py` 20 行连通性验证），不进仓库
+
+#### 9.2.3 下一轮正确打法（已由上一轮实测否定过半条路）
+1. 先把探针挂进 `cmd_selftest` → **同步安装副本** → 用 `douyin_status({selftest:true})` 跑真机（这是唯一验证得通的路径）
+2. 拿到 `/aweme/v1/web/notice` 真实 JSON 后，再改 `cmd_notes` 与 selftest 的 notes 分支（`SELFTEST_PAGES` 那项改成「接口探到就 ok，探不到分清 notfound/missing/unknown」）
+3. 分工（用户 2026-11-04 定）：**GLM-5.3 实现、千问 `qwen3.8-flash` 只读复核**；子代理模型选择开关只对**新会话**生效；`codegeex-4` 无工具调用不能当子代理，`glm-4.5v` 是识图模型
+4. 交付前注意：`douyin_notes` 本身要能用，还需用户自己开 `tierNotify`（闸门不可由 agent 自解锁，见 §4-H1）
 
 ### 9.3 重启后接着做
-1. 派 GLM-5.3 探 `/aweme/v1/web/notice/` 真实返回结构 → 改 `scripts/douyin_read.py` 的 `cmd_notes` + selftest 通知组判定
-2. 千问按任务书逐条只读复核（重点：有没有编造条目、失败是否明确说不可信）
-3. 通过后：同步安装副本 → `node selfcheck.mjs`（必须「17 个工具」）→ 升 1.5.0 → commit → push origin + gitcode → 打 `v1.5.0`
+1. 派 GLM-5.3：按 §9.2.3 先挂探针进 `cmd_selftest`，取到真实 JSON 结构 → 改 `scripts/douyin_read.py` 的 `cmd_notes` + selftest 通知组判定
+2. 千问按任务书逐条只读复核（重点：有没有编造条目、失败是否明确说不可信、闸门语义有没有被破坏）
+3. 通过后：同步安装副本 → 真机 `douyin_status({selftest:true})` 复验 → `node selfcheck.mjs`（必须「17 个工具」）→ 升 1.5.0 → commit → push origin + gitcode → 打 `v1.5.0`
+4. 密钥补丁与本次改动无关联，别混在同一个 commit 里
 
