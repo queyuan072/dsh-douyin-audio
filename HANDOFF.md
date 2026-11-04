@@ -1,7 +1,7 @@
 # HANDOFF —— 当前状态与决策记录
 
 > 用途：会话上下文过长时，新开会话直接读本文件即可接手，不需要翻历史。
-> 最后更新：2026-11-04（对应 1.4.0 / 见 `git log`）
+> 最后更新：2026-11-04 第二轮（1.4.0 待升 1.5.0 / 见 `git log` 与 §9）
 
 ## 1. 现在是什么状态
 
@@ -95,3 +95,23 @@ C1 插件 HTTP 路由加同源门（token / Sec-Fetch-Site / Origin==Host + **Ho
 - `zhipu`：`https://open.bigmodel.cn/api/paas/v4`，OpenAI Chat Completions
   模型：`glm-5.3`、`glm-5.3-flash`（文本）、`glm-4.5v`（文本+图片）、`codegeex-4`（文本，**无工具调用**）
 - 两家都实测支持工具调用（除 codegeex-4）
+## 9. 2026-11-04 第二轮（P0 攻坚中）
+
+### 9.1 已完成：密钥双路径兜底（P0-2）
+- 病灶：`dsh-glm-agent/index.js:14`、`dsh-qwen-agent/index.js:14` 硬编码 `D:\大肥鱼\工作区\ai\key.txt`；工作区被清空两次 → `glm_ask`/`qwen_ask` 双双失效
+- 修法：候选路径 `['C:\Users\20155\.dsh\ai\key.txt', 'D:\大肥鱼\工作区\ai\key.txt']` 前者优先；`resolveKeyFile(configured)` 保持 `config.keyFile` 最优；解析时机改为每次 execute 现解析（后补 key 不必重启插件）；报错区分「文件都不存在」/「文件在但没合规 key」
+- 已落盘并实测：新 key sha256 `0A9F96AA…F7F7B`（与旧文件逐字节一致）、两插件 `node --check` exit 0、真实路径解析 8 项全 PASS、key 体检 2 个有效 key（GLM 49 字符 / 千问 `sk-` 116 字符）
+- **留档**：`C:\Users\20155\.dsh\ai\patches\`（两份改好的 index.js + README）。这两个插件在工作区**没有源码仓库**，安装副本就是唯一源码，重装/升级会覆盖回单路径硬编码，必须照 README 重打
+- **生效前提**：重启 DSH（插件代码在启动时加载；本会话内改了不生效）
+
+### 9.2 进行中：通知改走接口（P0-1）
+- 目标：`douyin_notes` 改拦 `/aweme/v1/web/notice/` 的 XHR（入口是页内弹层 `[data-e2e="listDlgTest-container"]`），不再抓不存在的通知页；返回结构保持 `type/user/text/time/url`
+- 上一轮探路因「开启子代理模型选择并重启」中止；断点笔记在 `D:\大肥鱼\工作区\notice-probe-notes.md`（存在就先读它，别从零重探）
+- 重启后的分工（用户 2026-11-04 定）：**GLM-5.3 负责实现，千问 `qwen3.8-flash` 负责独立只读复核**
+- 约束：子代理模型选择开关只对**新会话**生效；`codegeex-4` 不支持工具调用不能当子代理；`glm-4.5v` 是识图模型；headless 被风控拦时可 `--window-offscreen` 或弹可见窗口（最多等 5 分钟，超时如实失败）
+
+### 9.3 重启后接着做
+1. 派 GLM-5.3 探 `/aweme/v1/web/notice/` 真实返回结构 → 改 `scripts/douyin_read.py` 的 `cmd_notes` + selftest 通知组判定
+2. 千问按任务书逐条只读复核（重点：有没有编造条目、失败是否明确说不可信）
+3. 通过后：同步安装副本 → `node selfcheck.mjs`（必须「17 个工具」）→ 升 1.5.0 → commit → push origin + gitcode → 打 `v1.5.0`
+
