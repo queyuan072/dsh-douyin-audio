@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 .verify-tmp/
-undefined/
 .DS_Store
 Thumbs.db
 *.log
@@ -12,3 +11,5 @@ Thumbs.db
 *.tgz
 venv/
 .venv/
+_diag/
+profiles/

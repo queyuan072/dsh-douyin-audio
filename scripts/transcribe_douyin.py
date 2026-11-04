@@ -23,6 +23,10 @@
   *) 切点默认做「静音吸附」：每片多探 2s，在片尾前 10s ~ 片尾后 2s 的能量包络里挑最安静的
      位置下刀（等价 silencedetect=noise=-35dB:d=0.25，但不额外起 ffmpeg）；找不到静音退回硬切。
      --no-snap 可关掉，退回固定硬切（对比用）。
+  *) 时长探测失败（probe_duration → None）不回退「整段一次解码」——改盲切推进：每次只解
+     chunk 秒、按实际解出的秒数前进，解不出音频即到结尾（--json 信封 durationUnknown=true）；
+  *) 单片解码失败不再静默吞掉：失败区间写进 --json 信封 failedRanges，丢片超过 1/3 整段判
+     失败（ChunkLossError）——部分内容被丢的结果不许冒充成功。
 
 退出码: 0 全部成功 / 1 有条目失败 / 2 用法或环境错误
 """
@@ -39,7 +43,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 
 def _default_threads() -> int:
@@ -174,7 +178,7 @@ _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 
 
 def probe_duration(ffmpeg: str, media_path: str, timeout: int = 30) -> float | None:
-    """媒体时长（秒）。ffprobe 优先，回退解析 ffmpeg 的 Duration 行；取不到就 None —— 不许因此让转写失败。"""
+    """媒体时长（秒）。ffprobe 优先，回退解析 ffmpeg 的 Duration 行；取不到就 None —— 调用方按盲切推进，不许因此让转写失败，更不许回退「整段一次解码」。"""
     try:
         ffprobe = resolve_tool(None, "ffprobe")
         if ffprobe:
@@ -266,6 +270,12 @@ def load_recognizer(model_dir: str, threads: int = DEFAULT_THREADS):
 
 
 CHUNK_SEC = 30.0   # 分片长度：SenseVoice 是离线「单句」模型，整段喂进去会在超窗后静默丢内容
+
+# 分片失败的可信度闸门：丢片 ≤ 1/3 时仍返回文本，但失败区间会写进 --json 信封 failedRanges；
+# 超过阈值整段抛 ChunkLossError 判失败——「部分内容被丢」不许伪装成成功。
+CHUNK_FAIL_RATIO = 1.0 / 3.0
+# 盲切（时长未知）的安全上限：每片 chunk 秒、解到解不出音频为止；触顶说明推进失控，显式报错
+BLIND_MAX_CHUNKS = 2000
 
 # ---- 静音吸附切点 ----------------------------------------------------------
 # 固定 chunk 秒硬切会把词切两半（输出里能看到「…着，。」「…了。。」这类残句）。
@@ -378,10 +388,14 @@ def _decode_once(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
             pass
 
 
+class ChunkLossError(RuntimeError):
+    """分片丢失超阈值（或盲切推进失败）：整段转写不可信，显式判失败，绝不冒充成功。"""
+
+
 def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
                      start: float | None = None, dur: float | None = None,
                      chunk: float = CHUNK_SEC, segments_out: list | None = None,
-                     snap: bool = True) -> str:
+                     snap: bool = True, stats_out: dict | None = None) -> str:
     """
     媒体文件 → 转写文本。
 
@@ -392,45 +406,148 @@ def transcribe_media(recognizer, ffmpeg: str, media_path: str, tmp_root: str,
     分段：给了 segments_out(list) 就把每片的 {"start","dur","text"} append 进去
     （start 相对媒体起点，秒）。不传时返回值/行为与从前完全一致 —— 仍是 str。
     snap=False 关掉静音吸附，退回固定 chunk 秒硬切。
-    """
-    total = dur if dur is not None else probe_duration(ffmpeg, media_path)
-    base = float(start or 0.0)
-    segs: list = [] if segments_out is None else segments_out
-    if not total or total <= chunk * 1.5:
-        text, used, _ = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
-                                     start=start, dur=dur)
-        if text:
-            segs.append({"start": round(base, 3), "dur": round(used, 3), "text": text})
-        return text
 
-    end = base + float(total)
-    parts: list[str] = []
-    lookahead = SNAP_LOOKAHEAD if (snap and chunk >= SNAP_MIN_CHUNK) else 0.0
-    lead_back = min(SNAP_LEAD_BACK, chunk * 0.5)  # 片很短时窗口别倒到片头之前
-    idx = 0
-    t = base
-    while t < end - 0.2:
-        idx += 1
-        nominal = min(chunk, end - t)
-        win = None
-        # 只有「后面还有不止一片」时才值得吸附：最后一片本来就到结尾了
-        if lookahead and (end - t) > chunk + 0.2:
-            win = (max(0.0, chunk - lead_back), chunk + lookahead)
-        try:
-            piece, used, snapped = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
-                                                start=t, dur=nominal, snap=win)
-        except Exception as exc:  # 单片失败不该毁掉整段
-            eprint(f"      片 {idx} 失败（{t:.0f}s +{nominal:.0f}s）: {one_line(str(exc), 120)}")
-            piece, used, snapped = "", nominal, False
-        if used <= 0.05:  # 解出空音频也要往前走，否则死循环
-            used = nominal
-        if piece:
-            parts.append(piece)
-            segs.append({"start": round(t, 3), "dur": round(used, 3), "text": piece})
-        eprint(f"      片 {idx}: {t:.1f}s +{used:.1f}s"
-               f"（{'静音吸附' if snapped else '硬切'}，名义 {nominal:.1f}s）→ {len(piece)} 字")
-        t += used
-    return "\n".join(parts)
+    可信度（v1.3.1，修 P1 静默失败）：
+      *) 时长探测失败（probe_duration → None）**不回退**「整段一次解码」——那是历史丢内容
+         bug 的复活通道。改盲切推进：每次只解 chunk 秒，按实际解出的秒数 t += used 前进，
+         解不出音频（used≈0）即到结尾；stats_out["durationUnknown"] = True 标记这条降级路径。
+      *) 单片解码失败不再静默吞掉：失败区间记进 stats_out["failedRanges"]（{"start","dur",
+         "error"}），失败片占比或丢秒占比 ≥ CHUNK_FAIL_RATIO（1/3）时抛 ChunkLossError 整段
+         判失败 —— douyin_fetch.py 复用本函数，同样拿到显式失败而不是残缺文本的 ok:true。
+      *) stats_out(dict) 在 finally 里写回本次分片统计（异常路径也写）：durationUnknown /
+         chunksTotal / chunksFailed / coveredSeconds / failedSeconds / emptySeconds /
+         spanSeconds / failedRanges。解出空音频（音轨比容器短等）单独记 emptySeconds 不算
+         失败，但 spanSeconds 与 coveredSeconds 的差会在信封里暴露未覆盖区间。
+    """
+    stats: dict = {"durationUnknown": False, "chunksTotal": 0, "chunksFailed": 0,
+                   "coveredSeconds": 0.0, "failedSeconds": 0.0, "emptySeconds": 0.0,
+                   "spanSeconds": 0.0, "failedRanges": []}
+    try:
+        total = dur if dur is not None else probe_duration(ffmpeg, media_path)
+        base = float(start or 0.0)
+        segs: list = [] if segments_out is None else segments_out
+        parts: list[str] = []
+        lookahead = SNAP_LOOKAHEAD if (snap and chunk >= SNAP_MIN_CHUNK) else 0.0
+        lead_back = min(SNAP_LEAD_BACK, chunk * 0.5)  # 片很短时窗口别倒到片头之前
+
+        # 单片快速路径：**时长已知**且不长（或显式 --chunk 0 的旧行为）才允许一次解完。
+        # 时长未知绝不走这里——整段单次解码超窗后会静默丢内容，不许它借「探测失败」复活。
+        if total is not None and total <= chunk * 1.5:
+            stats["chunksTotal"] = 1
+            try:
+                text, used, _ = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
+                                             start=start, dur=dur)
+            except Exception as exc:
+                stats["chunksFailed"] = 1
+                stats["failedRanges"].append({"start": round(base, 3), "dur": None,
+                                              "error": one_line(exc, 160)})
+                raise
+            stats["coveredSeconds"] = used
+            stats["spanSeconds"] = used
+            if used <= 0.05:  # 一个采样都没解出来：区间里没有音频数据，不能当「成功且无话」
+                raise ChunkLossError(
+                    f"区间 {base:.0f}s 起 +{(dur or 0):.0f}s 没有解出任何音频数据"
+                    f"（音轨缺失或区间越界），无可转写内容")
+            if text:
+                segs.append({"start": round(base, 3), "dur": round(used, 3), "text": text})
+            return text
+
+        if total is None:
+            # ---- 盲切推进：时长未知，解到「解不出音频」为止；推进只信实际解出的秒数 ----
+            stats["durationUnknown"] = True
+            eprint(f"[时长] 探测失败（ffprobe / ffmpeg Duration 都没给出），按 {chunk:g}s 盲切推进")
+            t, idx = base, 0
+            while True:
+                if idx >= BLIND_MAX_CHUNKS:
+                    raise ChunkLossError(
+                        f"盲切推进已解 {idx} 片（每片 {chunk:g}s）仍未到音频结尾，推进异常，中止")
+                win = (max(0.0, chunk - lead_back), chunk + lookahead) if lookahead else None
+                try:
+                    piece, used, snapped = _decode_once(recognizer, ffmpeg, media_path,
+                                                        tmp_root, start=t, dur=chunk, snap=win)
+                except Exception as exc:
+                    # 盲切没有「名义时长」兜底：这片起失败，其后音频是否被覆盖无法证明，必须显式失败
+                    stats["chunksTotal"] = idx + 1
+                    stats["chunksFailed"] = 1
+                    stats["failedRanges"].append({"start": round(t, 3), "dur": None,
+                                                  "error": one_line(exc, 160)})
+                    raise ChunkLossError(
+                        f"盲切模式（时长未知）下片 {idx + 1}（{t:.0f}s 起）解码失败: "
+                        f"{one_line(exc, 160)}；已成功覆盖 {stats['coveredSeconds']:.0f}s，"
+                        f"其后音频是否转出无法证明，整段结果不可信") from None
+                if used <= 0.05:  # 这段没解出音频 = 到结尾（或起点越界）
+                    break
+                idx += 1
+                stats["chunksTotal"] = idx
+                stats["coveredSeconds"] = round(stats["coveredSeconds"] + used, 3)
+                if piece:
+                    parts.append(piece)
+                    segs.append({"start": round(t, 3), "dur": round(used, 3), "text": piece})
+                eprint(f"      片 {idx}: {t:.1f}s +{used:.1f}s"
+                       f"（{'静音吸附' if snapped else '硬切'}，名义 {chunk:.1f}s）→ {len(piece)} 字")
+                t += used
+                if not snapped and used < chunk - 0.2:
+                    break  # 没吸附却比请求短 → 音频在这片中间就结束了，这就是最后一片
+            stats["spanSeconds"] = round(t - base, 3)
+            return "\n".join(parts)
+
+        # ---- 时长已知：按 chunk 循环，单片失败记账不静默，丢片超阈值整段判失败 ----
+        end = base + float(total)
+        idx = 0
+        t = base
+        while t < end - 0.2:
+            idx += 1
+            stats["chunksTotal"] = idx
+            nominal = min(chunk, end - t)
+            win = None
+            # 只有「后面还有不止一片」时才值得吸附：最后一片本来就到结尾了
+            if lookahead and (end - t) > chunk + 0.2:
+                win = (max(0.0, chunk - lead_back), chunk + lookahead)
+            try:
+                piece, used, snapped = _decode_once(recognizer, ffmpeg, media_path, tmp_root,
+                                                    start=t, dur=nominal, snap=win)
+            except Exception as exc:  # 单片失败不毁掉整段，但必须记账进信封——不许静默
+                stats["chunksFailed"] += 1
+                stats["failedSeconds"] = round(stats["failedSeconds"] + nominal, 3)
+                stats["failedRanges"].append({"start": round(t, 3), "dur": round(nominal, 3),
+                                              "error": one_line(exc, 160)})
+                eprint(f"      片 {idx} 失败（{t:.0f}s +{nominal:.0f}s）: {one_line(str(exc), 120)}")
+                piece, used, snapped = "", nominal, False
+            else:
+                if used <= 0.05:  # 解出空音频（音轨比容器短/数据缺失/区间越界）：显式记账，不算失败
+                    stats["emptySeconds"] = round(stats["emptySeconds"] + nominal, 3)
+                    used = nominal  # 空片也按名义推进，否则死循环
+                else:
+                    stats["coveredSeconds"] = round(stats["coveredSeconds"] + used, 3)
+            if piece:
+                parts.append(piece)
+                segs.append({"start": round(t, 3), "dur": round(used, 3), "text": piece})
+            eprint(f"      片 {idx}: {t:.1f}s +{used:.1f}s"
+                   f"（{'静音吸附' if snapped else '硬切'}，名义 {nominal:.1f}s）→ {len(piece)} 字")
+            t += used
+        stats["spanSeconds"] = round(float(total), 3)
+
+        if stats["chunksFailed"]:
+            lost_ratio = stats["chunksFailed"] / stats["chunksTotal"]
+            attempted = stats["coveredSeconds"] + stats["failedSeconds"] + stats["emptySeconds"]
+            sec_ratio = (stats["failedSeconds"] / attempted) if attempted > 0 else 0.0
+            if max(lost_ratio, sec_ratio) >= CHUNK_FAIL_RATIO:
+                ranges = "；".join(f"{r['start']:.0f}s+{r['dur']:.0f}s"
+                                   for r in stats["failedRanges"][:5])
+                more = f" 等 {len(stats['failedRanges'])} 片" if len(stats["failedRanges"]) > 5 else ""
+                raise ChunkLossError(
+                    f"{stats['chunksFailed']}/{stats['chunksTotal']} 分片解码失败"
+                    f"（丢失约 {stats['failedSeconds']:.0f}s / {attempted:.0f}s，"
+                    f"≥{CHUNK_FAIL_RATIO:.0%} 阈值），转写结果不可信，已放弃整段文本: {ranges}{more}")
+        if stats["coveredSeconds"] <= 0.0:
+            raise ChunkLossError(
+                f"整个区间（{base:.0f}s 起 +{float(total):.0f}s）没有解出任何音频数据"
+                f"（音轨缺失或区间越界），无可转写内容")
+        return "\n".join(parts)
+    finally:
+        if stats_out is not None:
+            stats_out.clear()
+            stats_out.update(stats)
 
 
 # --------------------------------------------------------------------------
@@ -598,7 +715,7 @@ def run(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", dest="out", metavar="PATH", default=None,
                     help="把文本结果写到这个文件（不给就打到 stdout）")
     ap.add_argument("--json", dest="as_json", action="store_true",
-                    help="把结果以 JSON 打到 stdout: {ok, threads, items:[{source,text,error,duration}], model, elapsed}")
+                    help="把结果以 JSON 打到 stdout: {ok, threads, items:[{source,text,error,duration,segments,chunksTotal,chunksFailed,coveredSeconds,failedSeconds,emptySeconds,spanSeconds,failedRanges,durationUnknown}], model, elapsed}")
     ap.add_argument("--chunk", dest="chunk", type=float, default=CHUNK_SEC, metavar="SEC",
                     help=f"分片长度（秒，默认 {CHUNK_SEC:g}）；0 = 不分片、整段一次解码（旧行为，长音频会静默丢内容）")
     ap.add_argument("--srt", dest="srt", default=None, metavar="PATH",
@@ -706,6 +823,7 @@ def run(argv: list[str] | None = None) -> int:
             result["items"].append(entry)
             texts.append(f"{it.get('screen') or '-'}|{it.get('title') or os.path.basename(it['source'])}|[转写失败] {entry['error']}")
             continue
+        chunk_stats: dict = {}
         try:
             if not tmp_root:
                 raise RuntimeError("没有可写的临时目录（可用 DSH_DOUYIN_TMP 指定）")
@@ -727,16 +845,19 @@ def run(argv: list[str] | None = None) -> int:
                                                 start=args.start, dur=args.dur,
                                                 chunk=(chunk if chunk > 0 else 10 ** 9),
                                                 segments_out=entry["segments"],
-                                                snap=not getattr(args, "no_snap", False))
+                                                snap=not getattr(args, "no_snap", False),
+                                                stats_out=chunk_stats)
             finally:
                 if downloaded:
                     try:
                         os.remove(downloaded)
                     except OSError:
                         pass
+            entry.update(chunk_stats)  # 分片统计进信封：durationUnknown/chunksFailed/failedRanges…
             text = entry["text"]
             eprint(f"      → {text[:120]}")
         except Exception as exc:  # 不裸 traceback：异常文本进 error 字段
+            entry.update(chunk_stats)  # 失败路径同样带上分片统计（若有）——丢片不许静默
             entry["error"] = one_line(f"{type(exc).__name__}: {exc}", 400)
             failing += 1
             eprint(f"      → 转写失败: {entry['error']}")

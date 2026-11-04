@@ -44,7 +44,8 @@
     点完发现方向不对（数字下降）就隔 1 秒再点一次把它点回来，让结束状态等于意图。
     两次都校不回来（比如每次点击都被风控吞掉）就如实返回 ok:false / state:'uncertain'，绝不假装成功。
     页面若提供 aria-pressed / data-pressed / data-active 会先用它短路（真机实测这些属性不存在）。
-    unlike/uncollect 且计数为 0 时可以确定「本来就没有」，直接 0 次点击。
+    unlike/uncollect 且计数为可观测的 0 时可以确定「本来就没有」，直接 0 次点击；
+    读不到数字（inner_text 为空）时不点击，如实报 ok:false / state:'uncertain'。
   * 不绕过人机验证：撞验证码按 douyin_read.py 的文案报错；--verify-wait N 只是给你 N 秒手动处理的时间。
 """
 
@@ -866,8 +867,14 @@ def perform(page, args, action, url=None):
         return _payload(action, url, before, before, False, target_state, clicks=0)
 
     if pressed is None and action in ("unlike", "uncollect") and before == 0:
-        log("计数为 0，本来就没{}，不点击".format(verb[2:] if len(verb) > 2 else verb))
-        return _payload(action, url, 0, 0, False, target_state, clicks=0)
+        if _count_observable(before_text):
+            log("计数为 0，本来就没{}，不点击".format(verb[2:] if len(verb) > 2 else verb))
+            return _payload(action, url, 0, 0, False, target_state, clicks=0)
+        # 读不到数字 ≠ 本来就没赞：点一下反而可能把「没赞」翻成「有赞」。
+        # 不点击、不替用户断言，如实报 uncertain（对齐下方 _count_observable 防线）。
+        reason = "计数不可观测（按钮文本 {!r} 无数字），无法确认是否已{}，未点击，状态未知".format(before_text, verb)
+        log(reason)
+        return _payload(action, url, before, before, False, "uncertain", clicks=0, reason=reason)
 
     timeout_s = getattr(args, "timeout", 30.0)
     login_wall = bool(pre_nodes or pre_hits)   # 页面上已经有登录提示：点击预算收短，别在 actionability 上耗

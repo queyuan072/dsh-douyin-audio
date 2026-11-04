@@ -28,7 +28,7 @@ v2.7 新增：
     python douyin_scroller.py --delay 3.0         # 每屏停留 3 秒
     python douyin_scroller.py --headless          # 后台刷（不弹窗口）
 
-退出码: 0 = 正常刷完; 2 = 失败（验证码/登录墙挡死、页面卡死、浏览器异常）
+退出码: 0 = 正常刷完; 2 = 失败（验证码/登录墙挡死、页面卡死、浏览器异常、manifest 写失败）
 按 Ctrl+C 随时停止。
 """
 
@@ -200,6 +200,19 @@ def _brief(exc, limit=200):
     except Exception:
         text = exc.__class__.__name__
     return text[:limit] or exc.__class__.__name__
+
+
+class ManifestWriteError(Exception):
+    """manifest 清单写失败 —— 这条通道负责上报直链与 NO_AUDIO 标记，它自己坏了必须响，不许静默"""
+
+
+def _append_manifest(line):
+    """向 manifest 追加一行；磁盘满/权限/目录被删等写失败抛 ManifestWriteError（调用方据此终止整次运行）"""
+    try:
+        with open(MANIFEST, "a", encoding="utf-8") as mf:
+            mf.write(line)
+    except OSError as exc:
+        raise ManifestWriteError("manifest 写入失败（{}）: {}".format(MANIFEST, exc)) from exc
 
 
 def _require_executable(path):
@@ -848,8 +861,12 @@ def main():
             try:
                 with open(MANIFEST, "w", encoding="utf-8") as mf:
                     mf.write(f"# 抖音刷视频清单 v2.7 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            except Exception:
-                pass
+            except OSError as exc:
+                # 清单初始化都写不进去（磁盘满/权限/路径被占），后面每屏必然也写失败：
+                # 上报通道坏了就别开刷，响亮失败，别静默丢一整份清单。
+                print(f"\n[出错] manifest 初始化写失败（{MANIFEST}）: {exc}")
+                browser.close()
+                sys.exit(2)
             print("[2/3] 开始自动刷视频（Ctrl+C 可随时停止）...")
             recommend_mode = is_recommend_mode(page)
             if recommend_mode:
@@ -1002,13 +1019,13 @@ def main():
                         cands = grab_media_candidates(page)
                         media = cands[0] if cands else ""
                         sig = last_sig or get_video_signature(page)
-                        with open(MANIFEST, "a", encoding="utf-8") as mf:
-                            mf.write(f"{scrolled}|{sig[:60].replace('|', ' ')}|{media}\n")
+                        _append_manifest(f"{scrolled}|{sig[:60].replace('|', ' ')}|{media}\n")
                         # 可选：下载 mp4（含音轨）供后续声音转写
                         if args.save_all and cands:
                             vpath = os.path.join(VIDEO_DIR, f"video_{scrolled:03d}.mp4")
                             chosen = None
                             fallback = None
+                            unknown = None   # 音轨探测未知（ffmpeg 缺失/探测失败）的候选，≠ 有音轨
                             for cand in cands[:4]:
                                 tmp = vpath + ".part"
                                 if not download_video(cand, tmp, timeout=args.download_timeout):
@@ -1022,13 +1039,28 @@ def main():
                                         pass
                                     continue
                                 aud = has_audio_stream(tmp)
-                                if aud is not False:
+                                if aud is True:
                                     os.replace(tmp, vpath)
                                     if digest:
                                         _seen_hashes.add(digest)
                                     chosen = cand
                                     break
-                                if fallback is None:
+                                if aud is None:
+                                    # 未知 ≠ 有音轨：文件先保住（也许实际有音轨、能转写），
+                                    # 但绝不冒充「含音轨」，manifest 显式标 AUDIO_UNKNOWN。
+                                    if unknown is None:
+                                        os.replace(tmp, vpath)
+                                        if digest:
+                                            _seen_hashes.add(digest)
+                                        unknown = cand
+                                    else:
+                                        try:
+                                            os.remove(tmp)
+                                        except OSError:
+                                            pass
+                                    continue
+                                # aud is False：确认无音轨；别覆盖已保住的未知候选（那个更有转写价值）
+                                if unknown is None and fallback is None:
                                     os.replace(tmp, vpath)
                                     fallback = cand
                                 else:
@@ -1038,12 +1070,16 @@ def main():
                                         pass
                             if chosen:
                                 print(f"\n[下载] 视频已存 {vpath}（含音轨）")
+                            elif unknown:
+                                _append_manifest(f"# AUDIO_UNKNOWN screen={scrolled} url={unknown}\n")
+                                print(f"\n[下载] 视频已存 {vpath} 警告: 音轨未知（ffmpeg 不可用或探测失败，无法验证），该屏不一定能转写")
                             elif fallback:
-                                with open(MANIFEST, "a", encoding="utf-8") as mf:
-                                    mf.write(f"# NO_AUDIO screen={scrolled} url={fallback}\n")
+                                _append_manifest(f"# NO_AUDIO screen={scrolled} url={fallback}\n")
                                 print("\n[下载] 视频已存 " + vpath + " 警告: 无音轨/重复，该屏无法转写")
                             else:
                                 print(f"\n[下载] 第 {scrolled} 屏视频下载失败或全部重复，已跳过")
+                    except ManifestWriteError:
+                        raise   # 清单写失败 = 上报通道自身坏了，穿透静默层让整次运行非零结束
                     except Exception:
                         pass
                 elif args.shot_every > 0 and scrolled % args.shot_every == 0:

@@ -29,6 +29,10 @@ stdout 只输出一个 JSON 对象（进度一律走 stderr），字段：
   {"ok","url","finalUrl","title","author","duration","source","subtitleLang",
    "text","textLength","truncated","segments","reason","elapsed"}
   · textLength = --max-chars 截断前的原长；truncated = 是否截断（segments 始终保持完整时间轴）
+  · ASR 路径附带分片统计（字段名沿用 transcribe_douyin）：durationUnknown/chunksTotal/
+    chunksFailed/coveredSeconds/failedSeconds/emptySeconds/spanSeconds/failedRanges ——
+    丢片占比 ≥1/3 时整段判失败（ok=false）；阈值内仍 ok=true，但统计照样进信封，
+    残缺文本不许冒充完整结果
   · 只有「抖音页面 → 浏览器兜底」这条路会多出 resolvedBy="browser" 与 mediaUrl（已脱敏）
 退出码: ok=true → 0；ok=false → 2（沿用本项目其它脚本的约定）
 """
@@ -426,8 +430,15 @@ def read_meta(path: str) -> dict:
 
 
 def run_asr(media_path: str, model_dir: str, threads: int, chunk: float,
-            snap: bool, tmp_root: str) -> tuple[str, list[dict]]:
-    """复用 transcribe_douyin：load_recognizer + 分片/静音吸附 + segments_out。"""
+            snap: bool, tmp_root: str,
+            stats_out: dict | None = None) -> tuple[str, list[dict]]:
+    """复用 transcribe_douyin：load_recognizer + 分片/静音吸附 + segments_out。
+
+    stats_out(dict) 原样透传给 transcribe_media（它在 finally 里写回分片统计，异常路径也写）：
+    丢片占比 ≥1/3 时抛 ChunkLossError（这里包成 FetchError，整段失败）；阈值内仍正常返回
+    文本，调用方从 stats_out 拿到 chunksFailed/failedRanges/failedSeconds/emptySeconds/
+    spanSeconds 等统计并进返回信封 —— 阈值内的部分丢片从此看得见，不再零信号。
+    """
     ffmpeg = td.resolve_tool(None, "ffmpeg")
     if not ffmpeg:
         raise FetchError("本地转写", "找不到 ffmpeg（PATH 与 ~/.dsh/bin 都没有）")
@@ -440,7 +451,8 @@ def run_asr(media_path: str, model_dir: str, threads: int, chunk: float,
     segments: list[dict] = []
     try:
         text = td.transcribe_media(recognizer, ffmpeg, media_path, tmp_root,
-                                   chunk=chunk, segments_out=segments, snap=snap)
+                                   chunk=chunk, segments_out=segments, snap=snap,
+                                   stats_out=stats_out)
     except Exception as exc:
         raise FetchError("本地转写", td.one_line(exc, 300)) from None
     return text, segments
@@ -699,6 +711,8 @@ def run(argv: list[str] | None = None) -> int:
         epilog=("stdout 只输出一个 JSON 对象（进度走 stderr）：\n"
                 '  {"ok","url","finalUrl","title","author","duration","source",\n'
                 '   "subtitleLang","text","textLength","truncated","segments","reason","elapsed"}\n'
+                "  （ASR 路径另带分片统计：chunksTotal/chunksFailed/coveredSeconds/failedSeconds/\n"
+                "    emptySeconds/spanSeconds/failedRanges/durationUnknown —— 丢片 ≥1/3 → ok=false）\n"
                 '  （浏览器兜底成功时另带 "resolvedBy":"browser" 与脱敏过的 "mediaUrl"）\n'
                 "退出码: ok=true → 0；ok=false → 2\n"
                 "示例:\n"
@@ -808,7 +822,18 @@ def run(argv: list[str] | None = None) -> int:
                 td.eprint(f"[链接] {url} -> {final_url}")
             result["finalUrl"] = final_url
             media = ""
-            cookies = args.cookies if (args.cookies and os.path.exists(args.cookies)) else None
+            cookies = None
+            if args.cookies:
+                if os.path.exists(args.cookies):
+                    cookies = args.cookies
+                elif args.cookies != td.DEFAULT_COOKIES:
+                    # 显式给了 --cookies 但路径不存在：以前连一行日志都没有，yt-dlp 全程游客，
+                    # 字幕探测变少、落到 ASR，调用方还以为带了登录态。这里必须明说。
+                    # （--cookies 不给时落在默认路径，帮助文本写明「存在才带」——默认路径
+                    #   不存在＝文档承诺的游客态，不算失误，不告警。）
+                    result["cookieNote"] = ("指定的 --cookies 路径不存在，本次按游客（无 cookie）运行: "
+                                            + args.cookies)
+                    td.eprint("[警告] " + result["cookieNote"])
             yt_dlp = td.resolve_tool(args.yt_dlp, "yt-dlp")
             if not yt_dlp:
                 errors.append("探测 yt-dlp 失败（PATH 与 ~/.dsh/bin 都没有，可用 --yt-dlp 指定）")
@@ -914,18 +939,22 @@ def run(argv: list[str] | None = None) -> int:
             dur = td.probe_duration(ffmpeg, media_path)
             if dur:
                 result.setdefault("duration", dur)
+        chunk_stats: dict = {}
         try:
             text, segs = run_asr(media_path, args.model_dir, args.threads, args.chunk,
-                                 not args.no_snap, work_dir)
+                                 not args.no_snap, work_dir, stats_out=chunk_stats)
         except FetchError as exc:
+            result.update(chunk_stats)  # 丢片超阈值的失败信封也带分片统计（transcribe 侧 finally 已写）
             errors.append(exc.reason())
             return fail("；".join(errors))
         if not text.strip():
+            result.update(chunk_stats)  # 同上：空文本的失败信封带上统计，便于区分空音频与丢片
             errors.append("ASR 没有解出任何文字")
             return fail("；".join(errors))
         text, total_len, cut = truncate_text(text, args.max_chars)
         result.update({"ok": True, "source": "asr", "text": text,
                        "textLength": total_len, "truncated": cut, "segments": segs})
+        result.update(chunk_stats)  # 分片统计进信封：阈值内的部分丢片从此可见（chunksFailed/failedRanges…）
         result.pop("reason", None)
         td.eprint(f"[ASR] {len(segs)} 片 / {total_len} 字" + ("（text 已按 --max-chars 截断）" if cut else ""))
         if args.srt:

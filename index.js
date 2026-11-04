@@ -205,11 +205,13 @@ export const BROWSER_EXE_NAMES = ['msedge', 'chrome', 'firefox', 'brave', 'opera
   '360se', '360chrome', 'qqbrowser', 'sogoupv', 'ucbrowser']
 
 let lnkScanCache = null
+let lnkScanNote = ''   // 最近一次快捷方式扫描的异常说明（空串 = 正常）：失败不能吞成「没有快捷方式」
 
-/** 用 PowerShell 一次性解析快捷方式目标：返回 [{ name, path }]；超时 8 秒，失败一律当没扫到（绝不抛） */
+/** 用 PowerShell 一次性解析快捷方式目标：返回 { rows, note }；超时 8 秒，绝不抛。
+ *  失败不再一律当「没扫到」：note 带原因（空串 = 正常），由 scanShortcuts 记进 lnkScanNote 供 douyin_status 暴露。 */
 function scanLnkTargets() {
   return new Promise((resolve) => {
-    if (process.platform !== 'win32') return resolve([])
+    if (process.platform !== 'win32') return resolve({ rows: [], note: '' })
     const ps = [
       '$sh = New-Object -ComObject WScript.Shell',
       '$dirs = @([IO.Path]::Combine($env:ProgramData, "Microsoft", "Windows", "Start Menu", "Programs"), [IO.Path]::Combine($env:APPDATA, "Microsoft", "Windows", "Start Menu", "Programs"), [IO.Path]::Combine($env:USERPROFILE, "Desktop"), [IO.Path]::Combine($env:PUBLIC, "Desktop"))',
@@ -218,21 +220,21 @@ function scanLnkTargets() {
     let child
     try {
       child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
-    } catch { return resolve([]) }
+    } catch (e) { return resolve({ rows: [], note: 'PowerShell 无法启动: ' + ((e && e.message) || e) }) }
     let out = ''
     let settled = false
-    const done = (v) => { if (!settled) { settled = true; resolve(v) } }
-    try { child.stdout.on('data', (d) => { out += d }) } catch { return done([]) }
-    child.on('error', () => done([]))
-    child.on('close', () => {
+    const done = (v, note) => { if (!settled) { settled = true; resolve({ rows: v, note: note || '' }) } }
+    try { child.stdout.on('data', (d) => { out += d }) } catch (e) { return done([], '读取 PowerShell 输出失败: ' + ((e && e.message) || e)) }
+    child.on('error', (e) => done([], 'PowerShell 启动失败: ' + ((e && e.message) || e)))
+    child.on('close', (code) => {
       const rows = []
       for (const line of String(out).split(/\r?\n/)) {
         const path = line.trim()
         if (path && /\.exe$/i.test(path)) rows.push({ name: exeBaseName(path), path })
       }
-      done(rows)
+      done(rows, code ? 'PowerShell 退出码 ' + code + '（结果可能不完整）' : '')
     })
-    setTimeout(() => { try { child.kill() } catch {} ; done([]) }, 8000)
+    setTimeout(() => { try { child.kill() } catch {} ; done([], '快捷方式扫描超时（8s），结果可能不完整') }, 8000)
   })
 }
 
@@ -275,8 +277,8 @@ export function mergeShortcutList(found, paths) {
 
 export async function scanShortcuts(force) {
   if (!force && lnkScanCache) return lnkScanCache
-  let rows = []
-  try { rows = await scanLnkTargets() } catch { rows = [] }
+  const { rows, note } = await scanLnkTargets()
+  lnkScanNote = note
   lnkScanCache = shortcutBrowsers(rows)
   return lnkScanCache
 }
@@ -302,19 +304,37 @@ const screenVideo = (screen) => join(workVideos(), 'video_' + String(screen).pad
  * 解析 manifest.txt（douyin_scroller.py 写的）：
  *   表头   "# 抖音刷视频清单 vX.Y 时间"
  *   数据行 "屏号|标题|直链"
- *   无音轨 "# NO_AUDIO screen=N url=..."
+ *   标记行 "# NO_AUDIO screen=N url=..."      → 该屏**确认无音轨**（纯画面，不能转写）
+ *   标记行 "# AUDIO_UNKNOWN screen=N url=..." → 该屏**音轨未知**（ffmpeg 缺失或探测失败），不一定能转写
  * 只认数据行，按文件里的先后顺序原样返回，**不排序**：屏号是脚本给的，不能用数组下标顶替。
+ * 标记行不单独成条：按屏号合并进对应数据行（noAudio=true / audioUnknown=true，两种含义不同、必须区分）；
+ * 标记行写在同屏数据行之后，对不上数据行的标记行忽略。
  */
 export function parseManifest(text) {
   const rows = []
+  const byScreen = new Map()
+  const marks = new Map()   // screen → 'noAudio' | 'audioUnknown'（标记行与数据行谁先谁后都能配上）
   for (const raw of String(text || '').split(/\r?\n/)) {
     const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
+    if (!line) continue
+    const mark = /^#\s+(NO_AUDIO|AUDIO_UNKNOWN)\s+screen=(\d+)/.exec(line)
+    if (mark) {
+      const screen = Number(mark[2])
+      if (Number.isInteger(screen) && screen > 0) marks.set(screen, mark[1] === 'NO_AUDIO' ? 'noAudio' : 'audioUnknown')
+      continue
+    }
+    if (line.startsWith('#')) continue
     const parts = line.split('|')
     if (parts.length < 2) continue
     const screen = Number(parts[0].trim())
     if (!Number.isInteger(screen) || screen <= 0) continue
-    rows.push({ screen, title: parts[1].trim(), url: parts.slice(2).join('|').trim() })
+    const row = { screen, title: parts[1].trim(), url: parts.slice(2).join('|').trim() }
+    rows.push(row)
+    byScreen.set(screen, row)
+  }
+  for (const [screen, kind] of marks) {
+    const row = byScreen.get(screen)
+    if (row) row[kind] = true
   }
   return rows
 }
@@ -329,7 +349,10 @@ export function manifestItems() {
     let sizeMB = 0
     let hasFile = false
     try { sizeMB = Math.round((statSync(file).size / 1048576) * 100) / 100; hasFile = true } catch { hasFile = false }
-    return { screen: r.screen, title: r.title, file: hasFile ? file : null, sizeMB, hasFile }
+    const item = { screen: r.screen, title: r.title, file: hasFile ? file : null, sizeMB, hasFile }
+    if (r.noAudio) item.noAudio = true            // 确认无音轨：不能转写
+    if (r.audioUnknown) item.audioUnknown = true  // 音轨未知：不一定能转写（与 noAudio 是两回事）
+    return item
   })
   const totalMB = Math.round(items.reduce((s, i) => s + i.sizeMB, 0) * 100) / 100
   return { items, totalMB, manifestPath: mpath }
@@ -1692,7 +1715,7 @@ export function apply(ctx, config = {}) {
   // ── 1. 刷抖音 ─────────────────────────────────────────────
   tool({
     name: 'douyin_scroll',
-    description: '刷抖音推荐页：自动下滑 N 屏、逐屏截图、并把每屏视频下载到本地（自动确保含音轨，无音轨会标记 NO_AUDIO）。刷完返回统计。',
+    description: '刷抖音推荐页：自动下滑 N 屏、逐屏截图、并把每屏视频下载到本地。items 里按屏标注音轨状态（两种含义不同）：noAudio=true 该屏确认无音轨（纯画面，不能转写）；audioUnknown=true 音轨未知（ffmpeg 缺失或探测失败），不一定能转写。刷完返回统计。',
     parameters: {
       count: { type: 'number', description: '下滑屏数，默认取插件配置（3）' },
       delay: { type: 'number', description: '每屏停留秒数，默认 1.5' },
@@ -1743,7 +1766,7 @@ export function apply(ctx, config = {}) {
   // ── 3. 自检 ───────────────────────────────────────────────
   tool({
     name: 'douyin_status',
-    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存。selftest=true 时额外跑一次选择器体检（4 个页面，会真开浏览器），结果放 selectors：{ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?,notFound?}]}，verdict=ok/missing/notfound/unknown（notfound=落地是抖音 404 页「页面不见啦」，地址不存在或已变，不是选择器失效；missing 才是地址对但候选选择器全 0）。',
+    description: '自检抖音插件运行条件：Python(playwright) / Python(sherpa_onnx) / ffmpeg / 模型目录 / cookie 文件 / 脚本是否存在，并报告状态目录占用、五个浏览器内核 + 手动添加项 + 快捷方式发现的浏览器（browsers）是否装好。env 字段是「装入配置环境」的状态（venv / venvUsable / basePython / canReusePython / setupRunning / setupResult / setupLog 尾部）。scan=true 会重扫开始菜单 / 桌面里的 .lnk，否则用本次运行已扫到的缓存；快捷方式扫描失败/超时不再静默：原因在 browsers.shortcutsNote（空串 = 正常）。selftest=true 时额外跑一次选择器体检（4 个页面，会真开浏览器），结果放 selectors：{ok, items:[{name,url,selectors:[{sel,count}],verdict,hits,reason?,notFound?}]}，verdict=ok/missing/notfound/unknown（notfound=落地是抖音 404 页「页面不见啦」，地址不存在或已变，不是选择器失效；missing 才是地址对但候选选择器全 0）。',
     parameters: {
       scan: { type: 'boolean', description: 'true = 重扫一次快捷方式（开始菜单 / 桌面里的 .lnk），否则用本次运行已扫到的缓存' },
       selftest: { type: 'boolean', description: 'true = 额外跑一次选择器体检（热榜/推荐/通知/私信 4 个页面），结果放 selectors 字段；默认 false（一个页面都不开）' },
@@ -1759,10 +1782,12 @@ export function apply(ctx, config = {}) {
       const vdir = workVideos()
       const videos = existsSync(vdir) ? readdirSync(vdir).filter((f) => /\.mp4$/i.test(f)) : []
       const browsers = probeBrowsers(cfg)
-      // 快捷方式扫出来的浏览器：按路径去重，且剔掉「已知安装路径已经命中」的那些（同一条只出现一次）
+      // 快捷方式扫出来的浏览器：按路径去重，且剔掉「已知安装路径已经命中」的那些（同一条只出现一次）。
+      // 扫描失败/超时不再吞成空数组：原因放 browsers.shortcutsNote（空串 = 正常），与 browserNote（通道解析说明）分开。
       try {
         browsers.shortcuts = mergeShortcutList(await scanShortcuts(!!(args && args.scan)), browsers.paths)
-      } catch { browsers.shortcuts = [] }
+      } catch (e) { browsers.shortcuts = []; lnkScanNote = '快捷方式扫描异常: ' + ((e && e.message) || e) }
+      browsers.shortcutsNote = lnkScanNote || ''
       const out = {
         ok: !!(pyScroll && pyAsr && ff && existsSync(modelDir)),
         version: pluginVersion(),
@@ -1847,7 +1872,7 @@ export function apply(ctx, config = {}) {
    */
   tool({
     name: 'douyin_setup',
-    description: '给插件配运行环境（基础能力，不设等级闸门）。mode=auto（默认）：先扫描，有可用 Python 就复用它并把路径写进 pythonPath，没有就在 <插件根>/venv 建独立 venv 装 playwright + sherpa-onnx，返回 action=reused|installed|failed；mode=scan：只体检不改动，返回 inventory（Python 路径/版本/playwright/sherpa、ffmpeg、模型、cookie 条数）；mode=minimal / full / minimal-force / full-force：后台派生去装（full 另含 ffmpeg 下到 <状态目录>/bin、SenseVoice 模型下到 <状态目录>/models），起来就返回 started:true，进度写 <状态目录>/setup.log（几分钟）。装完调用 douyin_status 看 env。',
+    description: '给插件配运行环境（基础能力，不设等级闸门）。mode=auto（默认）：先扫描，有可用 Python 就复用它并把路径写进 pythonPath，没有就在 <插件根>/venv 建独立 venv 装 playwright + sherpa-onnx，返回 action=reused|installed|failed|unknown（脚本没回报 action 时不猜结果，标 unknown 且 ok=false）；mode=scan：只体检不改动，返回 inventory（Python 路径/版本/playwright/sherpa、ffmpeg、模型、cookie 条数）；mode=minimal / full / minimal-force / full-force：后台派生去装（full 另含 ffmpeg 下到 <状态目录>/bin、SenseVoice 模型下到 <状态目录>/models），起来就返回 started:true，进度写 <状态目录>/setup.log（几分钟）。装完调用 douyin_status 看 env。',
     parameters: {
       mode: { type: 'string', description: 'auto（默认：扫描→复用或安装）/ scan（只体检）/ minimal（venv + playwright + sherpa）/ full（另含 ffmpeg 与模型）/ minimal-force 或 full-force（强制新建 venv，不复用）' },
     },
@@ -1872,9 +1897,17 @@ export function apply(ctx, config = {}) {
         const r = await runSetupForeground(argv, log, mode === 'scan' ? SETUP_SCAN_TIMEOUT_S : SETUP_AUTO_TIMEOUT_S)
         const out = { ...r, mode, venv, log: setupLog }
         if (mode === 'auto') {
-          // 脚本没给 action 就按结果推：装不成就 failed，能复用就 reused
-          if (!out.action) out.action = r.ok === false ? 'failed' : (r.canReusePython ? 'reused' : 'installed')
-          out.ok = out.action !== 'failed'
+          // 脚本没给 action：failed 照旧；脚本明确给了 canReusePython=true 才推 reused；
+          // 其余一律 unknown——**不猜 installed**（铁律：结果要么可信、要么明说不可信）。
+          if (!out.action) {
+            if (r.ok === false) out.action = 'failed'
+            else if (r.canReusePython === true) out.action = 'reused'
+            else {
+              out.action = 'unknown'
+              out.reason = out.reason || '脚本没回报 action，安装结果未知（重跑 setup auto 或看安装日志）'
+            }
+          }
+          out.ok = out.action === 'installed' || out.action === 'reused'
           if (out.action === 'installed') venvProbeCache = null   // 刚装完：缓存里的 false 不能再信
         }
         log('setup ' + mode + ' 结束 ok=' + out.ok + (out.action ? ' action=' + out.action : '') + (out.reason ? ' reason=' + out.reason : ''))
@@ -1986,12 +2019,14 @@ export function apply(ctx, config = {}) {
       return { ...parsed, ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', output: tail(r.stderr, 8) }
     }
     // 截断在脚本层做（--max-chars 只截 text，segments 保持完整时间轴）：插件层**不再截一遍**，
-    // textLength（截断前原长）/ truncated 一律用脚本回报的值；脚本没给才按「没截断」兜底。
+    // textLength（截断前原长）/ truncated 一律用脚本回报的值。脚本没回报时**标「未知」**，
+    // 不假装「没截断」——text 可能已经是截过的，把截后长度当原长报出去是撒谎。
     const text = typeof parsed.text === 'string' ? parsed.text : ''
     const res = { ...parsed, ok: true, text, maxChars, exitCode: r.code }
-    if (typeof res.textLength !== 'number') res.textLength = text.length
-    if (typeof res.truncated !== 'boolean') res.truncated = false
-    if (res.truncated) res.truncateNote = 'text 已在脚本层按 maxChars=' + maxChars + ' 截断（原长 ' + res.textLength + ' 字符）；segments 仍是完整时间轴'
+    if (typeof res.truncated !== 'boolean') res.truncated = null
+    if (typeof res.textLength !== 'number') res.textLength = res.truncated === false ? text.length : null
+    if (res.truncated === true) res.truncateNote = 'text 已在脚本层按 maxChars=' + maxChars + ' 截断（原长 ' + (res.textLength === null ? '未知' : res.textLength) + ' 字符）；segments 仍是完整时间轴'
+    else if (res.truncated === null) res.truncateNote = '脚本没回报 truncated / textLength：截断状态未知，text 可能不完整（原长也无法判断）'
     if (srt) {
       res.srtPath = srt
       if (!existsSync(srt)) res.srtNote = '这个 srt 文件没写成（脚本可能跳过了落盘）'
@@ -2153,7 +2188,7 @@ export function apply(ctx, config = {}) {
   // 与只读那几件同一套信封；区别只在闸门档位（notify）与页面（登录后才有的通知页）。
   tool({
     name: 'douyin_notes',
-    description: '抖音通知摘要（只读，能力等级② 通知）：取点赞/评论/@我的/关注的摘要，返回 type/user/text/time/url。只读页面，不点已读、不回复、不点赞、不回关。',
+    description: '抖音通知摘要（只读，能力等级② 通知）：Web 接口直连（不开浏览器）取评论/关注等通知，返回 type/user/text/time/url。未支持的通知类型只带类型号、不猜字段。不点已读、不回复、不点赞、不回关。',
     parameters: {
       limit: { type: 'number', description: '取几条，1-50，默认 20' },
     },
@@ -2217,7 +2252,10 @@ export function apply(ctx, config = {}) {
     if (!parsed) {
       return { ok: false, exitCode: r.code, action, reason: '脚本输出不是 JSON（动作 ' + action + ' 那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
     }
-    return { ...parsed, exitCode: r.code }
+    // 与 runRead 同一套双闸：脚本自己的 ok:false 先原样带回；退出码非 0 时 JSON 可能不完整，不能当成功透传
+    if (parsed.ok === false) return { ...parsed, exitCode: r.code }
+    if (!r.ok) return { ok: false, exitCode: r.code, action, reason: '脚本退出码非 0，输出可能不完整', output: tail(r.stderr, 8) }
+    return { ...parsed, ok: true, exitCode: r.code }
   }
 
   tool({
@@ -2299,10 +2337,16 @@ export function apply(ctx, config = {}) {
         const startedAt = Date.now()
         const boot = { phase: 'waiting', at: startedAt, message: '窗口已打开：在里面扫码 / 过验证', cookiePath: null, mode: 'window' }
         try { writeFileSync(loginStatePath(), JSON.stringify(boot, null, 2), 'utf8') } catch { /* poll 读不到会说没状态 */ }
-        const winArgv = ['--mode', 'window', '--wait', String(LOGIN_WAIT), '--out', cookiePath,
+        // --state-dir 必须传（与 qr 分支同款）：不传时脚本崩溃把 error 写到它自己的兜底目录
+        // （~/.dsh/douyin-duty/login），这边预写的 waiting 永远盖不掉，poll 就永远「窗口已打开」。
+        // douyin_login.py 崩溃/超时/成功都会往这个目录写 state.json。
+        const winArgv = ['--mode', 'window', '--state-dir', loginDir(), '--wait', String(LOGIN_WAIT), '--out', cookiePath,
           ...(await browserArgvFor(python, SCRIPT_LOGIN, cfg))]
         const sp = await spawnLoginBg(python, winArgv, log)
         if (!sp.ok) {
+          // 派生失败 = 脚本根本没跑起来，预写的 waiting 是假的：改成 error，别让 poll 永远 waiting
+          try { writeFileSync(loginStatePath(), JSON.stringify({ phase: 'error', at: Date.now(),
+            message: '后台派生登录脚本失败: ' + (sp.reason || '(原因不明)'), cookiePath: null, mode: 'window' }, null, 2), 'utf8') } catch { /* poll 读不到会说没状态 */ }
           return { ok: false, mode, stateFile: loginStatePath(), log: loginLogPath(), cookiePath,
             reason: '后台派生登录脚本失败：' + sp.reason }
         }
@@ -2676,7 +2720,10 @@ export function apply(ctx, config = {}) {
       const badNum = checkNumericCfg(key, v)
       if (badNum) return { ok: false, error: badNum }
       cfg[key] = v
-      saveCfg(cfg)
+      // 写盘结果不丢：saveCfg 失败回 { ok:false, error }（HTTP /config 路由同处检查过），工具路径对齐——
+      // 写失败还回 ok:true 等于「看起来成功，实际没保存」。
+      const saved = saveCfg(cfg)
+      if (saved && saved.ok === false) return { ok: false, key, error: saved.error || '配置写盘失败' }
       return { ok: true, config: cfg }
     },
   })

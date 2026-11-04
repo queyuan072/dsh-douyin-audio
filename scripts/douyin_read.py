@@ -14,11 +14,16 @@
     python douyin_read.py note --url https://www.douyin.com/note/<id> --json
     python douyin_read.py notes --limit 20 --json
     python douyin_read.py messages --limit 20 --json
-    python douyin_read.py selftest --json      # 选择器体检（热榜/推荐/通知/私信 4 个页面）
+    python douyin_read.py selftest --json      # 体检：热榜/推荐/私信页面选择器 + 通知接口连通性
 
 输出统一:
-    成功 {"ok": true,  "items": [...], "elapsed": 1.2}
-    失败 {"ok": false, "error": "一句话原因", "items": []}
+    成功 {"ok": true,  "items": [...], "elapsed": 1.2, "browser": "...", "diag"?: {...}}
+    失败 {"ok": false, "error": "一句话原因", "items": [],
+          "errorKind"?: "not_login|bad_params|network|structure|unknown_code"}
+  成功/失败都带 "cookie"?: {guest, cookieCount, file, fileExists, injected?, note?}
+    （浏览器路径的 cookie 状态：guest=true = 本次游客态——没读到 cookie 或注入失败；
+     notes 纯接口不开浏览器；messages 开浏览器，但没 cookie 时在起浏览器之前就 ok:false
+     早失败 —— 所以两者都不带该字段）
   加 --json 时 stdout 只有这一行 JSON；进度与告警一律走 stderr。
 
 items 结构:
@@ -31,12 +36,20 @@ items 结构:
                 type: note（图文页）/ video（给了视频地址或短链跳到视频页时的自动回退）
                 images: note-detail 容器内的大图绝对 URL（最多 20 条，只给地址不下载）
     comments -> {user, text, like, time}
-    notes    -> {type, user, text, time, url}
-                type: 点赞 / 评论 / @我的 / 关注 / 私信 / 其他（按动作句归类，认不出就是「其他」，不猜）
+    notes    -> {type, user, text, time, url, avatar?}  走已验证的 Web 接口（纯 HTTP，不开浏览器）
+                实测药方：NOTICE_API_QS + notice_group（按分组遍历、nid 去重）；数据在 notice_list_v2。
+                字段映射 type=31（评论）/ 33（关注）已用 5 条真实通知验证；未知 type 不猜字段
+                （type 数字带上、text 留空、diag.unsupportedTypes 列出）；general_notice 兜底
+                路径**未验证**（样本里全空字符串，仅当其内容非空才启用并标注 unverified）。
+                diag: {endpoint, param, pageSize, countGroups, groupPlan, groups[], received,
+                       deduped, unsupportedTypes, status_code, countError?, message?, riskHint?}
+                （groups[] 条目失败时带 error；单组失败只降级记录、继续下一组，见 cmd_notes；
+                  countGroups 为空且全部静态分组 0 条时 message 换成风险提示 + riskHint）
     messages -> {user, lastText, time, unread}   unread 是整数（"99+" 记 99，读不到记 0）
 
     selftest -> {name, label, url, selectors: [{sel, count}], verdict, hits, title?,
-                 reason?, notFound?}
+                 reason?, notFound?, via?="api", api?: {cls, status_code, httpStatus, noticeCount}}
+                 （通知项 via=api：selectors 恒空，结论看 verdict/api）
                 verdict: ok（该页关键候选组至少命中一个）/
                          missing（候选组全 0，DOM 可能已变 —— 地址对、选择器失效）/
                          notfound（候选组全 0 且落地是抖音 404 页「页面不见啦」——
@@ -53,10 +66,17 @@ items 结构:
       {"ok": false, "error": "search: 被抖音人机验证拦截（页面标题=验证码中间页），
        当前环境无法搜索；建议手动打开一次抖音并完成验证后重试", "items": []}
     先在浏览器里手动完成一次验证（同一 cookie）后重跑，才可能成功。
-  * notes / messages 读的是**登录后**才有的页面：没有 cookie 时脚本在起浏览器之前就返回
-      {"ok": false, "error": "notes: 需要登录态：没读到 cookie（<路径>）…"}。
-    这两个页面在真机上的 URL 与 DOM 未在本仓库验证过（默认 /notifications 与 /messages），
-    路径不对时用 --url 覆盖；页面结构变了同样走「选择器全部未命中」的明确 error。
+  * notes 走已验证的 Web 接口 /aweme/v1/web/notice/?…&notice_group=<GROUP>（纯 HTTP，实测
+    打通、不需要签名/浏览器；按分组遍历 + nid 去重，数据在 notice_list_v2）：
+    没有 cookie 时仍在最早的时刻返回 {"ok": false, "error": "notes: 需要登录态…"}；
+    接口错误五类分开（errorKind 机读）：not_login(8) / bad_params(5) / network / structure /
+    unknown_code；空列表是成功的空（ok=true + 空数组 + diag.message「当前无通知」；
+    动态分组现取为空且静态分组全 0 时，message 换成显式风险提示 —— 见 cmd_notes）。
+    单个分组请求失败按降级处理（记 diag 继续下一组），只有 not_login 中止整条命令。
+    每个分组只拉第一页（count=10）：结果按 create_time 新→旧排序，但不保证是全局最新 N 条。
+    只认实测过的 type 31（评论）/ 33（关注）；未知 type 不猜字段（type 数字带上、text 留空）。
+    messages 仍走 /chat 页面：路径不对时用 --url 覆盖；页面结构变了走
+    「选择器全部未命中」的明确 error。
   * hot 榜单项的 innerText 是多行拼接（时长 / 热度 / 标题 / N人在看 / 作者 / 时间），
     按行切分解析；抖音改版导致行序变化时标题会退化，脚本照实返回而不是编造。
 """
@@ -68,6 +88,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -88,11 +109,40 @@ DOUYIN_HOST = "https://www.douyin.com"
 #           /inbox、/interaction、/msg、/notify、/chat/notice 等 20+ 个候选全部 404
 #           （或落到 error-page）。页面右上角导航岛里的「通知」点开是**页内弹层**
 #           （[data-e2e="listDlgTest-container"] + 接口 /aweme/v1/web/notice/），URL 不变。
-#           所以这里保留历史值、不瞎猜一个能打开的地址；selftest 会把它判成
-#           verdict=notfound（地址不存在，不是选择器失效），一眼能分清是哪种坏。
-# 路径哪天变了，用 --url 覆盖即可（见 cmd_notes / cmd_messages）。
+#           所以这里保留历史值、不瞎猜一个能打开的地址；notes 命令已改走下面的 Web 接口
+#           （纯 HTTP，已实测打通），selftest 的通知项也按接口体检，不再开这个 404 页。
 DOUYIN_NOTES_URL = DOUYIN_HOST + "/notifications"
 DOUYIN_MESSAGES_URL = DOUYIN_HOST + "/chat"
+
+# 通知 Web 接口（实测打通：纯 HTTP 直连，**不需要签名、不需要浏览器**）。
+# 实测记录（宿主浏览器抓包 + 5 条真实通知验证，探针在 _diag/notes-probe/）：
+#   * 精确药方 = NOTICE_API_QS + "&notice_group=<GROUP>"（见 _notice_api_fetch）：
+#     **参数名是 notice_group，不是 notice_type**（旧药方整个方向错了）；
+#   * notice_group 必填：不带 → status_code=5「参数不合法」；带上 → 0；
+#   * 不需要 a_bogus / msToken / verifyFp / fp / webid / uifid 任何签名：全部剥掉仍 sc=0 正常返回；
+#   * version_code：170400 与 190500 实测都能拿到数据（宿主复核两者均 sc=0、同样返回 5 条；
+#     旧记录「190500 拿不到数据」已被实测证伪）。170400 是浏览器真实发出的值，沿用无害但不是必需；
+#   * 请求头：桌面 Edge UA + Referer=https://www.douyin.com/ + Accept + Cookie +
+#     Accept-Encoding=identity；
+#   * 错误码：0=成功；5=参数不合法（缺 notice_group）；8=用户未登录；
+#   * 成功响应的数据在 **notice_list_v2**（全部实测样本 notice_list 恒为空数组，v2 才是真的）；
+#     顶层键另有 extra / has_more / max_time / min_time / notice_config / notice_fold /
+#     notice_settings / notice_tab / type_list / status_code / status_msg 等。
+#   * 分组覆盖实测：960→type31×2+33×3（聚合）、700→同 960、401→type33（关注）、
+#     2→type31（评论）、601/961/3/7/28/64→空；count 接口的非零分组是**动态**的
+#     （同一账号两次采样非零分组就变过），必须每次现取（见 _notice_count_groups），不能写死。
+NOTICE_API_PATH = "/aweme/v1/web/notice/"
+NOTICE_API_COUNT_PATH = "/aweme/v1/web/notice/count/"
+# is_mark_read 实测 1/0/不带 三者返回数据完全一样（宿主复核）；取 0 以兑现「不点已读」契约，
+# 服务端是否真的遵守未验证。
+NOTICE_API_QS = ("device_platform=webapp&aid=6383&channel=channel_pc_web&is_new_notice=1"
+                 "&is_mark_read=0&count=10&min_time=0&max_time=0"
+                 "&version_code=170400&version_name=17.4.0&pc_client_type=1&platform=PC")
+NOTICE_API_COUNT_QS = "device_platform=webapp&aid=6383"  # count 接口实测最小可用 QS（探针 group_scan.py 同款）
+NOTICE_API_GROUP_COUNT = 10                      # 药方里的 count=10：每个 group 拉一页，固定此值
+NOTICE_API_STATIC_GROUPS = (960, 700, 401, 2)    # 实测有数据的聚合分组兜底（count 现取失败时仍可用）
+# 注意：count 接口实测可能只统计未读（推断未核实）——通知全部已读时其非零分组恒为空，
+# 此时结果完全依赖上面这组硬编码分组；cmd_notes 会在 diag 里给显式风险提示。
 _DEFAULT_COOKIE_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "cookies", "douyin_cookies.txt")
 
 # 页面跳转只允许抖音自己的域名（防 SSRF：douyin_video --url http://127.0.0.1:8080/
@@ -125,10 +175,11 @@ _COUNT_UNITS = {"万": 10000, "w": 10000, "W": 10000, "亿": 100000000,
 class StepError(Exception):
     """某一步失败：step 说明卡在哪一步，reason 一句话原因。绝不让 traceback 漏到 stdout。"""
 
-    def __init__(self, step, reason):
+    def __init__(self, step, reason, kind=None):
         super().__init__("{}: {}".format(step, reason))
         self.step = step
         self.reason = reason
+        self.kind = kind   # 机器可读分类（notes 接口路径用）：not_login/bad_params/network/structure/unknown_code
 
 
 def _assert_douyin_url(url, step="url"):
@@ -234,6 +285,36 @@ def _cookie_records(cookie_file=None):
     except Exception:
         return []
     return out
+
+
+def _cookie_header(cookie_file=None):
+    """netscape 文件 → HTTP Cookie 头（通知接口用）：过滤**已过期**的条目。
+    与 _load_douyin_cookie 的差别：这里按实测药方丢弃 expires 已过的行，
+    不把残缺会话发给服务端（探针 sig_probe.py 用同一套过滤跑通了 status_code=0）。"""
+    path = cookie_file or _resolve_cookie_file()
+    ck = []
+    now = time.time()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.rstrip("\n")
+                if ln.startswith("#HttpOnly_"):
+                    ln = ln[len("#HttpOnly_"):]
+                elif not ln or ln.startswith("#"):
+                    continue
+                parts = ln.split("\t")
+                if len(parts) < 7:
+                    continue
+                try:
+                    exp = int(float(parts[4]))
+                    if exp > 0 and exp <= now:
+                        continue
+                except ValueError:
+                    pass
+                ck.append("{}={}".format(parts[5], parts[6]))
+    except Exception:
+        return ""
+    return "; ".join(ck)
 
 
 # --------------------------------------------------------------------------
@@ -404,17 +485,8 @@ COMMENT_LIKE = ['[data-e2e="comment-like-count"]', '[class*="like"] [class*="cou
                 '[class*="like-count"]']
 COMMENT_TIME = ['[data-e2e="comment-time"]', '[class*="time"]', '[class*="date"]']
 
-# ② 通知页 / 私信页（真机 DOM 未验证：多候选 + 按行切分兜底，取不到就明确报错）
-NOTES_ROWS = [
-    '[data-e2e="notice-item"]',
-    '[data-e2e="message-item"]',
-    '[data-e2e="notification-item"]',
-    '[data-e2e="notice-list"] > div',
-    '[class*="notice-list"] > div',
-    '[class*="notification-list"] > div',
-    '[class*="notice"] li',
-    '[class*="message-list"] > div',
-]
+# ② 私信页（真机 DOM 未验证：多候选 + 按行切分兜底，取不到就明确报错）。
+# 通知不走页面（改按 Web 接口，见 NOTICE_API_PATH），所以这里不再留通知页选择器候选组。
 MESSAGES_ROWS = [
     '[data-e2e="conversation-item"]',
     '[data-e2e="session-item"]',
@@ -799,82 +871,6 @@ COMMENTS_BODY = r"""
            bodyLen: (document.body ? (document.body.innerText || '').length : 0) };
 """
 
-NOTES_BODY = r"""
-  const cfg0 = cfg;
-  const rows = pick(cfg0.rows);
-  const out = [];
-  // 通知卡 innerText 大概是「昵称 / 动作句 / 时间」或「昵称 / 动作句 / 评论摘录 / 时间」。
-  // 抖音改版后行序会变，所以按"行"归类，不按固定下标取。
-  const isTimeLine = (s) => /(\d+\s*(?:秒|分钟|小时|天|周|个月|月|年)前)/.test(s)
-      || /^(刚刚|刚才|昨天|今天|前天)/.test(s)
-      || /^[·•]/.test(s)
-      || /^\d{1,2}:\d{2}$/.test(s)
-      || /^\d{1,2}-\d{1,2}$/.test(s)
-      || /^\d{4}-\d{2}-\d{2}/.test(s);
-  // 类型只看"动作句"：逐行扫，先命中的行决定类型（评论正文里出现"赞"不会被抢先判成点赞）
-  const TYPE_RULES = [
-    [/@了我|@了你|提到了你|在评论中@/, '@我的'],
-    [/关注了你|开始关注|新增关注/, '关注'],
-    [/赞了|点赞了你|喜欢了你的/, '点赞'],
-    [/评论了|回复了你|给你留言/, '评论'],
-    [/私信|发来一条消息|给你发了/, '私信'],
-    [/收藏了|分享了|转发了你的/, '其他'],
-  ];
-  const isAction = (s) => TYPE_RULES.some((r) => r[0].test(s));
-  const typeOf = (lines) => {
-    for (const ln of lines) {
-      const t = clean(ln);
-      if (!t) continue;
-      for (const rule of TYPE_RULES) { if (rule[0].test(t)) return rule[1]; }
-    }
-    return '其他';
-  };
-  rows.forEach((r) => {
-    let lines = [];
-    try { lines = (r.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean); }
-    catch (err) { lines = []; }
-    let time = '';
-    const rest = [];
-    for (const ln of lines) {
-      if (!time && isTimeLine(ln)) { time = ln; continue; }
-      rest.push(ln);
-    }
-    // user：优先 a[href*="/user/"]（昵称/头像通常带链接）；没有就挑"不像动作句、不是时间"的短行
-    let user = '';
-    try {
-      const a = r.querySelector('a[href*="/user/"]');
-      if (a) user = clean(a.textContent || a.innerText || '');
-    } catch (err) {}
-    if (!user) {
-      for (const ln of rest) {
-        const t = clean(ln);
-        if (!t || t.length > 24 || isAction(t)) continue;
-        user = t;
-        break;
-      }
-    }
-    // text：最长的那一行（动作句或评论摘录），排掉与 user 相同的那行
-    let text = '';
-    for (const ln of rest) {
-      const t = clean(ln);
-      if (!t || t === user) continue;
-      if (t.length > text.length) text = t;
-    }
-    let url = '';
-    try {
-      const a3 = r.querySelector('a[href*="/video/"]') || r.querySelector('a[href*="/user/"]')
-                 || r.querySelector('a[href]');
-      if (a3) url = abs(a3.getAttribute('href'));
-    } catch (err) {}
-    out.push({ type: typeOf(lines), user: clean(user, 60), text: clean(text, 300),
-               time: clean(time, 40), url: url });
-  });
-  const items = uniqBy(out.filter((it) => it.text || it.user),
-                       (it) => it.user + '|' + it.text + '|' + it.time).slice(0, cfg0.limit);
-  return { items: items, rowCount: rows.length,
-           bodyLen: (document.body ? (document.body.innerText || '').length : 0) };
-"""
-
 MESSAGES_BODY = r"""
   const cfg0 = cfg;
   const rows = pick(cfg0.rows);
@@ -1123,14 +1119,26 @@ def _browser_page(args):
         except Exception as exc:
             raise StepError("browser", "无法创建浏览器上下文: {}".format(_brief(exc)))
         records = _cookie_records(args.cookies)
+        try:
+            cookie_file = _resolve_cookie_file(args.cookies)
+            cookie_state = {"guest": not records, "cookieCount": len(records),
+                            "file": cookie_file, "fileExists": os.path.isfile(cookie_file)}
+        except Exception:
+            cookie_state = {"guest": not records, "cookieCount": len(records)}
         if records:
             try:
                 ctx.add_cookies(records)
+                cookie_state["injected"] = True
                 log("已注入 {} 条 cookie".format(len(records)))
             except Exception as exc:
+                cookie_state["guest"] = True
+                cookie_state["injected"] = False
+                cookie_state["note"] = "注入失败（游客态继续）: {}".format(_brief(exc))
                 log("注入 cookie 失败（继续游客态）: {}".format(_brief(exc)))
         else:
+            cookie_state["injected"] = False
             log("没有可用 cookie 文件（游客态继续）")
+        args.cookie_state = cookie_state   # main() 带进 payload["cookie"]：游客态不再无声
         page = ctx.new_page()
         try:
             page.set_default_timeout(int(args.timeout * 1000))
@@ -1816,48 +1824,312 @@ def cmd_note(page, args):
 
 
 def _require_login(args, step):
-    """通知/私信页面只有登录态才渲染：没读到 cookie 就在起浏览器之前失败（一句话原因，不漏 traceback）"""
+    """通知接口/私信页面都只有登录态才有内容：没读到 cookie 就早失败（一句话原因，不漏 traceback）。
+    notes 由此避免一次注定返回 8 的空跑；messages 由此不白起一个浏览器。
+    kind=not_login：无 cookie 的失败与接口返回 8 是同一语义，errorKind 必须同形（契约见文件头）。"""
     if _cookie_records(args.cookies):
         return
     raise StepError(step, "需要登录态：没读到 cookie（{}）；先跑 scripts/douyin_login.py 或用 --cookies 指定"
-                    .format(_resolve_cookie_file(args.cookies)))
+                    .format(_resolve_cookie_file(args.cookies)), kind="not_login")
+
+
+def _notice_http_get(args, url):
+    """通知接口族共享传输层：GET 一次并**分类**结果（纯 urllib，不开浏览器）。
+
+    返回 dict，cls 互斥 —— 调用方按类处理，绝不许混成一个「失败」：
+      cls=ok            status_code=0，data=解析后的 JSON 对象
+      cls=not_login     status_code=8   cookie 缺失/过期/无效
+      cls=bad_params    status_code=5   参数不合法（本脚本固定药方不应触发，触发=抖音改了要求）
+      cls=network       传输层失败：连接/超时/HTTP 非 200/HTTP 200 但响应不是 JSON
+      cls=structure     响应顶层不是 JSON 对象 / 缺 status_code 键 —— 接口结构可能已变
+      cls=unknown_code  其它 status_code —— 语义未实测，如实带码值
+    非 ok 都带一句话 error；http_status / status_code 能带就带。
+    """
+    headers = {
+        "User-Agent": UA_STRING,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": DOUYIN_HOST + "/",
+        "Cookie": _cookie_header(getattr(args, "cookies", None)),
+        "Accept-Encoding": "identity",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(
+                req, timeout=max(3.0, float(getattr(args, "timeout", 30.0) or 30.0))) as resp:
+            http_status = resp.status
+            body = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return {"cls": "network", "http_status": exc.code,
+                "error": "接口 HTTP {}（非 200）".format(exc.code), "url": url}
+    except Exception as exc:
+        return {"cls": "network", "error": "网络失败: {}".format(_brief(exc, 160)), "url": url}
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return {"cls": "network", "http_status": http_status,
+                "error": "HTTP {} 但响应不是 JSON（可能被风控/登录中间页拦截）：{}".format(
+                    http_status, _brief(body[:120], 120)), "url": url}
+    if not isinstance(data, dict):
+        return {"cls": "structure", "http_status": http_status,
+                "error": "响应顶层不是 JSON 对象（{}），接口结构可能已变".format(type(data).__name__),
+                "url": url}
+    try:
+        sc = int(data.get("status_code"))
+    except (TypeError, ValueError):
+        return {"cls": "structure", "http_status": http_status,
+                "error": "响应缺 status_code 键，接口结构可能已变", "url": url}
+    if sc == 0:
+        return {"cls": "ok", "http_status": http_status, "status_code": 0, "data": data, "url": url}
+    if sc == 8:
+        return {"cls": "not_login", "http_status": http_status, "status_code": 8,
+                "error": "接口返回 8（用户未登录；cookie 可能过期/无效，先跑 scripts/douyin_login.py）",
+                "url": url}
+    if sc == 5:
+        return {"cls": "bad_params", "http_status": http_status, "status_code": 5,
+                "error": "接口返回 5（参数不合法）——本脚本用的是实测药方（notice_group 必填），"
+                         "触发多半是抖音改了参数要求",
+                "url": url}
+    return {"cls": "unknown_code", "http_status": http_status, "status_code": sc,
+            "error": "接口返回未实测过的错误码 {}（status_msg={!r}）".format(sc, data.get("status_msg")),
+            "url": url}
+
+
+def _notice_api_fetch(args, group):
+    """按 notice_group 调一次通知接口（实测药方见常量注释），数据取 notice_list_v2（v2 空才退 v1）。
+
+    返回 dict：cls=ok 带 notice_list(list) / source("notice_list_v2"|"notice_list") / has_more /
+    group；其余 cls 语义见 _notice_http_get（not_login / bad_params / network / structure /
+    unknown_code），都带一句话 error。
+    """
+    try:
+        group = int(group)
+    except (TypeError, ValueError):
+        return {"cls": "bad_params", "group": group,
+                "error": "notice_group 不是数字（{!r}）——调用方传参错误，不是接口问题".format(group)}
+    url = "{}?{}&notice_group={}".format(DOUYIN_HOST + NOTICE_API_PATH, NOTICE_API_QS, group)
+    out = _notice_http_get(args, url)
+    out["group"] = group
+    if out["cls"] != "ok":
+        return out
+    data = out.pop("data")
+    http_status = out.get("http_status")
+    v2 = data.get("notice_list_v2")
+    v1 = data.get("notice_list")
+    if isinstance(v2, list) and v2:
+        items, src = v2, "notice_list_v2"
+    elif isinstance(v1, list) and v1:
+        items, src = v1, "notice_list"     # v2 空 → 退 v1（实测 v1 恒空，留条后路）
+    elif v2 is None or isinstance(v2, list):
+        items, src = (v2 or []), "notice_list_v2"  # v2 缺失/为 null/空数组 = 成功的空（实测出现过 null，别判结构变了）
+    elif v1 is None or isinstance(v1, list):
+        items, src = (v1 or []), "notice_list"     # v2 是奇怪类型但 v1 为 null/空数组时仍接受 v1
+    else:
+        return {"cls": "structure", "http_status": http_status, "status_code": 0,
+                "group": group, "url": url,
+                "error": "status_code=0 但 notice_list_v2 / notice_list 都不是数组，接口结构可能已变；"
+                         "顶层键: {}".format(", ".join(sorted(map(str, data.keys()))[:14]))}
+    return {"cls": "ok", "http_status": http_status, "status_code": 0, "group": group,
+            "notice_list": items, "source": src, "has_more": data.get("has_more"), "url": url}
+
+
+def _notice_count_groups(args):
+    """调 count 接口取**当前非零**的 notice_group（实测分组动态变化，必须每次现取，不能写死）。
+
+    返回 {"cls": "ok", "groups": [int...]}（count>0 或 dot_count>0 的 group，按接口顺序去重）；
+    其余 cls 语义同 _notice_http_get。
+    """
+    url = "{}?{}".format(DOUYIN_HOST + NOTICE_API_COUNT_PATH, NOTICE_API_COUNT_QS)
+    out = _notice_http_get(args, url)
+    if out["cls"] != "ok":
+        return out
+    data = out.pop("data")
+    rows = data.get("notice_count")
+    if not isinstance(rows, list):
+        return {"cls": "structure", "http_status": out.get("http_status"), "status_code": 0,
+                "url": url,
+                "error": "status_code=0 但响应缺 notice_count 键（或它不是数组），count 接口结构可能已变"}
+    groups = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            total = int(row.get("count") or 0) + int(row.get("dot_count") or 0)
+            group = int(row.get("group"))
+        except (TypeError, ValueError):
+            continue
+        if total > 0 and group not in groups:
+            groups.append(group)
+    return {"cls": "ok", "http_status": out.get("http_status"), "status_code": 0,
+            "groups": groups, "url": url}
+
+
+def _first_url(node):
+    """avatar_thumb.url_list[0] 一类的安全一取：url_list 不是非空数组就给空串。"""
+    urls = node.get("url_list") if isinstance(node, dict) else None
+    if isinstance(urls, list) and urls:
+        return str(urls[0] or "")
+    return ""
+
+
+def _fmt_notice_time(raw):
+    """create_time（unix 秒）→「YYYY-MM-DD HH:MM:SS」本地时间；解析不出就清洗原样返回。
+    （仓库其它命令的 time 是页面原文直出；这里是接口结构化时间戳，按人读格式给。）"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(raw)))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return _clean(raw, 40)
+
+
+def _notice_create_time(raw):
+    """排序键：create_time（unix 秒）取不出就当 0（视为最旧），绝不让缺字段的条目抛异常。"""
+    try:
+        return int(raw.get("create_time"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _notice_map(raw, diag):
+    """单条通知 → 契约条目 {type, user, text, time, url, avatar}。
+
+    type 31（评论）/ 33（关注）按实测样本映射（_diag/notes-probe 5 条真实通知验证过）；
+    其它 type **不猜字段**：type 数字带上、user/text/url 留空，diag.unsupportedTypes 记录
+    「未支持的通知类型 N，字段映射未知」。
+    general_notice 子对象兜底 —— **未验证路径**：实测样本里 title/content/sender_name 全是
+    空字符串（只有 schema_text="查看详情"），因此仅当这些字段真的非空才启用填空，
+    并在条目标 "unverified": true（不许把它当主力）。
+    """
+    try:
+        ntype = int(raw.get("type"))
+    except (TypeError, ValueError):
+        ntype = None
+    item = {"type": "未知({})".format(ntype if ntype is not None else "?"),
+            "user": "", "text": "", "time": _fmt_notice_time(raw.get("create_time")), "url": ""}
+    if ntype == 31:   # 评论（实测样本：comment.comment.*）
+        c = (raw.get("comment") or {}).get("comment") or {}
+        u = c.get("user") or {}
+        aweme_id = str(c.get("aweme_id") or raw.get("aweme_id") or "").strip()
+        item.update({"type": "评论",
+                     "user": _clean(u.get("nickname"), 60),
+                     "text": _clean(c.get("text"), 300),
+                     "url": "https://www.douyin.com/video/{}".format(aweme_id) if aweme_id else "",
+                     "avatar": _first_url(u.get("avatar_thumb"))})
+        return item
+    if ntype == 33:   # 关注（实测样本：follow.from_user.*）
+        f = raw.get("follow") or {}
+        u = f.get("from_user") or {}
+        sec_uid = str(u.get("sec_uid") or "").strip()
+        item.update({"type": "关注",
+                     "user": _clean(u.get("nickname"), 60),
+                     "text": _clean(f.get("content"), 300),
+                     "url": "https://www.douyin.com/user/{}".format(sec_uid) if sec_uid else "",
+                     "avatar": _first_url(u.get("avatar_thumb"))})
+        return item
+    rows = diag.setdefault("unsupportedTypes", [])
+    for row in rows:
+        if row.get("type") == ntype:
+            row["count"] += 1
+            break
+    else:
+        rows.append({"type": ntype, "count": 1,
+                     "note": "未支持的通知类型 {}，字段映射未知".format(ntype)})
+    gn = raw.get("general_notice") or {}
+    sender = _clean(gn.get("sender_name"), 60)
+    body = _clean(gn.get("content") or gn.get("title"), 300)
+    if sender or body:   # 未验证兜底真启用过才标注，绝不拿空串编内容
+        item["user"] = sender
+        item["text"] = body
+        item["unverified"] = True
+        for row in rows:
+            if row.get("type") == ntype:
+                row["generalNoticeFallback"] = "已启用（未验证）"
+                break
+    return item
 
 
 def cmd_notes(page, args):
-    url = (getattr(args, "url", None) or DOUYIN_NOTES_URL).strip()
-    _goto(page, url, args, "notes")
-    cfg = {"limit": args.limit, "rows": NOTES_ROWS}
-    data = _extract(page, NOTES_BODY, cfg, "notes")
-    rows = data.get("items") or []
-    try:
-        row_count = int(data.get("rowCount") or 0)
-    except (TypeError, ValueError):
-        row_count = 0
-    if not rows:
-        verify_msg = _verify_message(page)
-        if verify_msg:
-            raise StepError("notes", verify_msg)
-        not_found = _page_not_found(page)   # 404 页：地址就不对，别让用户去改选择器
-        if not_found and row_count == 0:
-            raise StepError("notes", "通知列表读不到：{}；Web 端目前没有独立的通知页"
-                                     "（导航岛里的「通知」是页内弹层，不是 URL）".format(not_found))
-        hint = _login_wall_hint(page)
-        if row_count > 0:
-            raise StepError("notes", "命中 {} 个通知节点但内容为空（可能未登录或列表未渲染）{}"
-                            .format(row_count, "；" + hint if hint else ""))
-        raise StepError("notes", "通知列表选择器全部未命中（抖音 DOM 可能已变；通知页需要登录态）{}"
-                        .format("；" + hint if hint else ""))
-    items = []
-    for it in rows[: args.limit]:
-        items.append({
-            "type": _clean(it.get("type"), 12) or "其他",
-            "user": _clean(it.get("user"), 60),
-            "text": _clean(it.get("text"), 300),
-            "time": _clean(it.get("time"), 40),
-            "url": it.get("url") or "",
-        })
+    """通知摘要：按 notice_group 遍历已验证的 Web 接口 /aweme/v1/web/notice/（纯 HTTP，不开浏览器）。
+
+    1. 候选分组 = count 接口当前非零分组（动态、每次现取）+ 实测聚合分组兜底 [960, 700, 401, 2]，
+       逐 group 拉一页（药方 count=10），按 nid(_str) 去重，最多取 args.limit 条；
+    2. 数据在 notice_list_v2（实测 v1 恒空）；映射只认实测过的 type 31（评论）/ 33（关注），
+       未知 type 不猜字段（见 _notice_map）；
+    3. 空列表 = 成功的空：ok=true + 空数组 + diag.message「当前无通知」；动态分组现取为空
+       （count 接口全 0，常见于通知已全读）且静态分组全 0 时，message 换成显式风险提示
+       （diag.riskHint=dynamic-groups-empty）—— 与「真的没通知」不同形，但仍是 ok；
+    4. 错误五类分开报（见 _notice_http_get），payload 附 errorKind 机读分类。单个分组失败
+       按降级处理：记进 diag.groups（带 error）继续下一组，只有 not_login 中止整条命令；
+    5. 每个分组只拉第一页（count=10）：映射前按 create_time 新→旧排序、截到 limit，
+       但不保证覆盖全局最新 N 条（翻页语义未验证，见 notice-schema.md §7）。
+    """
+    del page   # 接口路径不需要浏览器；签名保留与 HANDLERS 对齐
+    if getattr(args, "url", None):
+        log("notes 现走 Web 接口（{}），--url 参数已忽略".format(NOTICE_API_PATH))
+    limit = max(1, int(getattr(args, "limit", 20) or 20))
+    diag = {"endpoint": NOTICE_API_PATH, "param": "notice_group",
+            "pageSize": NOTICE_API_GROUP_COUNT, "countGroups": [], "groupPlan": [],
+            "groups": [], "received": 0, "deduped": 0, "unsupportedTypes": []}
+    args.diag = diag   # main() 会把它带进 payload["diag"]
+    # 1) 现取 count 接口的非零分组（动态）；未登录直接早失败，其余失败退回静态候选
+    count = _notice_count_groups(args)
+    if count["cls"] == "ok":
+        diag["countGroups"] = count["groups"]
+    else:
+        diag["countError"] = "{}（cls={}）".format(count.get("error", ""), count["cls"])
+        log("count 接口未取到分组（{}），退回静态候选分组".format(count["cls"]))
+        if count["cls"] == "not_login":
+            raise StepError("notes", count["error"], kind=count["cls"])
+    groups = list(dict.fromkeys(list(diag["countGroups"]) + list(NOTICE_API_STATIC_GROUPS)))
+    diag["groupPlan"] = groups
+    # 2) 逐 group 拉取 + nid 去重（dict 保序）；攒够 limit 就不再发请求
+    seen = {}
+    for g in groups:
+        if len(seen) >= limit:
+            break
+        fetch = _notice_api_fetch(args, g)
+        diag["status_code"] = fetch.get("status_code")
+        row = {"group": g, "cls": fetch["cls"],
+               "status_code": fetch.get("status_code"),
+               "httpStatus": fetch.get("http_status"),
+               "noticeCount": len(fetch.get("notice_list") or []),
+               "source": fetch.get("source")}
+        diag["groups"].append(row)
+        if fetch["cls"] != "ok":
+            if fetch["cls"] == "not_login":
+                # 登录态问题：其余分组也会同样失败，继续跑没意义 —— 中止整条命令
+                raise StepError("notes", fetch["error"], kind=fetch["cls"])
+            # 降级（与 count 接口失败同策略）：记下失败组继续下一组，别让一个组拖死整条命令
+            row["error"] = fetch.get("error", "")
+            log("notice_group={} 请求失败（{}），降级跳过：{}".format(
+                g, fetch["cls"], fetch.get("error", "")))
+            continue
+        for raw in fetch["notice_list"]:
+            if not isinstance(raw, dict):
+                continue
+            diag["received"] += 1
+            key = str(raw.get("nid_str") or raw.get("nid") or "_idx_{}".format(diag["received"]))
+            seen.setdefault(key, raw)
+    diag["deduped"] = len(seen)
+    # 3) 映射（未知 type 不猜字段，见 _notice_map）；按 create_time 新→旧排序后截到 limit
+    raws = sorted(seen.values(), key=_notice_create_time, reverse=True)
+    items = [_notice_map(raw, diag) for raw in raws][:limit]
+    failed_groups = [r for r in diag["groups"] if r["cls"] != "ok"]
     if not items:
-        raise StepError("notes", "通知解析后没有可用条目（可能需登录或页面结构已变）")
+        if failed_groups:
+            diag["message"] = ("当前无通知；但 {} 个分组请求失败（group {}），空结果可能不完整，"
+                               "失败原因见 diag.groups 里带 error 的条目".format(
+                                   len(failed_groups),
+                                   "、".join(str(r["group"]) for r in failed_groups)))
+        elif not diag["countGroups"]:
+            diag["message"] = ("当前无通知；动态分组现取为空（count 接口全 0，可能因通知已读），"
+                               "结果完全依赖硬编码分组 {}；若怀疑漏拿，请核对 group 号是否仍有效"
+                               .format(list(NOTICE_API_STATIC_GROUPS)))
+            diag["riskHint"] = "dynamic-groups-empty"
+        else:
+            diag["message"] = "当前无通知"
+        log(diag["message"])
+    elif diag["unsupportedTypes"]:
+        log("通知里含未支持类型 {}（不猜字段，text 留空）".format(
+            "、".join(str(row["type"]) for row in diag["unsupportedTypes"])))
     return items
 
 
@@ -1900,17 +2172,20 @@ def cmd_messages(page, args):
     return items
 
 
-# ---- selftest：选择器体检（只读；DOM 一变工具会静默返回空数组，这里能随时查出是哪种） ----
+# ---- selftest：选择器/接口体检（只读；DOM 一变工具会静默返回空数组，这里能随时查出是哪种） ----
 # 关键选择器候选组一律**复用上面的常量**，不另造一套：
 #   热榜 -> HOT_ROWS；推荐页 -> VIDEO_LIKE/COMMENT/SHARE（推荐页和详情页是同一个播放器组件的按钮）；
-#   通知页 -> NOTES_ROWS；私信页 -> MESSAGES_ROWS（未读角标 MESSAGES_BADGE 不算关键）。
+#   私信页 -> MESSAGES_ROWS（未读角标 MESSAGES_BADGE 不算关键）。
+#   通知 -> 不再看页面（Web 端没有独立通知页，页面体检只会得到 notfound 的噪声），
+#           改按已验证的 Web 接口 /aweme/v1/web/notice/ 体检（见 _selftest_notes）。
 SELFTEST_RECOMMEND = list(VIDEO_LIKE) + list(VIDEO_COMMENT) + list(VIDEO_SHARE)
 SELFTEST_PAGES = (
     ("hot", "热榜", DOUYIN_HOST + "/hot", HOT_ROWS, False),
     # 推荐组用 /friend：实测 / 会 302 到 /jingxuan（抖音精选落地页，没有播放器按钮），
     # 只有 /friend 是真信息流（video-player-digg / feed-comment-icon / video-player-share 各命中 1）
     ("recommend", "推荐", DOUYIN_HOST + "/friend", SELFTEST_RECOMMEND, True),
-    ("notes", "通知", DOUYIN_NOTES_URL, NOTES_ROWS, True),
+    # 通知：sels=None 即「接口体检」标记 —— 走 _selftest_notes，不开浏览器
+    ("notes", "通知", DOUYIN_HOST + NOTICE_API_PATH, None, True),
     ("messages", "私信", DOUYIN_MESSAGES_URL, MESSAGES_ROWS, True),
 )
 
@@ -1944,6 +2219,38 @@ def _page_not_found(page):
     return None
 
 
+def _selftest_notes(args, has_login, cookie_path):
+    """通知项按接口体检（Web 端没有独立通知页）：status_code=0 -> ok；8 -> unknown（登录态问题）；
+    5 / 网络 / 结构 -> missing。verdict 四值语义不变；entry 带 via:"api" 与 api 明细。
+    接口通但 notice_list_v2 为空也算 ok —— 体检只回答「通不通」，不回答「有没有内容」。
+    探测用实测聚合分组 960（notice_group 必填，见常量注释）。"""
+    entry = {"name": "notes", "label": "通知", "url": DOUYIN_HOST + NOTICE_API_PATH,
+             "selectors": [], "via": "api"}
+    if not has_login:
+        entry["verdict"] = "unknown"
+        entry["reason"] = "需要登录态：没读到 cookie（{}）".format(cookie_path)
+        return entry
+    group = NOTICE_API_STATIC_GROUPS[0]
+    fetch = _notice_api_fetch(args, group)
+    entry["api"] = {"cls": fetch["cls"], "status_code": fetch.get("status_code"),
+                    "httpStatus": fetch.get("http_status"), "group": group,
+                    "source": fetch.get("source"),
+                    "noticeCount": len(fetch.get("notice_list") or [])}
+    if fetch["cls"] == "ok":
+        entry["verdict"] = "ok"
+        entry["hits"] = 1
+        entry["reason"] = "接口通（status_code=0，notice_group={}），{} {} 条".format(
+            group, entry["api"]["source"], entry["api"]["noticeCount"])
+    elif fetch["cls"] == "not_login":
+        entry["verdict"] = "unknown"
+        entry["reason"] = fetch["error"]
+    else:
+        entry["verdict"] = "missing"
+        entry["hits"] = 0
+        entry["reason"] = fetch["error"]
+    return entry
+
+
 def _selftest_counts(page, sels, step):
     """每个候选选择器在该页的命中数。列表是异步渲染的：全 0 时等 1.5 秒再数一次，别把慢渲染当失效。"""
     counts = [{"sel": s, "count": 0} for s in sels]
@@ -1969,13 +2276,18 @@ def _selftest_counts(page, sels, step):
 
 
 def cmd_selftest(page, args):
-    """依次体检 4 个页面：关键候选组全 0 -> missing；页面打不开/被验证墙拦/要登录 -> unknown 附原因。
+    """体检：热榜/推荐/私信走页面（关键候选组全 0 -> missing；打不开/被验证墙拦/要登录 -> unknown 附原因），
+    通知走 Web 接口（status_code=0 -> ok；8 -> unknown；5/网络/结构 -> missing，见 _selftest_notes）。
     这是**体检工具**：missing 也如实返回（ok:true），绝不因为选择器失效就把整个命令判失败。"""
     has_login = bool(_cookie_records(args.cookies))
     cookie_path = _resolve_cookie_file(args.cookies)
     items = []
     for name, label, url, sels, login_only in SELFTEST_PAGES:
         entry = {"name": name, "label": label, "url": url, "selectors": []}
+        if sels is None:
+            # 接口体检项（通知）：不开页面，按接口错误码给 verdict
+            items.append(_selftest_notes(args, has_login, cookie_path))
+            continue
         if login_only and not has_login:
             # 没登录就不去开这一页：开了也只会把「登录墙」误报成「选择器失效」
             entry["verdict"] = "unknown"
@@ -2103,8 +2415,13 @@ HANDLERS = {
 
 def run(args):
     handler = HANDLERS[args.command]
-    if args.command in ("notes", "messages"):
-        _require_login(args, args.command)  # 先查登录态，别白起一个浏览器
+    if args.command == "notes":
+        # 通知走已验证的 Web 接口（纯 HTTP）：不开浏览器；没 cookie 仍在最早的时刻失败
+        _require_login(args, "notes")
+        args.browser_used = "http"   # 如实回报：本次没用浏览器（browser_used() 优先取这个值）
+        return cmd_notes(None, args)
+    if args.command == "messages":
+        _require_login(args, "messages")  # 先查登录态，别白起一个浏览器
     with _browser_page(args) as page:
         return handler(page, args)
 
@@ -2194,20 +2511,28 @@ def parse_args(argv=None):
     p_note.add_argument("--url", required=True,
                         help="图文地址 https://www.douyin.com/note/<id>（也接受短链与裸 id）")
 
-    # ② 通知（只读）：登录后才有的两个页面。--url 可覆盖默认路径（真机路径变了就不用改代码）
-    for name, helptext, default_url in (
-            ("notes", "通知摘要（点赞/评论/@我的/关注，需要登录态）", DOUYIN_NOTES_URL),
-            ("messages", "私信会话列表摘要（需要登录态）", DOUYIN_MESSAGES_URL)):
+    # ② 通知（只读）：notes 走已验证的 Web 接口（纯 HTTP，不开浏览器）；messages 走 /chat 页面。
+    # messages 的 --url 可覆盖默认路径（真机路径变了就不用改代码）
+    for name, helptext in (
+            ("notes", "通知摘要（评论/关注等通知，需要登录态；Web 接口直连，按 notice_group 遍历）",),
+            ("messages", "私信会话列表摘要（需要登录态）",)):
         p = sub.add_parser(name, parents=[common], help=helptext)
         p.add_argument("--limit", type=int, default=20, help="取几条，默认 20，范围 1-100")
-        p.add_argument("--url", default=None,
-                       help="页面地址，默认 {}".format(default_url))
+        if name == "messages":
+            p.add_argument("--url", default=None,
+                           help="页面地址，默认 {}".format(DOUYIN_MESSAGES_URL))
+        else:
+            p.add_argument("--url", default=None,
+                           help="已弃用：notes 走已验证的 Web 接口（{}），"
+                                "此参数仅保留兼容、会被忽略".format(NOTICE_API_PATH))
 
     # 体检：DOM 一变只读工具就静默返回空数组 —— 这个子命令随时回答「今天真没内容，还是选择器失效了」
     sub.add_parser("selftest", parents=[common],
-                   help="选择器体检：热榜/推荐/通知/私信四个页面各数一遍关键选择器的命中数",
-                   description="依次打开热榜 / 推荐 / 通知 / 私信四个页面，报告每页关键选择器候选组的命中数。"
-                               "关键候选组全 0 记 missing；全 0 且落地是抖音 404 页（「页面不见啦」）"
+                   help="体检：热榜/推荐/私信数关键选择器命中数，通知按 Web 接口连通性",
+                   description="热榜 / 推荐 / 私信三个页面各数一遍关键选择器候选组的命中数；通知不开页面，"
+                               "改按已验证的 Web 接口（/aweme/v1/web/notice/）体检：status_code=0 记 ok，"
+                               "8（未登录）记 unknown，5 / 网络 / 结构问题记 missing。"
+                               "页面候选组全 0 记 missing；全 0 且落地是抖音 404 页（「页面不见啦」）"
                                "记 notfound（地址不存在/已变，不是选择器失效）；页面打不开或被验证墙拦记 "
                                "unknown 并附原因。missing / notfound 都不改退出码（体检如实报告，不当失败）。")
 
@@ -2236,6 +2561,9 @@ def _emit(payload, as_json):
     items = payload.get("items") or []
     if not items:
         print("（无数据）")
+        diag = payload.get("diag") or {}
+        if isinstance(diag, dict) and (diag.get("message") or diag.get("fieldMapping")):
+            print("（{}）".format(diag.get("message") or diag.get("fieldMapping")))
     if items and isinstance(items[0], dict) and "verdict" in items[0]:
         for it in items:
             hits = sum(int(c.get("count") or 0) for c in (it.get("selectors") or []))
@@ -2255,9 +2583,14 @@ def main(argv=None):
         args = parse_args(argv)
         items = run(args)
         payload = {"ok": True, "items": items, "elapsed": round(time.time() - start, 2)}
+        diag = getattr(args, "diag", None)   # notes 的接口诊断信息（分页/收到的条数/字段映射状态）
+        if diag:
+            payload["diag"] = diag
     except StepError as exc:
         payload = {"ok": False, "error": "{}: {}".format(exc.step, exc.reason),
                    "items": [], "elapsed": round(time.time() - start, 2)}
+        if getattr(exc, "kind", None):
+            payload["errorKind"] = exc.kind   # 机器可读分类：not_login/bad_params/network/structure/unknown_code
     except KeyboardInterrupt:
         payload = {"ok": False, "error": "已中断", "items": [],
                    "elapsed": round(time.time() - start, 2)}
@@ -2265,6 +2598,9 @@ def main(argv=None):
         payload = {"ok": False, "error": "未预期错误: {}".format(_brief(exc)),
                    "items": [], "elapsed": round(time.time() - start, 2)}
     payload["browser"] = browser_used(args)
+    cookie_state = getattr(args, "cookie_state", None) if args is not None else None
+    if isinstance(cookie_state, dict):
+        payload["cookie"] = cookie_state   # 新增字段：本次是否游客态 / cookie 条数（不动既有字段语义）
     as_json = bool(getattr(args, "json", False)) if args is not None else False
     _emit(payload, as_json)
     return 0 if payload.get("ok") else 2

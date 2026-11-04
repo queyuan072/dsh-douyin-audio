@@ -1,135 +1,109 @@
-# HANDOFF —— 当前状态与决策记录
+# HANDOFF —— dsh-douyin · 下一轮接手唯一入口
 
-> 用途：会话上下文过长时，新开会话直接读本文件即可接手，不需要翻历史。
-> 最后更新：2026-11-04 第二轮（1.4.0 待升 1.5.0 / 见 `git log` 与 §9）
+> 2026-11-05 更新（1.5.0 轮收尾）。新会话只读这一份即可接手；本文件取代 2026-11-04 版，旧结论（「通知接口未打通」「默认 /messages」）一律作废。
+> 深读顺序：`_diag/notes-probe/notice-schema.md`（通知接口权威结构）→ `_diag/reviews/silent-failures-verify.md`（复核判定）→ `_diag/INTERRUPT-STATE.md`（中断现场/残局记录）。
 
-## 1. 现在是什么状态
+## 1. 现状表
 
-| 项 | 值 |
-| --- | --- |
-| 版本 | **1.4.0**（`package.json`） |
-| 工具数 | **17**（`node selfcheck.mjs` 必须输出「17 个工具」） |
-| 双远端 | `origin`=GitHub `queyuan072/dsh-douyin-audio`；`gitcode`=AtomGit 同名仓库 |
-| npm | **停在 1.2.3 未更新**（用户明确选择「只升版本打 tag，先不发 npm」） |
-| tag | `v1.3.0`、`v1.4.0` 已推双端 |
-
-**改完代码必须做**（顺序固定）：
-1. 复制到安装副本 `C:\Users\20155\.dsh\profiles\desktop\node_modules\dsh-douyin-audio`（index.js / client.js / selfcheck.mjs / README.md / package.json / scripts/*.py / lib/*.mjs）
-2. 在安装副本里跑 `node selfcheck.mjs`，必须 EXIT=0 且 17 个工具
-3. **重启 DSH**（bundle 层只在启动时叠加）
-4. `git commit` → `git push origin main` → `git push gitcode main`（**两个都要推，别只推 origin**）
-
-## 2. 这一轮做完的事（都有实测数据）
-
-### 2.1 长音频静默截断（最关键的修复）
-同一段 120 秒音频（`video_002.mp4` 前 120s），同机同线程：
-
-| 模式 | 字数 | 残句 | 说明 |
-| --- | --- | --- | --- |
-| 整段一次解码（旧） | **37** | — | 退出码 0，但 80% 内容被静默丢弃 |
-| 30s 硬切分片 | 177 | 2 | 有整片只出 1 字（60–90s 那段） |
-| **分片 + 静音吸附（现在）** | **305** | **0** | `CHUNK_SEC=30`，切点在 20–32s 窗口内找 ≥0.25s 的 −35dB 静音取中点 |
-
-相关实现：`scripts/transcribe_douyin.py` 的 `_decode_once` / `_pick_quiet_cut` / `transcribe_media`；CLI 有 `--chunk`（0=旧行为）`--no-snap``--srt`。
-
-### 2.2 第 17 个工具 `douyin_fetch`（链接驱动 + 字幕优先）
-- **有字幕** → `yt-dlp --write-subs` 抓下来解析 vtt/srt，**不下载音轨、不跑 ASR**
-- **无字幕** → 下载音轨 → 复用上面的分片+吸附管线
-- **抖音页面链接** → yt-dlp 拿不到（要 a_bogus 签名），改走 **Playwright 拦截 `douyinvod` 直链** → 下载 → ASR（`resolvedBy:"browser"`，`mediaUrl` 已脱敏）
-- 真机结果：抖音 `/video/7698723598362368697` → ok，title=「就让坚持拍电影感但毫无流量的我们…」，author=鹤望兰；B 站 `BV1GJ411x7h7` → 296 字 / 7 片 / 8.2s
-- 图文 `/note/` → 2.4s 内判「无音轨」快速失败
-
-### 2.3 选择器体检 `douyin_status({selftest:true})`
-真机结果：热榜 ok(71)、推荐 ok(3，改指 `/friend` 后)、私信 ok(3)、通知 **notfound**。
-`verdict` 取值：`ok` / `missing`（地址对但选择器全 0）/ `notfound`（抖音 404 页）/ `unknown`（验证墙、需登录）。
-
-## 3. 挖出并修掉的真 bug（都是「静默失败」类）
-
-| 问题 | 真相 | 修法 |
+| 项 | 值 | 来源 |
 | --- | --- | --- |
-| `douyin_messages` 永远空 | `/messages` 是 404 页 | 真路径是 **`/chat`**（实测拿到 JSEN/妙咪/舟懿 三个会话） |
-| `douyin_notes` 永远空 | 通知页 **Web 端不存在**（实测 25 个候选 URL 全 404） | 保留常量但明确判 `notfound`，报错写明「Web 端无独立通知页，入口是页内弹层」 |
-| `preferSubtitle` 传了不生效 | 脚本没有对应开关 | 脚本新增 `--no-subtitle`，宿主透传 |
-| 截断 text 却不报原长 | 调用方无法判断结果可信度 | 脚本只截 text、segments 保留完整时间轴，回报 `textLength`/`truncated` |
+| 版本 | package.json = 1.4.0，**本轮待升 1.5.0、未升** | package.json:3 |
+| 工具数 | **17**；本轮实跑 `node selfcheck.mjs` EXIT=0、「✓ 预检通过：17 个工具」 | selfcheck 实测 |
+| 双远端 | `origin`=github.com:queyuan072/dsh-douyin-audio；`gitcode`=**gitcode.com** 同名仓库（旧档写「AtomGit」与 remote URL 不符，以 URL 为准） | git remote -v |
+| npm | 停在 **1.2.3**（沿用旧档，本轮未联网复核） | 旧 HANDOFF §1 |
+| tag | v1.2.0 ~ v1.4.0 已打；**v1.5.0 未打** | git tag -l |
+| 工作树 | **12 文件未提交**（含 selfcheck.mjs；12 files changed, 961 insertions(+), 286 deletions(-)）——本轮成果全在工作树，HEAD=e696b15，先走 §4 发布流程 | git status / diff --stat |
 
-**判断标准（沿用）**：一个结果要么可信，要么明确说不可信；不允许「看起来成功、实际是假的」。
+## 2. 本轮成果
 
-## 4. 安全修复（1.2.2 那一批，已合入）
-C1 插件 HTTP 路由加同源门（token / Sec-Fetch-Site / Origin==Host + **Host 白名单防 DNS rebinding**）；H1 tier 闸门不可由 agent 自解锁；H2 Cookie 域名白名单；H3 SSRF 域名校验；H4 计数不可观测时不反向补点；H5 登录只认 session cookie。
-**注意**：1.2.2 曾有回归（同源门过严导致设置页 403），1.2.3 已修；现在门是「只按正面证据拒绝」。
+### 2.1 通知接口已打通（本轮最大成果）
 
-## 5. 已知限制（别再重复踩）
-- 抖音页面链接靠浏览器兜底，**headless 可能被风控拦** → 加 `--window-offscreen`（可见窗口移屏幕外）可过
-- 只下发分离视频轨的视频 → 报「只有视频轨、没有音轨」（不做 mux）
-- `codegeex-4`（智谱代码模型）**不支持工具调用**（`tool_choice=required` 也返回 0 个 tool_calls）→ 不能当子代理
-- 智谱 `glm-5.3`/`glm-4.7` **不支持图片输入**（400：content.type 只允许 text）；识图用 `glm-4.5v`/`glm-4v-plus`
-- `-realtime` / `-audio` / `-embedding` / `-rerank` 类模型在 Chat Completions 下不可用（500/400）
-- 抖音 `/models` 之类目录不等于可用：`cmaas-qwen3.8-flash` 会 403
-- 千问 `qwen3.8-max` 实际 ID 是 `qwen3.8-max-0902`
+- `douyin_notes` 弃「抓不存在的通知页」旧路线，改**纯 HTTP 直连** `GET /aweme/v1/web/notice/?…&notice_group=<GROUP>`，不开浏览器。三要点：参数名是 **`notice_group` 不是 `notice_type`**（用错恒空）；**完全不需要 a_bogus / msToken 等任何签名**；数据在 **`notice_list_v2`**（`notice_list` 恒为空数组）。
+- 落点：`scripts/douyin_read.py` 的 `cmd_notes` + `_notice_api_fetch`（douyin_read.py:1888-1905：分组遍历 + `nid` 去重、v2 空才退 v1、错误码 0/5/8 分明）；工具描述见 index.js:2191（未支持的类型只带类型号、不猜字段）。
+- **权威结构说明 = `_diag/notes-probe/notice-schema.md`**（请求药方、type 31/33 字段路径、已验证/未验证清单、抓包样本位置）。别把药方抄进会随代码漂移的文件，一切以它为准。
+- 运营注意：`/notice/count/` 的非零分组号是**动态的**（同账号两次采样都可能不同），必须现取：count>0 的 group + 960/700/401/2 兜底（notice-schema.md §2）。
+- 样本来源：宿主浏览器打开通知弹层抓包——沙箱内拿不到（原因见 §3）。
 
-## 6. 待办（按优先级）
+### 2.2 静默失败 15 条：复核判定 + 处理结果
 
-**P0（用户要求过、还没做）**
-- 通知改走接口：拦截 `/aweme/v1/web/notice/…`（XHR 已确认存在），让 `douyin_notes` 真能用
-- 密钥文件从 `D:\大肥鱼\工作区\ai\key.txt` 挪到 `C:\Users\20155\.dsh\ai\key.txt`（工作区已两次被清空导致两个工具失效）
+复核（silent-failures-verify.md；基准 `git archive HEAD@e696b15` 快照、三问法、立场=假设报告有错）：**15 条没有整条误判；#13 主论点误判（`resolve(null)` 只是内层 code 变量，runViaCmd 返回恒为对象）；属实 6（含 2 潜伏）、部分属实 9；#9/#10 的触发场景（传错 --cookies）在插件工具链路上不可达**。**结论：复核价值在定级校正而非推翻，没有任何已落改动需要回退**（INTERRUPT-STATE.md §8.2 同判定）。
 
-**P1**
-- 默认 `--chunk` 是否降到 20–25s（目前保持 30，靠吸附规避）
-- 选择器体检加一条「推荐页依赖登录」的说明（游客态 `/friend` 是登录墙 → unknown）
+| # | 复核判定 | 本轮处理（行号 = 本轮实测 grep） |
+| --- | --- | --- |
+| 1 时长未知回退整段解码 | 部分属实 | ✅ 盲切循环 + `durationUnknown`（transcribe-final-verify.md §1，broken.mp4 实测 exit 1） |
+| 2 分片失败吞成空串 | **属实** | ✅ 信封 `chunksFailed/failedRanges/failedSeconds/emptySeconds` + ≥1/3 闸门（同上 §2） |
+| 3 config set 丢 saveCfg | **属实** | ✅ 检查写盘结果（index.js:2725） |
+| 4 NO_AUDIO 标记过不了 JS | 部分属实（后果放大） | ✅ parseManifest 解析标记 → `noAudio`/`audioUnknown` 两义分开（index.js:316-354、1718） |
+| 5 ffmpeg 缺失误报「含音轨」 | 部分属实（后果放大） | ✅ manifest 显式 `# AUDIO_UNKNOWN`，绝不冒充（douyin_scroller.py:1074） |
+| 6 window 登录崩溃 → poll 永远 waiting | **属实** | ✅ window 分支传 `--state-dir`（index.js:2340-2343） |
+| 7 unlike 计数读不到假成功 | 部分属实 | ✅ 读不到计数 → 不点击 → `state=uncertain`（douyin_action.py:870-874）；按钮形态真机频率未核实 |
+| 8 runAction 不校验退出码 | 部分属实 | ✅ 双闸对齐 runRead（index.js:2255-2257） |
+| 9 cookie 游客态无标注 | 部分属实（触发面不可达） | ✅ 信封带 `cookie:{guest,cookieCount,injected?,note?}`（douyin_read.py:1115-1125） |
+| 10 fetch 丢 --cookies 无声 | 部分属实（触发面不可达） | ✅ 路径不存在 → 警告 + `cookieNote`（douyin_fetch.py:830-836） |
+| 11 duty.json 损坏当没跑过 | 部分属实 | ✅ `stateReadError`（lib/duty.mjs:206） |
+| 12 快捷方式扫描吞错误 | **属实** | ✅ 各失败出口带 note（index.js:212-238） |
+| 13 runViaCmd resolve(null) | **主论点误判** | 只修真问题：超时 taskkill /T /F 杀进程树（lib/runner.mjs:98-99）；outFile 残留清理未核实 |
+| 14 truncated 兜底撒谎 | **属实（潜伏）** | ✅ 脚本没回报 → `null` + `truncateNote`「未知」，不假装完整（index.js:2022-2029）；selfcheck.mjs 断言同步改（+7/−4，1263-1274）并实测通过 |
+| 15 setup 猜 installed | **属实（潜伏）** | ✅ action 缺失 → `unknown`（index.js:1902-1911） |
 
-**P2**
-- npm 发 1.4.0（需要用户提供令牌）
-- FunASR/GPU 后端（本机无 NVIDIA GPU，性价比最低，暂不做）
-- 转写后自动总结/入库（下游管道）
+另修：manifest 写失败不再吞——`_append_manifest` 抛 `ManifestWriteError` 终止整次运行（douyin_scroller.py:209-215）；fetch 侧接 `stats_out`（douyin_fetch.py:945），<1/3 丢片对 fetch 也可见。
+复核 §四 新挖 6 点的落地状态：manifest 写失败、cookie 标注两条已修；**lib/state.mjs 本轮零改动 → loadCfg 幽灵重置（其 §四.1）确认未修**；fetch 成功后 errors 蒸发、runViaCmd outFile 残留、spawnLoginBg 200ms 乐观判定三项未核实。
 
-## 7. 环境（本机实测值）
-- python（带 playwright + sherpa）：`C:\Users\20155\AppData\Local\Doubao\User Data\sandbox_runtime\bases\9f6d27f23933fb44a3a1c728c88a5ce4\python\python.exe`
-- node：`C:\Users\20155\nodejs\node-v22.23.4-win-x64\node.exe`
-- ffmpeg：`C:\Users\20155\.dsh\bin\ffmpeg.exe`；模型：`C:\Users\20155\.dsh\models\sherpa-sense-voice\sherpa-sense-voice-zh-en-ja-ko-yue-2024-07-17`
-- cookie：`C:\Users\20155\.dsh\cookies\douyin_cookies.txt`（账号 鹊渊 / 69154390456）
-- 状态目录：`C:\Users\20155\.dsh\douyin-duty\`（config.json / duty.json / account.json / setup.log / diag-*.txt）
+### 2.3 转写 P1 修复（已验收）
 
-## 8. 模型 provider（用户 2026-11-04 在设置里自行添加）
-- `qwen`：`https://dashscope.aliyuncs.com/compatible-mode/v1`，OpenAI Chat Completions
-  模型：`qwen3.8-flash`（文本）、`qwen3.8-max-0902`（文本）、`qwen3.8-omni-flash`（文本+图片）
-- `zhipu`：`https://open.bigmodel.cn/api/paas/v4`，OpenAI Chat Completions
-  模型：`glm-5.3`、`glm-5.3-flash`（文本）、`glm-4.5v`（文本+图片）、`codegeex-4`（文本，**无工具调用**）
-- 两家都实测支持工具调用（除 codegeex-4）
-## 9. 2026-11-04 第二轮（P0 攻坚中）
+- P1-1（时长未知不再整段一次解码）/ P1-2（分片失败进信封 + ≥1/3 闸门）真修好：结论、实测数据、可复现命令都在 `_diag/transcribe-final-verify.md`。
+- 7 个 Python（py_compile）+ 7 个 JS（node --check）编译全过（INTERRUPT-STATE.md §1）；selfcheck EXIT=0。
 
-### 9.1 已完成：密钥双路径兜底（P0-2）
-- 病灶：`dsh-glm-agent/index.js:14`、`dsh-qwen-agent/index.js:14` 硬编码 `D:\大肥鱼\工作区\ai\key.txt`；工作区被清空两次 → `glm_ask`/`qwen_ask` 双双失效
-- 修法：候选路径 `['C:\Users\20155\.dsh\ai\key.txt', 'D:\大肥鱼\工作区\ai\key.txt']` 前者优先；`resolveKeyFile(configured)` 保持 `config.keyFile` 最优；解析时机改为每次 execute 现解析（后补 key 不必重启插件）；报错区分「文件都不存在」/「文件在但没合规 key」
-- 已落盘并实测：新 key sha256 `0A9F96AA…F7F7B`（与旧文件逐字节一致）、两插件 `node --check` exit 0、真实路径解析 8 项全 PASS、key 体检 2 个有效 key（GLM 49 字符 / 千问 `sk-` 116 字符）
-- **留档**：`C:\Users\20155\.dsh\ai\patches\`（两份改好的 index.js + README）。这两个插件在工作区**没有源码仓库**，安装副本就是唯一源码，重装/升级会覆盖回单路径硬编码，必须照 README 重打
-- **生效前提**：重启 DSH（插件代码在启动时加载；本会话内改了不生效）
+## 3. 沙箱死结（成本极高的教训，禁止重试）
 
-### 9.2 进行中：通知改走接口（P0-1）
-- 目标：`douyin_notes` 改拦 `/aweme/v1/web/notice/` 的 XHR（入口是页内弹层 `[data-e2e="listDlgTest-container"]`），不再抓不存在的通知页；返回结构保持 `type/user/text/time/url`
-- **探路结论（2026-11-04，captures=0）：一条响应都没抓到，JSON 结构/分页/类型差异全部「未探到」**。完整断点笔记：`D:\大肥鱼\工作区\notice-probe-notes.md`（先读它，别从零重探）
+- **DSH 沙箱内 Chromium 完全起不来**：Mojo IPC 需要的命名管道创建被沙箱拒绝，`--single-process` 下直接 `FATAL mojo\public\cpp\platform\platform_channel.cc:187 Check failed 拒绝访问 (0x5)`（notice-probe-notes.md §5，多轮实测）。
+- 后果：**playwright 脚本与 raw CDP 在沙箱内都不可行**（同族死法：asyncio 命名管道 `PermissionError: [WinError 5]`）。沙箱子代理做不了任何浏览器真机验证——通知接口最后是在宿主浏览器抓包才打通的。
+- 浏览器真机验证只有两条路：**宿主工具 `douyin_status({selftest:true})`**（300s 预算、真开浏览器、唯一免能力闸门的入口）；或宿主浏览器人工抓包。
+- 别再写「沙箱里跑 Chromium/CDP」的探针，全是沉没成本。
 
-#### 9.2.1 三个硬卡点（决定「怎么验证」，务必先读）
-1. **沙箱禁 asyncio 命名管道 → playwright 在沙箱内起不来**：任何 playwright 脚本在启动驱动阶段 `PermissionError: [WinError 5]`（`asyncio/windows_utils.py` 建 `\\.\\pipe\\...`）；普通 subprocess 匿名管道反而正常。→ 子代理**不能**用沙箱内 python 做真机验证
-2. **宿主工具跑的是安装副本**（`C:\Users\20155\.dsh\profiles\desktop\node_modules\dsh-douyin-audio\scripts\*`），改仓库副本不生效 → 每次真机验证前**必须先同步安装副本**（脚本是每次调用现读，`.py` 改完即时生效，**不需要重启**；只有 `index.js`/`client.js` 改动才要重启）
-3. **`douyin_notes` 被能力闸门挡**：直接调返回 `{"ok":false,"code":"TIER_DISABLED","tier":"notify"}`。无闸门的真机入口只有 **`douyin_status({selftest:true})`**（跑 `scripts/douyin_read.py selftest`，预算 300s，真开浏览器）
+## 4. 改完代码的固定流程（顺序固定，本轮还没跑）
 
-#### 9.2.2 探路过程中确认为真的坑
-- headless 在**热榜/推荐页**没被风控拦（selftest 实测 hot=ok/hits=71、recommend=ok/hits=3），但**不代表通知弹层安全**
-- Edge CDP 必须加 `--remote-allow-origins=*`，否则 WS 连上即断（`no close frame received or sent`）
-- CDP 不要用后台 reader task 并发收发；顺序 send→recv 才连得住
-- 每次换新 `--user-data-dir` + 新端口，否则新 Edge 把参数转交旧实例后自己退出
-- 注入 cookie 必须过滤已过期 `expires`（`douyin_read.py:224-227` 注释：37 条会掉到 35 条，抖音随后回验证码中间页）
-- 现成探针脚本在 `D:\大肥鱼\工作区\_diag\notes-probe\`（`probe_cdp.py` 直连 page 端点即可续跑 / `cdp_smoke.py` 20 行连通性验证），不进仓库
+1. **同步安装副本** `C:\Users\20155\.dsh\profiles\desktop\node_modules\dsh-douyin-audio\`（index.js / client.js / selfcheck.mjs / README.md / package.json / scripts\*.py / lib\*.mjs）。宿主工具跑的就是这份副本：**.py 每次现读、改完即时生效；index.js / client.js 改动要重启 DSH**。副本目录在（douyin_status 实测），是否已含本轮代码未核实——发布前整份重同步。
+2. 安装副本上真机 `douyin_status({selftest:true})` 复验。
+3. `node selfcheck.mjs`：必须 EXIT=0 且「**17 个工具**」。
+4. `git commit` → **`git push origin main` 和 `git push gitcode main` 两个都要推** → 打 tag（本轮 `v1.5.0`）并推 tag。
+- ⚠️ 沙箱写不了 `.git`（任何 git 写操作）也写不了 `C:\Users\20155\.dsh\`（含安装副本同步）→ 步骤 1/4 必须 **danger-full-access** 升级会话后做。
+- npm 发版需用户提供令牌（npm 还停在 1.2.3）。
 
-#### 9.2.3 下一轮正确打法（已由上一轮实测否定过半条路）
-1. 先把探针挂进 `cmd_selftest` → **同步安装副本** → 用 `douyin_status({selftest:true})` 跑真机（这是唯一验证得通的路径）
-2. 拿到 `/aweme/v1/web/notice` 真实 JSON 后，再改 `cmd_notes` 与 selftest 的 notes 分支（`SELFTEST_PAGES` 那项改成「接口探到就 ok，探不到分清 notfound/missing/unknown」）
-3. 分工（用户 2026-11-04 定）：**GLM-5.3 实现、千问 `qwen3.8-flash` 只读复核**；子代理模型选择开关只对**新会话**生效；`codegeex-4` 无工具调用不能当子代理，`glm-4.5v` 是识图模型
-4. 交付前注意：`douyin_notes` 本身要能用，还需用户自己开 `tierNotify`（闸门不可由 agent 自解锁，见 §4-H1）
+## 5. 环境事实（douyin_status + 实跑核过）
 
-### 9.3 重启后接着做
-1. 派 GLM-5.3：按 §9.2.3 先挂探针进 `cmd_selftest`，取到真实 JSON 结构 → 改 `scripts/douyin_read.py` 的 `cmd_notes` + selftest 通知组判定
-2. 千问按任务书逐条只读复核（重点：有没有编造条目、失败是否明确说不可信、闸门语义有没有被破坏）
-3. 通过后：同步安装副本 → 真机 `douyin_status({selftest:true})` 复验 → `node selfcheck.mjs`（必须「17 个工具」）→ 升 1.5.0 → commit → push origin + gitcode → 打 `v1.5.0`
-4. 密钥补丁与本次改动无关联，别混在同一个 commit 里
+- python（playwright+sherpa 可用，3.13.13）：`C:\Users\20155\AppData\Local\Doubao\User Data\sandbox_runtime\bases\9f6d27f23933fb44a3a1c728c88a5ce4\python\python.exe`。**PATH 裸 python 是 Store 占位 stub（退出码 9009），一律用绝对路径。**
+- node：`C:\Users\20155\nodejs\node-v22.23.4-win-x64\node.exe`（Test-Path 实测在）
+- ffmpeg：`C:\Users\20155\.dsh\bin\ffmpeg.exe`（在）；**ffprobe 不装**（setup 只装 ffmpeg.exe，时长探测走 Duration 行兜底，silent-failures-verify.md §1）
+- 模型目录：`C:\Users\20155\.dsh\models\sherpa-sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`（在；旧档少写 `onnx-`，以此为准）
+- cookie：`C:\Users\20155\.dsh\cookies\douyin_cookies.txt`（在；账号 鹊渊 / 69154390456）
+- 状态目录：`C:\Users\20155\.dsh\douyin-duty\`（=`$DSH_HOME/douyin-duty`，lib/state.mjs:34-36；config.json / duty.json / login\ / videos\）
+- 浏览器：仅 msedge 在（chrome/chromium/firefox/webkit 均无）
+- 以上 `C:\Users\20155\.dsh\*` 在沙箱内**只读**。
 
+## 6. 已知限制（别重复踩）
+
+1. 通知 `general_notice` 兜底**未验证**：样本中 title/content/sender_name/schema_url 全空串（notice-schema.md §7）。
+2. 通知 type 除 31/33 **无样本**；未知 type 必须显式报「未支持的类型 N」，不许猜（已按此实现）。
+3. 通知**翻页语义未验证**（min_time/max_time 传 0、has_more 恒 0）；`is_mark_read=1` 已读回写未验证——只读原则下别开。
+4. 转写 `failedRanges` 条目 `dur` 可能为 **null**（盲切/单片失败时有意为之），JS 消费须容忍（transcribe-final-verify.md §5b）。
+5. package.json `files` 的 `scripts/*.py` **只匹配单层**：scripts 下加子目录会漏打包（package.json:37）。
+6. `client.js:36` `require('react')` **依赖宿主注入 react**。
+7. `vcd_toast_text` 是常驻文案（零通知时也存在、值相同），**不是诊断字段**，别拿它判成败（notice-schema.md §3）。
+8. headless 可能被抖音风控拦 → `--window-offscreen`（可见窗口移屏幕外）可过（沿用旧档，本轮未复核）。
+
+## 7. 待办（按优先级）
+
+1. **发布流程本体**（§4 全套，最高优先）：12 文件未提交；安装副本重同步 → 真机 selftest → selfcheck（17 工具）→ 升 1.5.0 → commit → push 双远端 → tag `v1.5.0`。全程需 danger-full-access。
+2. npm 发 1.5.0（需用户令牌）。
+3. `douyin_transcribe` 工具描述补分片统计新字段（chunksFailed / failedRanges / durationUnknown…；字段经 `...parsed` 已透传可达，只是描述没列）。
+4. 通知接口未验证项按需推进：general_notice 兜底、31/33 之外的 type 样本、翻页语义（notice-schema.md §7）。
+5. 实证 `runViaCmd` 的 cmd 传参「重定向是否真能跑通」（INTERRUPT-STATE.md §4；taskkill 已修，三种传参方式的实证没做完）。
+6. 复核 §四 剩余 4 点逐条核对：loadCfg 幽灵重置（确认未修）、fetch errors 蒸发、outFile 残留、spawnLoginBg 200ms（后三项未核实）。
+7. 旧档小项（未复核沿用）：`--chunk` 默认是否降 20–25s；selftest 补「推荐页依赖登录」说明。
+
+## 8. 模型 provider 现状与教训（本轮额度三连灭）
+
+- 用户自配两家（旧档 §8，本轮未复核）：`qwen` = dashscope compatible-mode（qwen3.8-flash / qwen3.8-max-0902 / qwen3.8-omni-flash）；`zhipu` = open.bigmodel.cn（glm-5.3 / glm-5.3-flash / glm-4.5v 识图 / codegeex-4——**无工具调用**，不能当子代理；glm-5.3/4.7 不支持图片输入）。
+- **现状**：本轮 qwen 403（免费额度耗尽）/ glm-5.3 429（资源包 0）/ glm-5.3-flash 429（烧完），额度三连灭把本轮打断多次，**6 个子代理中途暴毙**（各代理临死发现都汇总在 `_diag/INTERRUPT-STATE.md`；其中 index.js 六条、cookie/manifest、转写验证此后已补完，见 §2.2）。
+- **教训：派活前先探测额度**——先用一次轻量调用（如 `glm_ask` 打 glm-5.3-flash）确认非 429/403 再派活；并行子代理越多额度烧得越快，死一半就留残局，恢复成本高于重派。

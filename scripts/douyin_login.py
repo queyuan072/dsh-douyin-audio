@@ -761,8 +761,9 @@ def build_parser():
                     help="cookie 输出路径（默认取 $DOUYIN_COOKIE_FILE，再退到 "
                          "~/.dsh/cookies/douyin_cookies.txt）")
     ap.add_argument("--state-dir", dest="state_dir", default=None,
-                    help="登录临时目录（qr 模式必填，写 state.json 与 qr.png）；"
-                         "不填则 qr 默认 $DSH_HOME/douyin-duty/login")
+                    help="登录临时目录（写 state.json 与 qr.png）；不填则两种模式都默认 "
+                         "$DSH_HOME/douyin-duty/login（douyin_login_poll 轮询读的就是这里，"
+                         "崩溃/超时/成功都会写它）")
     return ap
 
 
@@ -772,7 +773,12 @@ def main(argv=None):
     args.out = os.path.expanduser(args.out)
     mode = args.mode or "window"
     state_dir = args.state_dir
-    if mode == "qr" and not state_dir:
+    if not state_dir:
+        # window 模式也必须有 state_dir：以前不传时 write_state 直接 return，一切 error/expired
+        # 都写不出去——脚本启动即崩时，host 预写的 phase=waiting 永远盖不掉，douyin_login_poll
+        # 只能一直报「窗口已打开」，实际脚本可能早就崩了。default_state_dir()
+        # （$DSH_HOME/douyin-duty/login）正是 host 轮询读的目录，把 qr 的老兜底照搬给 window；
+        # 显式传了 --state-dir 时仍以它为准。
         state_dir = default_state_dir()
     if state_dir:
         state_dir = os.path.abspath(os.path.expanduser(state_dir))
@@ -799,4 +805,18 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _exit_code = main()
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        # 连 main 都没跑起来（比如 argparse 之前就崩）也要把 error 落盘——「所有异常都落成
+        # state.json 的 error 原因，不裸 traceback」是本脚本 docstring 里的承诺。
+        # best-effort：写不出去就只留一行日志，不再让异常往外冒。
+        _exit_code = 2
+        log("[失败] 脚本顶层崩溃: " + _brief(exc, 300))
+        try:
+            write_state(default_state_dir(), "error", "脚本顶层崩溃: " + _brief(exc, 300))
+        except Exception:
+            pass
+    sys.exit(_exit_code)

@@ -1264,12 +1264,15 @@ else {
       ok('脚本回报 truncated=true / textLength=30000 → 原样透出（argv 带 --max-chars 1000；插件层不二次截断，text 1000 字未动、segments 2 段完整）')
     } else problem('截断透传那条不对：' + JSON.stringify({ argv: truncArgv, len: truncRes && String(truncRes.text || '').length, truncated: truncRes && truncRes.truncated, textLength: truncRes && truncRes.textLength }))
 
-    // 脚本没回报那两个字段时兜底：truncated=false、textLength=text.length（不炸，也不假装截过）
+    // 脚本没回报那两个字段时标「未知」：truncated=null / textLength=null + truncateNote 说明。
+    // 旧契约这里是 false / text.length —— 那等于「假装没截断、并把握手时的长度当原长」，是撒谎。
+    // 绝不能为了让这条断言变绿而把实现改回去。
     fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, url: FETCH_URL, title: 't', source: 'subtitle', text: '一二三', segments: [], elapsed: 1 }) }
     const fbRes = await callTool('douyin_fetch', { url: FETCH_URL })
-    if (fbRes && fbRes.ok === true && fbRes.truncated === false && fbRes.textLength === 3) {
-      ok('脚本没回报 truncated / textLength 时兜底成 false / text.length（3）')
-    } else problem('兜底那条不对：' + JSON.stringify(fbRes))
+    if (fbRes && fbRes.ok === true && fbRes.truncated === null && fbRes.textLength === null
+      && typeof fbRes.truncateNote === 'string' && /未知/.test(fbRes.truncateNote)) {
+      ok('脚本没回报 truncated / textLength 时标为未知（null / null + truncateNote 说明），不假装没截断')
+    } else problem('兜底那条不对（应为未知而非 false）：' + JSON.stringify(fbRes))
 
     // maxChars 越界：拒绝，不夹取、也不去跑脚本
     const beforeBadMc = fetchCalls.length
