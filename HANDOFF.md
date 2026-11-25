@@ -1,18 +1,24 @@
 # HANDOFF —— dsh-douyin · 下一轮接手唯一入口
 
 > 2026-11-05 更新（1.5.0 轮收尾）。新会话只读这一份即可接手；本文件取代 2026-11-04 版，旧结论（「通知接口未打通」「默认 /messages」）一律作废。
-> 深读顺序：`_diag/notes-probe/notice-schema.md`（通知接口权威结构）→ `_diag/reviews/silent-failures-verify.md`（复核判定）→ `_diag/INTERRUPT-STATE.md`（中断现场/残局记录）。
+> 深读顺序：**`docs/notice-api.md`**（通知接口权威结构，已从被 ignore 的 `_diag/` 挪进版本库）→ `_diag/reviews/silent-failures-verify.md`（复核判定，本地残留）→ `_diag/INTERRUPT-STATE.md`（中断现场/残局记录，本地残留）。
+
+## 0. 2026-11-25 复检（工作区曾被清空后的恢复记录）
+
+- 本地仓库与插件曾随工作区清空一起消失。恢复路径：从 **gitcode**（GitHub 当时不可达）克隆 → `dsh plugin --profile desktop add 'file:D:/大肥鱼/工作区/dsh-douyin'` → 安装副本里 `node selfcheck.mjs`（EXIT=0、17 工具）。
+- ⚠️ 半途踩过的坑：**直接把目录拷进 profile 的 node_modules 不够** —— 那只建了普通目录，没进 `node_modules/.modules.yaml`，DSH 加载器不认，工具不会出现；必须走 pnpm（`dsh plugin ... add`）注册。对照证据：能加载的 `dsh-cookie-guard` 是 pnpm junction 且在 .modules.yaml 里。
+- `_diag/notes-probe/notice-schema.md` 原版在原清空中丢失（根因：`_diag/` 被 `.gitignore` 忽略）。已按代码实测注释**重建**并挪到被跟踪的 `docs/notice-api.md`（标题标明「重建版」，冲突以代码为准）。
 
 ## 1. 现状表
 
 | 项 | 值 | 来源 |
 | --- | --- | --- |
-| 版本 | package.json = 1.4.0，**本轮待升 1.5.0、未升** | package.json:3 |
+| 版本 | **1.5.0**（已提交 `83f64a2`） | package.json:3 |
 | 工具数 | **17**；本轮实跑 `node selfcheck.mjs` EXIT=0、「✓ 预检通过：17 个工具」 | selfcheck 实测 |
 | 双远端 | `origin`=github.com:queyuan072/dsh-douyin-audio；`gitcode`=**gitcode.com** 同名仓库（旧档写「AtomGit」与 remote URL 不符，以 URL 为准） | git remote -v |
 | npm | 停在 **1.2.3**（沿用旧档，本轮未联网复核） | 旧 HANDOFF §1 |
-| tag | v1.2.0 ~ v1.4.0 已打；**v1.5.0 未打** | git tag -l |
-| 工作树 | **12 文件未提交**（含 selfcheck.mjs；12 files changed, 961 insertions(+), 286 deletions(-)）——本轮成果全在工作树，HEAD=e696b15，先走 §4 发布流程 | git status / diff --stat |
+| tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
+| 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
 ## 2. 本轮成果
 
@@ -20,7 +26,7 @@
 
 - `douyin_notes` 弃「抓不存在的通知页」旧路线，改**纯 HTTP 直连** `GET /aweme/v1/web/notice/?…&notice_group=<GROUP>`，不开浏览器。三要点：参数名是 **`notice_group` 不是 `notice_type`**（用错恒空）；**完全不需要 a_bogus / msToken 等任何签名**；数据在 **`notice_list_v2`**（`notice_list` 恒为空数组）。
 - 落点：`scripts/douyin_read.py` 的 `cmd_notes` + `_notice_api_fetch`（douyin_read.py:1888-1905：分组遍历 + `nid` 去重、v2 空才退 v1、错误码 0/5/8 分明）；工具描述见 index.js:2191（未支持的类型只带类型号、不猜字段）。
-- **权威结构说明 = `_diag/notes-probe/notice-schema.md`**（请求药方、type 31/33 字段路径、已验证/未验证清单、抓包样本位置）。别把药方抄进会随代码漂移的文件，一切以它为准。
+- **权威结构说明 = `docs/notice-api.md`**（请求药方、type 31/33 字段路径、已验证/未验证清单）。原放在 `_diag/` 被 gitignore 掉、随工作区清空丢失，2026-11-25 已按代码重建并挪进版本库；与代码冲突时以 `scripts/douyin_read.py` 为准。
 - 运营注意：`/notice/count/` 的非零分组号是**动态的**（同账号两次采样都可能不同），必须现取：count>0 的 group + 960/700/401/2 兜底（notice-schema.md §2）。
 - 样本来源：宿主浏览器打开通知弹层抓包——沙箱内拿不到（原因见 §3）。
 
