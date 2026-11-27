@@ -1851,6 +1851,67 @@ def _hot_api_items(args):
     log("hot: 接口直取成功（{} 条，未开浏览器）".format(len(items)))
     return items
 
+# 搜索接口（实测 2026-11-27：status_code=0、10 条、连续三次稳定，**免签名**）
+# 关键在参数：search_source=normal_search / query_correct_type=1 / is_filter_search=0 / need_filter_settings=1
+# —— 少这几个参数时接口返回 status_code=0 但 data 为空（当初误判成“需要签名”）
+SEARCH_API_PATH = "/aweme/v1/web/general/search/single/"
+SEARCH_API_QS = (AWEME_API_QS + "&search_channel=aweme_general&search_source=normal_search"
+                 "&query_correct_type=1&is_filter_search=0&need_filter_settings=1")
+
+
+def _search_api_items(args):
+    """搜索走纯 HTTP 接口（免签名）。任何一类失败返回 None，调用方回落浏览器。"""
+    keyword = (args.keyword or "").strip()
+    if not keyword:
+        raise StepError("search", "关键词为空")
+    sort_type = SEARCH_ORDER.get(args.order, "0")
+    count = max(1, min(int(args.limit or 20), 20))
+    url = "{}{}?keyword={}&sort_type={}&offset=0&count={}&{}".format(
+        DOUYIN_HOST, SEARCH_API_PATH, urllib.parse.quote(keyword), sort_type, count, SEARCH_API_QS)
+    out = _notice_http_get(args, url)
+    if out["cls"] != "ok":
+        log("search: 接口取数失败（{}），回落浏览器".format(out.get("error") or out["cls"]))
+        return None
+    data = out["data"]
+    try:
+        sc = int(data.get("status_code") or 0)
+    except (TypeError, ValueError):
+        log("search: 接口缺 status_code，回落浏览器")
+        return None
+    if sc != 0:
+        log("search: 接口 status_code={}，回落浏览器".format(sc))
+        return None
+    rows = data.get("data")
+    if not isinstance(rows, list) or not rows:
+        log("search: 接口返回空列表，回落浏览器")
+        return None
+    items = []
+    for row in rows:
+        info = (row or {}).get("aweme_info") or {}
+        if not info.get("aweme_id"):
+            continue
+        stats = info.get("statistics") or {}
+        author = info.get("author") or {}
+        try:
+            raw_ms = info.get("duration") or ((info.get("video") or {}).get("duration"))
+            secs = int(raw_ms) // 1000
+            dur = "{:02d}:{:02d}".format(secs // 60, secs % 60)
+        except (TypeError, ValueError):
+            dur = ""
+        items.append({
+            "title": _clean(info.get("desc"), 160),
+            "author": _clean(author.get("nickname"), 60),
+            "like": parse_count(stats.get("digg_count")),
+            "url": "{}/video/{}".format(DOUYIN_HOST, info.get("aweme_id")),
+            "duration": dur,
+        })
+    if not items:
+        log("search: 接口条目都缺 aweme_id，回落浏览器")
+        return None
+    args.browser_used = "http"
+    log("search: 接口直取成功（{} 条，未开浏览器）".format(len(items)))
+    return items[:count]
+
 def cmd_video(page, args):
     url = _video_url(args.url)
     _goto(page, url, args, "video")  # 被验证页挡住时抛 StepError，不做任何绕过
@@ -2653,6 +2714,10 @@ def run(args):
         return cmd_notes(None, args)
     if args.command == "messages":
         _require_login(args, "messages")  # 先查登录态，别白起一个浏览器
+    if args.command == "search":
+        items = _search_api_items(args)
+        if items is not None:
+            return items
     if args.command == "hot":
         items = _hot_api_items(args)
         if items is not None:
