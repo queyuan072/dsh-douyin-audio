@@ -41,6 +41,8 @@ export const Config = !z ? undefined : z.object({
   loginMode: z.string().default('window').extra('volatile', true),
   readHeadless: z.boolean().default(true).extra('volatile', true),
   verifyWait: z.number().default(0).extra('volatile', true),
+  // 撞验证码时的兜底：hint = 只提示可调配置（默认，行为与历史一致）/ browser = 报错里额外给出可交给 DSH 自带浏览器的链接
+  captchaFallback: z.string().default('hint').extra('volatile', true),
   // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
   browserChannel: z.string().default('msedge').extra('volatile', true),
   // 手动添加的浏览器：JSON 数组字符串 [{"id","label","path"}]（用字符串存，避开旧宿主的数组类型兼容问题）
@@ -59,6 +61,7 @@ export const Config = !z ? undefined : z.object({
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
 const EXTRA_DEFAULTS = {
   asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
+  captchaFallback: 'hint',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
@@ -1600,7 +1603,7 @@ export function apply(ctx, config = {}) {
   const merged = () => {
     const base = cfgAll()
     const over = {}
-    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait',
+    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback',
       'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
@@ -1925,7 +1928,7 @@ export function apply(ctx, config = {}) {
   const READ_ORDERS = ['totalrank', 'click', 'pubdate']
   const READ_TIMEOUT = { hot: 120, search: 150, video: 150, comments: 180, notes: 150, messages: 180, selftest: 300 }
   /** 只读工具的公共补充说明：撞验证码时怎么自救（配置写在 lib/state.mjs + EXTRA_DEFAULTS 那一层） */
-  const HINT = '可用配置 readHeadless/verifyWait 切到可见窗口并在人工过验证后继续。'
+  const HINT = '可用配置 readHeadless/verifyWait 切到可见窗口并在人工过验证后继续；把 captchaFallback 设为 browser 时，报错里会额外给出可交给 DSH 自带浏览器（browser 工具）的链接。'
 
   /** limit：不给就取默认；给了就必须是 1-50 的整数（越界直接报错，不夹取） */
   const checkLimit = (v, dflt) => {
@@ -1974,7 +1977,22 @@ export function apply(ctx, config = {}) {
     if (!parsed) {
       return { ok: false, exitCode: r.code, reason: '脚本输出不是 JSON（子命令 ' + sub + ' 那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
     }
-    if (parsed.ok === false) return { ...parsed, exitCode: r.code }
+    if (parsed.ok === false) {
+      const res = { ...parsed, exitCode: r.code }
+      // 验证码兜底（配置项 captchaFallback）：只加指引，绝不伪造数据
+      const captcha = /验证码|人机验证|captcha|中间页/i.test(String(parsed.error || parsed.reason || ''))
+      if (captcha && String(cfg.captchaFallback || 'hint') === 'browser') {
+        const u = extra.indexOf('--url')
+        const target = u >= 0 ? String(extra[u + 1] || '') : ''
+        res.fallback = {
+          mode: 'browser',
+          reason: 'captcha',
+          hint: '抖音把插件的浏览器链路拦成验证码中间页：改用 DSH 自带浏览器（browser 工具）打开该链接即可读到内容；接口类命令（video/note/hot/notes）不受影响。',
+          url: target,
+        }
+      }
+      return res
+    }
     if (!r.ok) return { ok: false, exitCode: r.code, reason: '脚本退出码非 0，输出可能不完整', items: parsed.items || [], output: tail(r.stderr, 8) }
     return { ...parsed, ok: true, exitCode: r.code }
   }
@@ -2694,7 +2712,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

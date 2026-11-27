@@ -33,6 +33,7 @@
 - **热榜同样接口化（同轮）**：`/aweme/v1/web/hot/search/list/` 实测 `status_code=0` + 51 条 `word_list`，**免签名**；`cmd_hot` 改为接口优先（`_hot_api_items`），名次用 `position`、置顶条目无 position 时按序号回退并去重，热度 `hot_value` 格式化成亿/万。真机：`douyin_hot` 0.4s、`browser: http`、名次 1..5。
 - **搜索探过了、没走通**：`/aweme/v1/web/general/search/single/` 与 `/aweme/v1/web/search/item/` 都返回 `status_code=0` 但 **`items/aweme_list` 为空** —— 说明仍需 a_bogus 类签名，故 `search` 保持浏览器路径。
 - ⚠️ **仍走浏览器、仍可能被验证码拦**：`search` / `comments` / `messages`（这三个还没接口化；comments 与 search 同族，通常也要签名）。
+- **撞验证码时的兜底改成了配置项 `captchaFallback`（1.5.2）**：`hint`（默认，行为与历史完全一致，只提示 readHeadless/verifyWait）/ `browser`（报错里额外带 `fallback: {mode, reason:'captcha', hint, url}`，可直接把 URL 交给 DSH 自带 `browser` 工具）。改法同 `readHeadless`/`verifyWait`：`douyin_config({action:'set', key:'captchaFallback', value:'browser'})`。`client.js` 里本就没有这两个键的界面，故本项同样只作配置项（既有约定，不新增 UI）。改的是 `index.js` → **需重启 DSH 生效**。
 ## 2. 本轮成果
 
 ### 2.1 通知接口已打通（本轮最大成果）
