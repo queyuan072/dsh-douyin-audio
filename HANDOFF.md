@@ -21,6 +21,15 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.6.0 第 18 个工具 `douyin_frames`（抽帧，给人/模型“看画面”）
+
+- 由来：`douyin_video` 只有元数据、`douyin_fetch` 只有音频转写，**画面内容一直只能靠宿主浏览器截图 + 人工看图**。
+- 实现：`scripts/douyin_fetch.py` 新增抽帧模式（`--frames N` / `--frames-dir DIR`，与字幕/ASR 互斥、优先级最高）：
+  yt-dlp 取视频本体（`-f bv*+ba/b`）→ 失败走既有浏览器兜底 → ffmpeg 按 `(i+0.5)/N * duration` 均匀抽帧 → 返回 `frames:[{index,at,path,bytes}]`。
+- 宿主：`douyin_frames`（① 只读档，走同一支脚本），参数 `url` / `count`(1-20, 默认 4) / `framesDir`；`readHeadless=false` 时自动带 `--window-offscreen`。
+- ⚠️ **工具数变成 18**：`selfcheck.mjs` 的 `EXPECTED_TOOLS`、`READ_TOOLS`、README 各处计数已同步（实测 `✓ 预检通过：18 个工具`）。
+- 真机实测：6.25s 视频抽 3 帧 → `at` 1.04 / 3.12 / 5.21，7.15s 完成（含下载），帧图 1024x576 清晰可用。
+
 ## 1.5.5 搜索也接口化（当初“需要签名”的判断是错的）
 
 - **真相**：`/aweme/v1/web/general/search/single/` **免签名**可用；之前返回 `status_code=0` 但 `data` 为空，是因为**少了四个参数**，不是缺 a_bogus：

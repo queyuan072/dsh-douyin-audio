@@ -703,6 +703,116 @@ def truncate_text(text: str, limit: int | None) -> tuple[str, int, bool]:
     return text[:limit], total, True
 
 
+def _media_duration(ffmpeg: str, media: str) -> float:
+    """从 ffmpeg -i 的 stderr 里读 Duration；取不到就返回 0（调用方按固定间隔兜底）。"""
+    try:
+        cp = subprocess.run([ffmpeg, "-hide_banner", "-i", media],
+                            capture_output=True, timeout=60)
+        text = (cp.stderr or b"").decode("utf-8", "replace")
+    except Exception:
+        return 0.0
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if not m:
+        return 0.0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+def download_video_media(yt_dlp: str, url: str, work_dir: str, cookies: str | None,
+                         timeout: int = 300) -> str:
+    """取视频本体（含画面）：bv*+ba / b。失败抛 FetchError。"""
+    out = os.path.join(work_dir, "media_{}.%(ext)s".format(os.getpid()))
+    cookie_arg, cookie_copy = _cookie_copy(cookies, work_dir)
+    cmd = [yt_dlp, "--no-playlist", "--no-warnings", "--retries", "1",
+           "--user-agent", td.DEFAULT_UA, "-f", "bv*+ba/b", "-o", out] + cookie_arg + [url]
+    try:
+        cp = _run(cmd, timeout, "下载视频")
+    finally:
+        if cookie_copy:
+            with contextlib.suppress(OSError):
+                os.remove(cookie_copy)
+    if cp.returncode != 0:
+        raise _ytdlp_fail("下载视频", cp)
+    prefix = os.path.basename(out).split("%(ext)s")[0]
+    for name in sorted(os.listdir(work_dir)):
+        if name.startswith(prefix):
+            return os.path.join(work_dir, name)
+    raise FetchError("下载视频", "yt-dlp 没有产出视频文件")
+
+
+def extract_frames(ffmpeg: str, media: str, count: int, out_dir: str,
+                   duration: float) -> list[dict]:
+    """按时间均匀抽 count 帧（jpg）。时长未知时按 2 秒间隔退让，取不到的帧如实跳过。"""
+    os.makedirs(out_dir, exist_ok=True)
+    frames: list[dict] = []
+    for i in range(count):
+        at = ((i + 0.5) / count) * duration if duration > 0 else i * 2.0
+        path = os.path.join(out_dir, "frame_{:02d}.jpg".format(i + 1))
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-ss", "{:.3f}".format(at), "-i", media, "-frames:v", "1",
+               "-q:v", "2", path]
+        try:
+            cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        except Exception as exc:
+            td.eprint("[抽帧] 第 {} 帧失败（{}）".format(i + 1, td.one_line(exc, 120)))
+            continue
+        if cp.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            frames.append({"index": i + 1, "at": round(at, 2), "path": path,
+                            "bytes": os.path.getsize(path)})
+        else:
+            td.eprint("[抽帧] 第 {} 帧为空或失败（exit={}）".format(i + 1, cp.returncode))
+    return frames
+
+
+def run_frames(args, started: float) -> int:
+    """抽帧模式（--frames N）：下载视频本体 → ffmpeg 均匀抽帧 → 输出 JSON。
+    与字幕/ASR 互斥、优先级最高；yt-dlp 拿不到时复用同一套浏览器兜底。"""
+    result: dict = {"ok": False, "url": args.url or "", "title": "", "author": "",
+                    "source": "frames", "frames": [], "duration": 0, "reason": ""}
+
+    def emit(code: int, **kw) -> int:
+        result.update(kw)
+        result["elapsed"] = round(time.time() - started, 2)
+        print(json.dumps(result, ensure_ascii=False))
+        return code
+
+    count = max(1, min(int(args.frames), 20))
+    ffmpeg = td.resolve_tool(args.ffmpeg, "ffmpeg")
+    if not ffmpeg:
+        return emit(2, reason="找不到 ffmpeg（PATH 与 ~/.dsh/bin 都没有）")
+    try:
+        url = normalize_url(args.url or "")
+        final_url, _host = resolve_short_url(url)
+    except FetchError as exc:
+        return emit(2, reason=exc.reason())
+    work_dir = tempfile.mkdtemp(prefix="douyin-frames-")
+    media = ""
+    yt_dlp = td.resolve_tool(args.yt_dlp, "yt-dlp")
+    if yt_dlp:
+        try:
+            media = download_video_media(yt_dlp, final_url, work_dir, args.cookies, args.timeout)
+            td.eprint("[视频] yt-dlp 已下载 {}".format(os.path.basename(media)))
+        except FetchError as exc:
+            td.eprint("[警告] {}".format(exc.reason()))
+    if not media and not args.no_browser and is_douyin_page_url(final_url):
+        td.eprint("[视频] 走浏览器兜底拿直链")
+        try:
+            media, _media_url, meta = resolve_media_by_browser(
+                final_url, args.cookies, not args.window_offscreen, args.window_offscreen,
+                args.browser_channel, args.browser_wait, args.timeout, work_dir, ffmpeg)
+            result.update({k: v for k, v in (meta or {}).items() if v})
+        except FetchError as exc:
+            return emit(2, reason=exc.reason())
+    if not media:
+        return emit(2, reason="拿不到视频本体（yt-dlp 与浏览器兜底都失败）")
+    duration = _media_duration(ffmpeg, media)
+    out_dir = args.frames_dir or os.path.join(os.path.dirname(media), "frames")
+    frames = extract_frames(ffmpeg, media, count, out_dir, duration)
+    if not frames:
+        return emit(2, reason="ffmpeg 抽帧全部失败")
+    td.eprint("[抽帧] 成功 {} / {} 帧 -> {}".format(len(frames), count, out_dir))
+    return emit(0, ok=True, duration=round(duration, 2), mediaPath=media,
+                framesDir=out_dir, frames=frames)
+
 def run(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="douyin_fetch.py",
@@ -765,12 +875,18 @@ def run(argv: list[str] | None = None) -> int:
                     help="yt-dlp 路径（默认自动探测 PATH 与 ~/.dsh/bin）")
     ap.add_argument("--timeout", dest="timeout", type=int, default=300, metavar="SEC",
                     help="单步外部命令超时（秒，默认 300）")
+    ap.add_argument("--frames", dest="frames", type=int, default=0, metavar="N",
+                    help="抽帧模式：下载视频本体后按时间均匀抽 N 帧（1-20）存盘并返回路径；与字幕/ASR 互斥")
+    ap.add_argument("--frames-dir", dest="frames_dir", default=None, metavar="DIR",
+                    help="抽帧输出目录（默认 <下载目录>/frames）")
     ap.add_argument("--keep-temp", dest="keep_temp", action="store_true",
                     help="保留临时目录（排查字幕/音频落盘位置时用）")
     ap.add_argument("--version", action="version", version=f"douyin_fetch.py {VERSION}")
     args = ap.parse_args(argv)
 
     started = time.time()
+    if getattr(args, "frames", 0) > 0:
+        return run_frames(args, started)
     result: dict = {"ok": False, "url": args.url or args.file or "", "title": "",
                     "source": "none", "text": "", "textLength": 0, "truncated": False,
                     "segments": [], "elapsed": 0.0}

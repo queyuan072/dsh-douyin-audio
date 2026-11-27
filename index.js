@@ -3,6 +3,7 @@
  * 工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  * 只读查询：douyin_hot / douyin_search / douyin_video / douyin_comments（都走 scripts/douyin_read.py）
  * 给定链接精准提取（① 只读）：douyin_fetch —— 字幕优先、无字幕退回本地 ASR，走 scripts/douyin_fetch.py
+ * 抽帧（① 只读）：douyin_frames —— 下载视频本体后 ffmpeg 均匀抽帧，返回图片路径，用于“看画面”
  * 通知（② 通知级闸门）：douyin_notes / douyin_messages —— 同样只读，只读页面不发消息、不标已读
  * 轻互动（③A 轻互动级闸门，默认关）：douyin_react —— 点赞 / 取消赞 / 收藏 / 取消收藏，走 scripts/douyin_action.py
  * 装入配置环境（基础能力，不设等级闸门）：douyin_setup —— mode=auto 扫描→复用或装 venv，装完写 pythonPath
@@ -2202,6 +2203,59 @@ export function apply(ctx, config = {}) {
     },
   })
 
+  // ── 4f. 抽帧（只读）：下载视频本体 → ffmpeg 均匀抽帧，返回图片路径 ────────────
+  // 与 douyin_fetch 共用同一支脚本（--frames 模式），区别只是参数与返回结构。
+  const FRAMES_TIMEOUT_SEC = 420
+
+  /** 调一次 douyin_fetch.py 的抽帧模式：解析约定与 runFetch 一致（脚本的 ok:false 原样带回，绝不抛） */
+  async function runFrames({ url, count, framesDir }) {
+    if (!existsSync(fetchDeps.script)) return { ok: false, reason: '抓取脚本不存在: ' + fetchDeps.script }
+    const cfg = merged()
+    const python = await fetchDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
+    if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
+    const argv = ['--url', url, '--json', '--frames', String(count)]
+    if (framesDir) argv.push('--frames-dir', framesDir)
+    // readHeadless=false 时让浏览器兜底走可见窗口（移到屏幕外）：实测能过风控，又不打扰桌面
+    if (cfg.readHeadless === false) argv.push('--window-offscreen')
+    const r = await fetchDeps.run(python, fetchDeps.script, argv, { timeoutSec: FRAMES_TIMEOUT_SEC, log })
+    const out = String(r.stdout || '')
+    log('frames 结束 code=' + r.code + '（预算 ' + FRAMES_TIMEOUT_SEC + 's）')
+    let parsed = null
+    const start = out.indexOf('{')
+    if (start >= 0) { try { parsed = JSON.parse(out.slice(start)) } catch { /* 下面按「不是 JSON」报 */ } }
+    if (!parsed) {
+      return { ok: false, exitCode: r.code, reason: '脚本输出不是 JSON（抽帧模式那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
+    }
+    if (parsed.ok === false) {
+      return { ...parsed, ok: false, reason: parsed.reason || '抽帧失败（脚本 ok=false）',
+        exitCode: r.code, output: tail(out, 10) || tail(r.stderr, 8) }
+    }
+    if (!r.ok) {
+      return { ...parsed, ok: false, exitCode: r.code, reason: '脚本退出码非 0，结果可能不完整', output: tail(r.stderr, 8) }
+    }
+    return { ...parsed, ok: true, count, exitCode: r.code }
+  }
+
+  tool({
+    name: 'douyin_frames',
+    description: '按链接抽帧（只读）：下载视频本体后用 ffmpeg 按时间均匀抽 N 帧存到本地，返回每帧的绝对路径与时间点（{index,at,path,bytes}）。用于“看画面”——不做转写、不点赞、不评论。图文页没有连续画面，会报“拿不到视频本体”。',
+    parameters: {
+      url: { type: 'string', description: '视频页链接或短链，如 https://www.douyin.com/video/<id>' },
+      count: { type: 'number', description: '抽几帧，1-20，默认 4' },
+      framesDir: { type: 'string', description: '可选：输出目录（默认下载目录下的 frames/）' },
+    },
+    async execute(args) {
+      const deny = requireTier('douyin_frames', 'read')
+      if (deny) return deny
+      const u = checkUrl(args.url)
+      if (u.error) return { ok: false, reason: u.error }
+      const n = args.count === undefined ? 4 : Number(args.count)
+      if (!Number.isInteger(n) || n < 1 || n > 20) return { ok: false, reason: 'count 需是 1-20 的整数，收到 ' + JSON.stringify(args.count) }
+      let dir = null
+      if (args.framesDir !== undefined && args.framesDir !== null && String(args.framesDir).trim() !== '') dir = resolve(String(args.framesDir).trim())
+      return runFrames({ url: u.value, count: n, framesDir: dir })
+    },
+  })
   // ── 4e. 通知摘要（② 通知，只读）─────────────────────────────
   // 与只读那几件同一套信封；区别只在闸门档位（notify）与页面（登录后才有的通知页）。
   tool({

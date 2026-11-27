@@ -4,7 +4,7 @@
  * 那类错误提前在本地暴露出来（宿主只会留一句 warning，日志里看不出根因）。
  *
  * 查什么：
- *   a. 恰好注册 17 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
+ *   a. 恰好注册 18 个工具：douyin_scroll / douyin_transcribe / douyin_status / douyin_config
  *      + douyin_hot / douyin_search / douyin_video / douyin_comments / douyin_note（只读查询）
  *      + douyin_fetch（给定链接精准提取，① 只读：字幕优先、无字幕退回本地 ASR）
  *      + douyin_notes / douyin_messages（② 通知，只读）
@@ -61,7 +61,7 @@ import { pathToFileURL } from 'node:url'
 const EXPECTED_TOOLS = [
   'douyin_scroll', 'douyin_transcribe', 'douyin_status', 'douyin_config',
   'douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note',
-  'douyin_fetch',
+  'douyin_fetch', 'douyin_frames',
   'douyin_notes', 'douyin_messages',
   'douyin_react',
   'douyin_login_start', 'douyin_login_poll',
@@ -210,7 +210,7 @@ for (const t of registered) {
 }
 
 /* ───────── ⑤ 能力等级闸门（tierRead 默认开；③④ 打开时 ① 视为生效） ───────── */
-const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note', 'douyin_fetch']
+const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note', 'douyin_fetch', 'douyin_frames']
 const NOTIFY_TOOLS = ['douyin_notes', 'douyin_messages']
 const byName = new Map(registered.map((t) => [t && t.name, t]))
 /** 直接写沙箱里的 config.json（$DSH_HOME 已指到临时目录，不碰真家目录） */
