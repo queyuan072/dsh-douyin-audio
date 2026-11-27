@@ -21,6 +21,13 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.8.0 视觉模型可选，默认 `agent`（= 我自己看，不调外部模型）
+
+- 设置页「能力等级」下面多一行三选一：**我自己看（默认）/ 千问 omni-flash / 智谱 glm-4.5v**，写 `visionModel`。
+- `visionModel=agent`（默认）：`douyin_vision` 只抽帧返回本地路径，**不调用任何外部模型、不上传图片**，由调用方（agent/人）自己看图；返回里带 `describeSkipped:true` 与 `visionNote`。
+- 切到 qwen/智谱后仍受 ⑤ 视觉档 + `describe=true` 双重前置：三处都满足才会把帧发到云端。
+- 依据：本机 key 文件只有千问/智谱两家；DSH 自己的 `deepseek-account` 是宿主托管的会话账号，插件拿不到它的 key，所以「用你」在实现上 = 「不调用外部模型，由当前 agent 读图」。
+
 ## 1.7.1 视觉能力加了一档闸门 `tierVision`（默认关）
 
 - 位置：设置页「能力等级」第 ⑤ 档「视觉（抽帧上传）」，与 ① 只读 / ② 通知 / ③A / ③B / ④ 并列。

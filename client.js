@@ -220,7 +220,12 @@ window.__ModuleLoader__.load({
     }
 
     /* 四个能力的定义（顺序 = 等级顺序；needRead = 依赖 ① 只读） */
-    const TIERS = [
+    const VISION_MODELS = [
+  { key: 'agent', title: '我自己看（默认）', note: '不调用任何外部模型、不上传图片，只返回本地帧路径' },
+  { key: 'qwen3.8-omni-flash', title: '千问 omni-flash', note: 'DashScope 多模态（实测可用）；会把帧图片上传到云端' },
+  { key: 'glm-4.5v', title: '智谱 glm-4.5v', note: '智谱多模态；会把帧图片上传到云端' },
+]
+const TIERS = [
       { key: 'tierRead', title: '① 只读', note: '看热榜、搜视频、读视频详情和评论列表 —— 只读不写，不动你账号里的任何东西' },
       { key: 'tierNotify', title: '② 通知', note: '读私信、拉通知摘要 —— 风险：能看到你账号收到的私信内容' },
       { key: 'tierReact', title: '③A 轻互动（点赞收藏）', note: '点赞、收藏、取消 —— 风险：会动你账号的互动记录，但可撤回', needRead: true },
@@ -1268,8 +1273,18 @@ window.__ModuleLoader__.load({
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
+          /* 视觉模型选择：只在 ⑤ 视觉 + describe=true 时才会真的调用 */
+          h('div', { 'data-dy-row': '', key: 'vision-models' },
+            ...VISION_MODELS.map((m) => h('button', {
+              key: m.key,
+              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === m.key ? '' : undefined,
+              disabled: busy === 'visionModel',
+              title: m.note,
+              onClick: () => { if ((cfg.visionModel || 'agent') !== m.key) patch('visionModel', m.key, '视觉模型') },
+            }, m.title))),
           h('div', { 'data-dy-note': '' },
-            '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
+            '视觉模型默认「我自己看」= 不调用外部模型、不上传图片；切到千问/智谱后，只有 ⑤ 视觉开启且 douyin_vision 传 describe=true 才会把帧发出去。'
+            + '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
         h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),
@@ -1855,6 +1870,15 @@ window.__ModuleLoader__.load({
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
+          /* 视觉模型选择：只在 ⑤ 视觉 + describe=true 时才会真的调用 */
+          h('div', { 'data-dy-row': '', key: 'vision-models' },
+            ...VISION_MODELS.map((m) => h('button', {
+              key: m.key,
+              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === m.key ? '' : undefined,
+              disabled: busy === 'visionModel',
+              title: m.note,
+              onClick: () => { if ((cfg.visionModel || 'agent') !== m.key) patch('visionModel', m.key, '视觉模型') },
+            }, m.title))),
           h('div', { 'data-dy-note': '' },
             '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这五个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),

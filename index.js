@@ -45,7 +45,7 @@ export const Config = !z ? undefined : z.object({
   // 撞验证码时的兜底：hint = 只提示可调配置（默认，行为与历史一致）/ browser = 报错里额外给出可交给 DSH 自带浏览器的链接
   captchaFallback: z.string().default('hint').extra('volatile', true),
   // 视觉描述（douyin_vision 的 describe=true 才用）：模型 id 与 key 文件
-  visionModel: z.string().default('qwen3.8-omni-flash').extra('volatile', true),
+  visionModel: z.string().default('agent').extra('volatile', true),
   visionKeyFile: z.string().default('').extra('volatile', true),
   // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
   browserChannel: z.string().default('msedge').extra('volatile', true),
@@ -65,7 +65,7 @@ export const Config = !z ? undefined : z.object({
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
 const EXTRA_DEFAULTS = {
   asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
-  captchaFallback: 'hint', visionModel: 'qwen3.8-omni-flash', visionKeyFile: '',
+  captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
@@ -2305,7 +2305,7 @@ export function apply(ctx, config = {}) {
       url: { type: 'string', description: '视频页链接或短链，如 https://www.douyin.com/video/<id>' },
       count: { type: 'number', description: '抽几帧，1-20，默认 4' },
       describe: { type: 'boolean', description: '是否调用视觉模型描述每帧，默认 false（不上传图片）' },
-      model: { type: 'string', description: '视觉模型 id，默认取配置 visionModel（默认 qwen3.8-omni-flash；qwen* 走 DashScope，其它按智谱）' },
+      model: { type: 'string', description: '视觉模型 id；默认取配置 visionModel（默认 agent = 不调用外部模型、只返回帧路径由调用方自己看；qwen* 走 DashScope、其它按智谱）' },
       prompt: { type: 'string', description: '可选：自定义描述提示词' },
       framesDir: { type: 'string', description: '可选：帧图片输出目录' },
     },
@@ -2319,9 +2319,16 @@ export function apply(ctx, config = {}) {
       const cfg = merged()
       const model = (args.model !== undefined && args.model !== null && String(args.model).trim() !== '')
         ? String(args.model).trim()
-        : (typeof cfg.visionModel === 'string' && cfg.visionModel.trim() ? cfg.visionModel.trim() : 'qwen3.8-omni-flash')
+        : (typeof cfg.visionModel === 'string' && cfg.visionModel.trim() ? cfg.visionModel.trim() : 'agent')
       let dir = null
       if (args.framesDir !== undefined && args.framesDir !== null && String(args.framesDir).trim() !== '') dir = resolve(String(args.framesDir).trim())
+      // visionModel=agent：不调用任何外部模型，只抽帧返回本地路径，由调用方自己看图
+      if (model === 'agent') {
+        const r = await runFrames({ url: u.value, count: n, framesDir: dir })
+        if (r && r.ok) return { ...r, visionModel: 'agent', describeSkipped: true,
+          visionNote: 'visionModel=agent：未调用任何外部模型、未上传图片；帧图片在 frames[].path，调用方自己看即可。' }
+        return r
+      }
       return runVision({ url: u.value, count: n, describe: !!args.describe, model, prompt: args.prompt, framesDir: dir })
     },
   })

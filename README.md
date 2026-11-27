@@ -282,6 +282,8 @@ venv 建在**插件的安装目录里**，所以：
 | `tierReact` | boolean | `false` | **③A 轻互动**：解锁 `douyin_react`——点赞 / 取消赞 / 收藏 / 取消收藏（见 1.6）。**默认关**；这一档**真的会写**：以你的账号点赞、收藏（可撤回，但会动你的互动记录）。关着时 `douyin_react` 返回 `TIER_DISABLED(tier=react)` |
 | `tierComment` | boolean | `false` | **③B 评论回复**：发评论 / 回复（预留；会以你的账号公开发言，发出后收不回） |
 | `tierPublish` | boolean | `false` | **④ 发布**：上传视频到抖音（预留；会向你的账号投稿） |
+| `visionModel` | string | `agent` | `douyin_vision` 用的视觉模型：`agent`（默认，**不调用外部模型、不上传图片**，只返回本地帧路径由调用方自己看）/ `qwen3.8-omni-flash`（DashScope）/ `glm-4.5v`（智谱）/ 自定义模型 id。只有 ⑤ 视觉开启且 `describe=true` 时才会真的调用 |
+| `visionKeyFile` | string | `""` | 视觉模型的 key 文件；空 = `~/.dsh/ai/key.txt`（按前缀挑：qwen 认 `sk-`，智谱反向） |
 | `tierVision` | boolean | `false` | **⑤ 视觉（抽帧上传）**：解锁 `douyin_vision`——抽帧后可把画面发给多模态模型描述。**默认关**，因为图片会离开本机上传到云端模型；只想要本地图片路径时用 `douyin_frames`（属 ① 只读，不上传）。关着时 `douyin_vision` 返回 `TIER_DISABLED(tier=vision)` |
 
 **能力等级（六个开关）**
