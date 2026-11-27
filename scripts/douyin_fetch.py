@@ -39,6 +39,7 @@ stdout 只输出一个 JSON 对象（进度一律走 stderr），字段：
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -703,6 +705,76 @@ def truncate_text(text: str, limit: int | None) -> tuple[str, int, bool]:
     return text[:limit], total, True
 
 
+# ── 视觉描述（可选，--describe）：把抽到的帧交给多模态模型描述 ─────────────────
+# 默认不发任何图片；只有调用方显式要求 describe 才会把帧上传到云端模型。
+VISION_DEFAULT_MODEL = "qwen3.8-omni-flash"
+VISION_DEFAULT_KEY_FILE = os.path.join(os.path.expanduser("~"), ".dsh", "ai", "key.txt")
+VISION_ENDPOINTS = {
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+}
+VISION_PROMPT = "用一到两句中文描述这张图的画面内容：谁、在哪、在做什么。只描述看到的，不猜测。"
+
+
+def _vision_provider(model: str) -> str:
+    """模型名 -> 提供方。qwen* 走 DashScope（key 以 sk- 开头），其余按智谱处理。"""
+    return "qwen" if model.strip().lower().startswith("qwen") else "zhipu"
+
+
+def _vision_key(model: str, key_file: str | None) -> str:
+    """从 key 文件里挑出与该模型匹配的那个 key（qwen 要 sk- 前缀，智谱反过来）。"""
+    path = key_file or VISION_DEFAULT_KEY_FILE
+    want_sk = _vision_provider(model) == "qwen"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            keys = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+    except OSError as exc:
+        raise FetchError("视觉描述", "读不到 key 文件 {}（{}）".format(path, td.one_line(exc, 120)))
+    for k in keys:
+        if len(k) >= 20 and k.startswith("sk-") == want_sk:
+            return k
+    raise FetchError("视觉描述", "{} 里没有适配 {} 的 key".format(path, model))
+
+
+def describe_image(key: str, model: str, image_path: str, prompt: str, timeout: int = 120) -> str:
+    """把一张图发给多模态模型，返回描述文本。失败抛 FetchError。"""
+    try:
+        with open(image_path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+    except OSError as exc:
+        raise FetchError("视觉描述", "读不到帧文件 {}（{}）".format(image_path, td.one_line(exc, 120)))
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
+            {"type": "text", "text": prompt},
+        ]}],
+        "max_tokens": 300,
+    }
+    req = urllib.request.Request(
+        VISION_ENDPOINTS[_vision_provider(model)],
+        data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        raise FetchError("视觉描述", "模型 HTTP {}：{}".format(exc.code, detail or "无响应体"))
+    except Exception as exc:
+        raise FetchError("视觉描述", "请求失败：{}".format(td.one_line(exc, 160)))
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise FetchError("视觉描述", "模型返回不是 JSON：{}".format(raw[:160]))
+    choices = data.get("choices") or []
+    if not choices:
+        raise FetchError("视觉描述", "模型没返回 choices：{}".format(raw[:200]))
+    content = (choices[0].get("message") or {}).get("content") or ""
+    return str(content).strip()
+
 def _media_duration(ffmpeg: str, media: str) -> float:
     """从 ffmpeg -i 的 stderr 里读 Duration；取不到就返回 0（调用方按固定间隔兜底）。"""
     try:
@@ -810,6 +882,26 @@ def run_frames(args, started: float) -> int:
     if not frames:
         return emit(2, reason="ffmpeg 抽帧全部失败")
     td.eprint("[抽帧] 成功 {} / {} 帧 -> {}".format(len(frames), count, out_dir))
+    if args.describe:
+        # 描述失败不推翻抽帧结果：帧照旧返回，失败原因逐帧记在 describeError 里
+        try:
+            key = _vision_key(args.vision_model, args.vision_key_file)
+        except FetchError as exc:
+            return emit(0, ok=True, duration=round(duration, 2), mediaPath=media,
+                        framesDir=out_dir, frames=frames, describeError=exc.reason())
+        prompt = args.vision_prompt or VISION_PROMPT
+        done = 0
+        for f in frames:
+            try:
+                f["description"] = describe_image(key, args.vision_model, f["path"], prompt, args.timeout)
+                done += 1
+                td.eprint("[视觉] 第 {} 帧：{}".format(f["index"], td.one_line(f["description"], 90)))
+            except FetchError as exc:
+                f["description"] = ""
+                f["describeError"] = exc.reason()
+                td.eprint("[警告] 第 {} 帧描述失败（{}）".format(f["index"], exc.reason()))
+        result["visionModel"] = args.vision_model
+        result["described"] = done
     return emit(0, ok=True, duration=round(duration, 2), mediaPath=media,
                 framesDir=out_dir, frames=frames)
 
@@ -875,6 +967,14 @@ def run(argv: list[str] | None = None) -> int:
                     help="yt-dlp 路径（默认自动探测 PATH 与 ~/.dsh/bin）")
     ap.add_argument("--timeout", dest="timeout", type=int, default=300, metavar="SEC",
                     help="单步外部命令超时（秒，默认 300）")
+    ap.add_argument("--describe", dest="describe", action="store_true",
+                    help="抽帧后把图片交给多模态模型描述（**会把图片上传到云端**；不传则该参数关闭，只返回本地路径）")
+    ap.add_argument("--vision-model", dest="vision_model", default=VISION_DEFAULT_MODEL, metavar="ID",
+                    help=f"视觉模型 id（默认 {VISION_DEFAULT_MODEL}；qwen* 走 DashScope，其它按智谱处理）")
+    ap.add_argument("--vision-key-file", dest="vision_key_file", default=None, metavar="FILE",
+                    help=f"视觉模型的 key 文件（默认 {VISION_DEFAULT_KEY_FILE}）")
+    ap.add_argument("--vision-prompt", dest="vision_prompt", default=None, metavar="TEXT",
+                    help="自定义描述提示词（默认要求只描述看到的内容、不猜测）")
     ap.add_argument("--frames", dest="frames", type=int, default=0, metavar="N",
                     help="抽帧模式：下载视频本体后按时间均匀抽 N 帧（1-20）存盘并返回路径；与字幕/ASR 互斥")
     ap.add_argument("--frames-dir", dest="frames_dir", default=None, metavar="DIR",

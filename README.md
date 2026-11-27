@@ -11,7 +11,7 @@
 
 ---
 
-## 1. 十八个工具
+## 1. 十九个工具
 
 ### 1.1 只读查询（5 个）
 
@@ -197,7 +197,7 @@ dsh plugin --profile <profile> add link:D:\path\to\dsh-douyin
 
 ## 3. 依赖与自检
 
-不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、18 个工具是否齐全，不依赖 Python、不联网。
+不装 Python 也能先跑一遍 `node selfcheck.mjs`（见第 9 节第 1 步）：它只验证插件能否被宿主正常加载、19 个工具是否齐全，不依赖 Python、不联网。
 
 装完跑一次 `douyin_status`。它的 `ok` 字段 = 「Python(playwright) 找到」且「Python(sherpa_onnx) 找到」且「`~/.dsh/bin/ffmpeg.exe` 存在」且「模型目录存在」。
 
@@ -588,7 +588,7 @@ python douyin_login.py --out D:\my\cookie.txt
 node selfcheck.mjs
 ```
 
-退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 18 个工具（原有 4 + 只读 7 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
+退出码 `0` = 通过：它会用假 ctx 真跑一次 `apply()`，断言导出的 `name`/`inject` 正确、恰好注册 19 个工具（原有 4 + 只读 8 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）、每个工具都有 `description`/`parameters`/`execute`、参数 schema 里 `type: "object"` 的节点都带 `additionalProperties`（宿主缺这个会抛 `JsonSchemaError`，整条插件不激活，日志里只会留一句 warning）。它会把 `DSH_HOME` 临时指到系统临时目录下再跑，跑完删掉，不碰你真正的状态目录。
 
 **第 2 步：环境自检**
 
@@ -691,7 +691,7 @@ douyin_search  keyword=美食  limit=5  order=click
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.js` | 18 个工具的实现（原有 4 + 只读 7 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr,duty,token}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
+| `index.js` | 19 个工具的实现（原有 4 + 只读 8 + 通知 2 + 登录 2 + 轻互动 1 + 谷时自动刷 1 + 装入配置环境 1）+ zod `Config` + 配置合并优先级 + `workRoot()`/`workVideos()` 工作目录约定 + manifest 解析（`parseManifest` / `manifestItems`）+ HTTP `/api/douyin-audio/{config,run,sysinfo,qr,duty,token}` 路由（`run` 用 `douyin_` + `action` 映射到已注册工具；`sysinfo` 只读返回 `cores`/`platform`/`arch`/`totalMemGB`；`qr` 直接回 `login/qr.png` 的 PNG 字节） |
 | `selfcheck.mjs` | 本地预检：假 ctx 跑一次 `apply()`，校验工具注册与参数 schema；`node selfcheck.mjs`，退出码 0=通过 |
 | `lib/state.mjs` | 家的路径（`DSH_HOME`）、`DEFAULTS`、`loadCfg`/`saveCfg`、日志轮转 |
 | `lib/runner.mjs` | Python 探测（按模块名 import 试探）、脚本执行、pipe→cmd 沙箱降级、`childEnv()` 注入 `DSH_DOUYIN_TMP` |

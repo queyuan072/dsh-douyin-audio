@@ -44,6 +44,9 @@ export const Config = !z ? undefined : z.object({
   verifyWait: z.number().default(0).extra('volatile', true),
   // 撞验证码时的兜底：hint = 只提示可调配置（默认，行为与历史一致）/ browser = 报错里额外给出可交给 DSH 自带浏览器的链接
   captchaFallback: z.string().default('hint').extra('volatile', true),
+  // 视觉描述（douyin_vision 的 describe=true 才用）：模型 id 与 key 文件
+  visionModel: z.string().default('qwen3.8-omni-flash').extra('volatile', true),
+  visionKeyFile: z.string().default('').extra('volatile', true),
   // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
   browserChannel: z.string().default('msedge').extra('volatile', true),
   // 手动添加的浏览器：JSON 数组字符串 [{"id","label","path"}]（用字符串存，避开旧宿主的数组类型兼容问题）
@@ -62,7 +65,7 @@ export const Config = !z ? undefined : z.object({
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
 const EXTRA_DEFAULTS = {
   asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
-  captchaFallback: 'hint',
+  captchaFallback: 'hint', visionModel: 'qwen3.8-omni-flash', visionKeyFile: '',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
@@ -1604,7 +1607,7 @@ export function apply(ctx, config = {}) {
   const merged = () => {
     const base = cfgAll()
     const over = {}
-    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback',
+    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile',
       'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
@@ -2256,6 +2259,70 @@ export function apply(ctx, config = {}) {
       return runFrames({ url: u.value, count: n, framesDir: dir })
     },
   })
+  // ── 4g. 抽帧 + 视觉描述（只读，但 describe=true 时会把图片上传到云端模型）───────
+  const VISION_TIMEOUT_SEC = 600
+
+  /** 调 douyin_fetch.py 的 frames(+describe) 模式：解析约定同 runFetch，脚本 ok:false 原样带回 */
+  async function runVision({ url, count, describe, model, prompt, framesDir }) {
+    if (!existsSync(fetchDeps.script)) return { ok: false, reason: '抓取脚本不存在: ' + fetchDeps.script }
+    const cfg = merged()
+    const python = await fetchDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
+    if (!python) return { ok: false, reason: '找不到带 playwright 的 Python。可在配置里设置 pythonPath。' }
+    const argv = ['--url', url, '--json', '--frames', String(count), '--vision-model', model]
+    if (describe) argv.push('--describe')
+    if (prompt) argv.push('--vision-prompt', prompt)
+    const keyFile = typeof cfg.visionKeyFile === 'string' ? cfg.visionKeyFile.trim() : ''
+    if (keyFile) argv.push('--vision-key-file', keyFile)
+    if (framesDir) argv.push('--frames-dir', framesDir)
+    if (cfg.readHeadless === false) argv.push('--window-offscreen')
+    const r = await fetchDeps.run(python, fetchDeps.script, argv, { timeoutSec: VISION_TIMEOUT_SEC, log })
+    const out = String(r.stdout || '')
+    log('vision 结束 code=' + r.code + '（describe=' + describe + '，预算 ' + VISION_TIMEOUT_SEC + 's）')
+    let parsed = null
+    const start = out.indexOf('{')
+    if (start >= 0) { try { parsed = JSON.parse(out.slice(start)) } catch { /* 下面按「不是 JSON」报 */ } }
+    if (!parsed) {
+      return { ok: false, exitCode: r.code, reason: '脚本输出不是 JSON（抽帧/描述那一步）', output: tail(out, 12) || tail(r.stderr, 8) }
+    }
+    if (parsed.ok === false) {
+      return { ...parsed, ok: false, reason: parsed.reason || '抽帧失败（脚本 ok=false）', exitCode: r.code,
+        output: tail(out, 10) || tail(r.stderr, 8) }
+    }
+    if (!r.ok) {
+      return { ...parsed, ok: false, exitCode: r.code, reason: '脚本退出码非 0，结果可能不完整', output: tail(r.stderr, 8) }
+    }
+    const res = { ...parsed, ok: true, count, describeRequested: describe, model }
+    if (!describe) res.visionNote = '未上传任何图片（describe=false）。要模型描述画面，请传 describe=true —— 那会把帧图片发到云端视觉模型。'
+    return res
+  }
+
+  tool({
+    name: 'douyin_vision',
+    description: '看画面（只读）：下载视频本体后用 ffmpeg 抽帧，可选再用多模态模型逐帧描述。默认 **不上传任何图片**（describe=false 只返回本地图片路径，可用 read_image 自己看）；describe=true 才会把帧发到云端视觉模型拿文字描述。不转写、不点赞、不评论。',
+    parameters: {
+      url: { type: 'string', description: '视频页链接或短链，如 https://www.douyin.com/video/<id>' },
+      count: { type: 'number', description: '抽几帧，1-20，默认 4' },
+      describe: { type: 'boolean', description: '是否调用视觉模型描述每帧，默认 false（不上传图片）' },
+      model: { type: 'string', description: '视觉模型 id，默认取配置 visionModel（默认 qwen3.8-omni-flash；qwen* 走 DashScope，其它按智谱）' },
+      prompt: { type: 'string', description: '可选：自定义描述提示词' },
+      framesDir: { type: 'string', description: '可选：帧图片输出目录' },
+    },
+    async execute(args) {
+      const deny = requireTier('douyin_vision', 'read')
+      if (deny) return deny
+      const u = checkUrl(args.url)
+      if (u.error) return { ok: false, reason: u.error }
+      const n = args.count === undefined ? 4 : Number(args.count)
+      if (!Number.isInteger(n) || n < 1 || n > 20) return { ok: false, reason: 'count 需是 1-20 的整数，收到 ' + JSON.stringify(args.count) }
+      const cfg = merged()
+      const model = (args.model !== undefined && args.model !== null && String(args.model).trim() !== '')
+        ? String(args.model).trim()
+        : (typeof cfg.visionModel === 'string' && cfg.visionModel.trim() ? cfg.visionModel.trim() : 'qwen3.8-omni-flash')
+      let dir = null
+      if (args.framesDir !== undefined && args.framesDir !== null && String(args.framesDir).trim() !== '') dir = resolve(String(args.framesDir).trim())
+      return runVision({ url: u.value, count: n, describe: !!args.describe, model, prompt: args.prompt, framesDir: dir })
+    },
+  })
   // ── 4e. 通知摘要（② 通知，只读）─────────────────────────────
   // 与只读那几件同一套信封；区别只在闸门档位（notify）与页面（登录后才有的通知页）。
   tool({
@@ -2766,7 +2833,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / visionModel（douyin_vision 的默认视觉模型，默认 qwen3.8-omni-flash）/ visionKeyFile（视觉模型 key 文件，空 = ~/.dsh/ai/key.txt）/ loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

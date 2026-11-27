@@ -21,6 +21,15 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.7.0 第 19 个工具 `douyin_vision`（抽帧 + 可选视觉描述）
+
+- 由来：`douyin_frames` 只产出图片，理解画面还得人来读。本工具把「抽帧 + 多模态描述」串起来。
+- **隐私默认关闭**：`describe=false`（默认）只落盘返回路径，**不上传任何图片**；只有显式 `describe=true` 才把帧发到云端视觉模型，返回值里也写明 `visionNote`。
+- 模型可配：配置键 `visionModel`（默认 `qwen3.8-omni-flash`，qwen* 走 DashScope、其它按智谱）与 `visionKeyFile`（空 = `~/.dsh/ai/key.txt`，按前缀挑 key：qwen 认 `sk-`，智谱反过来）。
+- 实现：脚本侧 `--describe / --vision-model / --vision-key-file / --vision-prompt`（`describe_image`、`_vision_key`），描述失败**不推翻抽帧结果**：帧照旧返回，失败原因逐帧写 `describeError`。
+- 真机实测：6.25s 视频抽 2 帧 + 描述，17.77s 完成；描述示例「一名短发女子…赤脚跪在床上，身体向后仰，头部完全倒垂…」。
+- ⚠️ 工具数 **19**：`selfcheck` 的 `EXPECTED_TOOLS`/`READ_TOOLS`、README 计数已同步（实测 `✓ 预检通过：19 个工具`）。
+
 ## 1.6.0 第 18 个工具 `douyin_frames`（抽帧，给人/模型“看画面”）
 
 - 由来：`douyin_video` 只有元数据、`douyin_fetch` 只有音频转写，**画面内容一直只能靠宿主浏览器截图 + 人工看图**。
