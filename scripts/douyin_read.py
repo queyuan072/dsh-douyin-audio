@@ -592,10 +592,62 @@ HOT_BODY = r"""
            bodyLen: (document.body ? (document.body.innerText || '').length : 0) };
 """
 
+# 调试探针：取前 3 个视频链接，回它们的祖先链类名与卡片文本（只在 --dump-dom 时执行）
+PROBE_SEARCH_JS = r"""
+() => {
+  const out = [];
+  const seen = new Set();
+  for (const a of document.querySelectorAll('a[href*="/video/"]')) {
+    const href = a.getAttribute('href') || '';
+    if (!/\/video\/\d+/.test(href) || seen.has(href)) continue;
+    seen.add(href);
+    let card = a;
+    for (let i = 0; i < 6 && card.parentElement; i++) {
+      card = card.parentElement;
+      if (card.querySelectorAll('a[href*="/video/"]').length === 1 && card.innerText.trim().length > 8) break;
+    }
+    out.push({
+      href: href.slice(0, 80),
+      aClass: String(a.className || '').slice(0, 80),
+      cardClass: String(card.className || '').slice(0, 120),
+      cardText: String(card.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200),
+      imgAlt: (card.querySelector('img') ? String(card.querySelector('img').getAttribute('alt') || '') : '').slice(0, 80),
+      aTitle: String(a.getAttribute('title') || '').slice(0, 80),
+      userLinks: [...card.querySelectorAll('a[href*="/user/"]')].map(x => String(x.innerText || '').trim().slice(0, 30)).slice(0, 3),
+    });
+    if (out.length >= 3) break;
+  }
+  return { count: out.length, items: out, title: String(document.title || ''),
+           bodyTail: String(document.body ? document.body.innerText : '').replace(/\s+/g, ' ').slice(0, 600) };
+}
+"""
+
 SEARCH_BODY = r"""
   const cfg0 = cfg;
   const out = [];
-  const rows = pick(cfg0.rows);
+  // 真机实测（2026-11-27）：结果卡片是 .search-result-card，卡内 innerText 按行排列：
+  //   [合集]? / <时长 03:04> / <点赞 388 或 1.3万> / <标题或描述> / @作者 / <时间 2周前>
+  // 旧实现靠 [class*="title"] 之类的容器选择器，抓到的是点赞数/时长（标题变 387、合集、1.3万）。
+  // 现在按行语义解析：时长取 x:xx、点赞取纯数字/万、作者取 @开头、时间取 ...前/刚刚，剩下的最长行当标题。
+  const cards = [...document.querySelectorAll('.search-result-card')].filter(visible);
+  cards.slice(0, Math.max(cfg0.limit * 3, 12)).forEach((card) => {
+    const a = card.querySelector('a[href*="/video/"]');
+    const url = a ? abs(a.getAttribute('href')) : '';
+    if (!url) return;
+    const lines = String(card.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    const isDur = (s) => /^\d{1,2}:\d{2}(:\d{2})?$/.test(s);
+    const isNum = (s) => /^\d+(\.\d+)?[万wW]?$/.test(s);
+    const isTime = (s) => /^(刚刚|\d+\s*(秒|分钟|小时|天|周|月|年)前)$/.test(s);
+    const duration = lines.find(isDur) || '';
+    const authorLine = lines.find((s) => s.startsWith('@')) || '';
+    const likeLine = lines.find((s) => isNum(s) && !isDur(s)) || '';
+    const titleLine = lines
+      .filter((s) => !(s === '合集' || s === duration || s === authorLine || s === likeLine || isTime(s) || isNum(s) || isDur(s)))
+      .sort((x, y) => y.length - x.length)[0] || '';
+    out.push({ title: clean(titleLine).slice(0, 160), author: clean(authorLine.replace(/^@/, '')),
+               like: clean(likeLine), url: url, duration: clean(duration) });
+  });
+  const rows = out.length ? [] : pick(cfg0.rows);
   rows.forEach((r) => {
     const a = r.querySelector('a[href*="/video/"]') || r.querySelector('a[href]');
     let title = clean(txt(r, cfg0.title));
@@ -1361,6 +1413,23 @@ def cmd_search(page, args):
     cfg = {"limit": args.limit, "rows": SEARCH_ROWS, "title": SEARCH_TITLE,
            "author": SEARCH_AUTHOR, "like": SEARCH_LIKE, "duration": SEARCH_DURATION}
     data = _extract(page, SEARCH_BODY, cfg, "search")
+    # 调试用探针（--dump-dom，生产不传就完全不执行）：等结果渲染出来后导出真实结构，用来对着它修选择器
+    if getattr(args, "dump_dom", None):
+        try:
+            deadline = time.time() + max(30.0, float(getattr(args, "verify_wait", 0) or 0) or 180.0)
+            probe = {"count": 0}
+            while time.time() < deadline:
+                probe = page.evaluate(PROBE_SEARCH_JS) or {"count": 0}
+                if int(probe.get("count") or 0) > 0:
+                    break
+                log("search: 还没看到结果，继续等（最多 {:.0f}s）…".format(deadline - time.time()))
+                with contextlib.suppress(Exception):
+                    page.wait_for_timeout(3000)
+            with open(args.dump_dom, "w", encoding="utf-8") as fh:
+                json.dump(probe, fh, ensure_ascii=False, indent=1)
+            log("search: 探针已导出 -> {}".format(args.dump_dom))
+        except Exception as exc:
+            log("search: 探针导出失败（{}）".format(_brief(exc, 120)))
     verify_msg = _search_verify_message(page)
     if verify_msg:
         raise StepError("search", verify_msg)
@@ -2623,6 +2692,8 @@ def _common_parser():
                          "不回退；路径不存在直接报错）")
     ap.add_argument("--timeout", type=float, default=30.0, metavar="SEC",
                     help="单步超时秒数，默认 30")
+    ap.add_argument("--dump-dom", dest="dump_dom", default=None, metavar="PATH",
+                    help="调试用：把落地页 HTML 写到该路径（目前只有 search 会写）")
     ap.add_argument("--no-api", dest="no_api", action="store_true",
                     help="video/note 跳过纯 HTTP 接口，强制走浏览器（调试用；默认接口优先）")
     ap.add_argument("--json", action="store_true",
