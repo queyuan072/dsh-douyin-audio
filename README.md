@@ -276,7 +276,8 @@ venv 建在**插件的安装目录里**，所以：
 | `dutyWindow` | string | `12:00-14:00,18:00-23:59` | 谷时窗口，逗号分隔多个 `HH:MM-HH:MM`；支持跨零点（如 `23:00-02:00`） |
 | `dailyLimit` | number | `5` | 每天最多刷几屏（单位是屏，不是视频条数）；`0` = 不自动跑（仍可手动） |
 | `dutyIntervalMin` | number | `30` | 两次自动刷之间至少隔多少分钟 |
-| `uiLayout` | string | `classic` | 设置页布局：`classic` = 一长条平铺；`tabs` = 四标签页（采集 / 转写 / 权限与登录 / 环境与诊断） |
+| `uiMode` | string | `simple` | 界面模式：`simple` 简洁版（只留刷屏 / 转写 / 登录）/ `detailed` 详细版（全部设置，含下面 `uiLayout` 的两种排版） |
+| `uiLayout` | string | `classic` | **仅详细版内有效**：`classic` = 一长条平铺；`tabs` = 四标签页（采集 / 转写 / 权限与登录 / 环境与诊断） |
 | `tierRead` | boolean | `true` | **① 只读**：解锁 `douyin_hot` / `douyin_search` / `douyin_video` / `douyin_comments` / `douyin_note` / `douyin_fetch`（图文详情与按链接取文字同属 ① 级） |
 | `tierNotify` | boolean | `false` | **② 通知**：解锁 `douyin_notes` / `douyin_messages`（读通知摘要、私信会话列表；仍然只读，不发消息、不标已读） |
 | `tierReact` | boolean | `false` | **③A 轻互动**：解锁 `douyin_react`——点赞 / 取消赞 / 收藏 / 取消收藏（见 1.6）。**默认关**；这一档**真的会写**：以你的账号点赞、收藏（可撤回，但会动你的互动记录）。关着时 `douyin_react` 返回 `TIER_DISABLED(tier=react)` |

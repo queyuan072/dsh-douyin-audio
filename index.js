@@ -63,6 +63,8 @@ export const Config = !z ? undefined : z.object({
   dutyIntervalMin: z.natural().default(30).extra('volatile', true),
   // 界面布局：classic = 平铺（默认，保持现状）/ tabs = 四标签页；取值不限制，未知值由前端按 classic 处理
   uiLayout: z.string().default('classic').extra('volatile', true),
+  // 界面模式：simple = 简洁版（只留刷屏/转写/登录）；detailed = 详细版（含经典平铺与标签页两版）
+  uiMode: z.string().default('simple').extra('volatile', true),
 })
 
 /** asrThreads / autoTranscribe / readHeadless / verifyWait 的缺省值：lib/state.mjs 的 DEFAULTS 里没有这些键，白名单在这一层补齐；
@@ -73,7 +75,7 @@ const EXTRA_DEFAULTS = {
   captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '', visionBaseUrl: '', visionApiKey: '', visionPresets: '[]', visionActive: '',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
-  uiLayout: 'classic',
+  uiLayout: 'classic', uiMode: 'simple',
   // 浏览器通道：msedge（默认）/ chrome / chromium（内置）/ firefox / webkit / 自定义项 id
   browserChannel: 'msedge',
   // 手动添加的浏览器（JSON 数组字符串）：解析失败一律当 []，绝不抛
@@ -1613,7 +1615,7 @@ export function apply(ctx, config = {}) {
     const base = cfgAll()
     const over = {}
     for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile', 'visionBaseUrl', 'visionApiKey', 'visionPresets', 'visionActive',
-      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
+      'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'uiMode', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
       if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') over[k] = v
@@ -2869,7 +2871,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / visionModel（douyin_vision 的视觉模型 id，默认 agent = 不调用外部模型由调用方自己看；也可填 gpt-4o-mini / qwen-vl-max / glm-4.5v 等任意 OpenAI 兼容模型）/ visionBaseUrl（该模型的 /chat/completions 地址，空 = 按模型名猜 DashScope/智谱）/ visionApiKey（直接给 key，空 = 读 key 文件）/ visionKeyFile（key 文件，空 = ~/.dsh/ai/key.txt）/ loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / visionModel（douyin_vision 的视觉模型 id，默认 agent = 不调用外部模型由调用方自己看；也可填 gpt-4o-mini / qwen-vl-max / glm-4.5v 等任意 OpenAI 兼容模型）/ visionBaseUrl（该模型的 /chat/completions 地址，空 = 按模型名猜 DashScope/智谱）/ visionApiKey（直接给 key，空 = 读 key 文件）/ visionKeyFile（key 文件，空 = ~/.dsh/ai/key.txt）/ loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（详细版内的布局：classic 平铺 / tabs 四标签页，默认 classic）/ uiMode（界面模式：simple 简洁版默认 / detailed 详细版）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {

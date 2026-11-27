@@ -1742,6 +1742,13 @@ const TIERS = [
 
       /* ── 布局开关：uiLayout = 'classic'（默认，一长条平铺）| 'tabs'（四标签页）
              两版共用同一个顶栏、同一份 cfg/form 状态和同一批 patch/run，只有第三层分支渲染。 ── */
+      /* ── 界面模式：uiMode = 'simple'（默认）| 'detailed'（详细：经典平铺 / 标签页两版都在这一档）── */
+      const useSimple = (cfg.uiMode || 'simple') === 'simple'
+      const setMode = async (v) => {
+        setCfg((c) => (c ? { ...c, uiMode: v } : c))
+        await patch('uiMode', v, '界面模式')
+        setCfg((c) => (c ? { ...c, uiMode: v } : c))
+      }
       const useTabs = cfg.uiLayout === 'tabs'
       const setLayout = async (v) => {
         setCfg((c) => (c ? { ...c, uiLayout: v } : c))   // 当场切，别等宿主回话
@@ -1788,15 +1795,25 @@ const TIERS = [
             onClick: () => checkUpd(false),
           }, updBusy ? '查询中…' : '检查更新'),
           h('button', {
-            'data-dy-btn': '', 'data-dy-layout-btn': 'classic', 'data-primary': useTabs ? undefined : '',
-            disabled: busy === 'uiLayout', title: '一长条平铺的设置页（默认）',
-            onClick: () => { if (useTabs) setLayout('classic') },
-          }, '旧版'),
+            'data-dy-btn': '', 'data-dy-mode-btn': 'simple', 'data-primary': useSimple ? '' : undefined,
+            disabled: busy === 'uiMode', title: '简洁版：只留刷屏 / 转写 / 登录',
+            onClick: () => { if (!useSimple) setMode('simple') },
+          }, '简洁'),
           h('button', {
+            'data-dy-btn': '', 'data-dy-mode-btn': 'detailed', 'data-primary': useSimple ? undefined : '',
+            disabled: busy === 'uiMode', title: '详细版：全部设置（含平铺 / 标签页两种排版）',
+            onClick: () => { if (useSimple) setMode('detailed') },
+          }, '详细'),
+          useSimple ? null : h('button', {
+            'data-dy-btn': '', 'data-dy-layout-btn': 'classic', 'data-primary': useTabs ? undefined : '',
+            disabled: busy === 'uiLayout', title: '一长条平铺的设置页',
+            onClick: () => { if (useTabs) setLayout('classic') },
+          }, '平铺'),
+          useSimple ? null : h('button', {
             'data-dy-btn': '', 'data-dy-layout-btn': 'tabs', 'data-primary': useTabs ? '' : undefined,
             disabled: busy === 'uiLayout', title: '顶部状态栏 + 四个标签页',
             onClick: () => { if (!useTabs) setLayout('tabs') },
-          }, '新版')),
+          }, '标签页')),
         h('button', {
           'data-dy-btn': '', 'data-primary': '', 'data-dy-run-one': '',
           disabled: busy === 'scroll',
@@ -2029,7 +2046,49 @@ const TIERS = [
             h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))))
       }
 
-      return useTabs ? renderTabs() : renderClassic()
+      /* ── 简洁版：只留最常用的三件事（刷屏 / 转写 / 登录），其余全在详细版 ── */
+      const renderSimple = () => h('div', { 'data-dy-page': '', 'data-dy-simple': '' },
+        topBar,
+        h('div', { 'data-dy-sec': '', key: 'simple-collect' },
+          h('div', { 'data-dy-h': '' }, '刷屏'),
+          h('div', { 'data-dy-row': '' },
+            numField('count', '屏数 count', { min: 1 }),
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', disabled: busy === 'scroll',
+              onClick: () => run('scroll', { count: runCount }, '刷一轮'),
+            }, busy === 'scroll' ? '刷着呢…' : '刷一轮')),
+          h('div', { 'data-dy-quota': '' }, quotaText),
+          h('div', { 'data-dy-note': '' }, dutyNote),
+          h('div', { 'data-dy-row': '' },
+            h('button', { 'data-dy-btn': '', 'data-dy-duty': 'history', disabled: histBusy, onClick: loadHistory },
+              histBusy ? '读着呢…' : (hist === null ? '它刷过什么' : '收起记录'))),
+          hist === null
+            ? null
+            : (hist.length === 0
+              ? h('div', { 'data-dy-note': '' }, '还没刷过')
+              : h('div', { 'data-dy-hist': '' }, hist.map((it, i) => histRow(it, i))))),
+        h('div', { 'data-dy-sec': '', key: 'simple-trans' },
+          h('div', { 'data-dy-h': '' }, '转写'),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', disabled: busy === 'transcribe',
+              onClick: () => run('transcribe', { limit: 1 }, '转写最近一条'),
+            }, busy === 'transcribe' ? '转着呢…' : '转写最近一条'),
+            h('div', { 'data-dy-note': '' }, '本地 SenseVoice，不联网'))),
+        h('div', { 'data-dy-sec': '', key: 'simple-login' },
+          h('div', { 'data-dy-h': '' }, '登录'),
+          accountRow(),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', disabled: busy === 'login_start',
+              title: '弹一个真 Edge 窗口，你在里面扫码/过验证',
+              onClick: startLogin,
+            }, busy === 'login_start' ? '等你在窗口里登录…' : '登录 / 重新登录'))),
+        out ? h('div', { 'data-dy-sec': '', key: 'simple-out' }, h('div', { 'data-dy-h': '' }, '最近一次结果'), out) : null,
+        h('div', { 'data-dy-note': '' },
+          '简洁版只放最常用的三件事。改线程数、谷时窗口与额度、能力等级、视觉模型、浏览器通道、环境诊断这些，点顶栏「详细」。'))
+
+      return useSimple ? renderSimple() : (useTabs ? renderTabs() : renderClassic())
     }
 
     return {

@@ -21,6 +21,14 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.11.0 设置页分「简洁 / 详细」两版，旧的平铺 + 标签页都归入详细
+
+- 新配置 `uiMode`：`simple`（默认）/ `detailed`。顶栏多了「简洁」「详细」两个按钮。
+- **简洁版**（新增 `renderSimple()`）：顶栏徽章 + 刷屏（屏数 / 刷一轮 / 刷过什么 / 额度）/ 转写（转写最近一条）/ 登录（账号行 + 登录按钮）+ 最近一次结果 + 一行说明。
+- **详细版** = 原来的两版：`uiLayout=classic`（平铺）与 `tabs`（四标签页）都保留，只是「平铺 / 标签页」按钮只在详细版出现（原名「旧版 / 新版」已改）。
+- 理由：设置页九成时间只用「刷 / 转写 / 登录」；但详细里内容多到必须分组，所以保留标签页而不是砍掉。
+- 通道与 `uiLayout` 相同（宿主 `POST /config`），`selfcheck` 实测 `✓ 预检通过：19 个工具`。
+
 ## 1.10.0 视觉模型支持多套预设（`visionPresets` / `visionActive`）
 
 - 配置：`visionPresets`（JSON 数组：`[{name,model,baseUrl,apiKey}]`）+ `visionActive`（选中的 name）。设置页「用其他模型看」展开后可「存为预设」「用 ××」「删 ××」。
