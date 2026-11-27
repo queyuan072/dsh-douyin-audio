@@ -2046,7 +2046,8 @@ const TIERS = [
             h('button', { 'data-dy-btn': '', onClick: () => setOut(null) }, '清空结果'))))
       }
 
-      /* ── 简洁版：只留最常用的三件事（刷屏 / 转写 / 登录），其余全在详细版 ── */
+      /* ── 简洁版：日常真要动的那几项都在（刷屏 / 窗口 / 谷时 / 转写 / 能力 / 登录），
+            只把「诊断、浏览器通道、视觉预设、逐项说明」留给详细版 ── */
       const renderSimple = () => h('div', { 'data-dy-page': '', 'data-dy-simple': '' },
         topBar,
         h('div', { 'data-dy-sec': '', key: 'simple-collect' },
@@ -2057,24 +2058,70 @@ const TIERS = [
               'data-dy-btn': '', 'data-primary': '', disabled: busy === 'scroll',
               onClick: () => run('scroll', { count: runCount }, '刷一轮'),
             }, busy === 'scroll' ? '刷着呢…' : '刷一轮')),
-          h('div', { 'data-dy-quota': '' }, quotaText),
-          h('div', { 'data-dy-note': '' }, dutyNote),
           h('div', { 'data-dy-row': '' },
             h('button', { 'data-dy-btn': '', 'data-dy-duty': 'history', disabled: histBusy, onClick: loadHistory },
-              histBusy ? '读着呢…' : (hist === null ? '它刷过什么' : '收起记录'))),
+              histBusy ? '读着呢…' : (hist === null ? '它刷过什么' : '收起记录')),
+            h('div', { 'data-dy-quota': '' }, quotaText)),
           hist === null
             ? null
             : (hist.length === 0
               ? h('div', { 'data-dy-note': '' }, '还没刷过')
               : h('div', { 'data-dy-hist': '' }, hist.map((it, i) => histRow(it, i))))),
+        h('div', { 'data-dy-sec': '', key: 'simple-window' },
+          h('div', { 'data-dy-h': '' }, '窗口与声音'),
+          h(ToggleRow, {
+            label: '刷屏后台跑 headless',
+            note: '关着会弹浏览器窗口（看不看得见过程）；两个窗口都已静音',
+            on: on('headless'), disabled: busy === 'headless',
+            onChange: (v) => patch('headless', v, '后台跑'),
+          }),
+          h(ToggleRow, {
+            label: '只读工具后台跑 readHeadless',
+            note: '关着=可见窗口，验证码更容易过；开着=不抢焦点',
+            on: on('readHeadless'), disabled: busy === 'readHeadless',
+            onChange: (v) => patch('readHeadless', v, '只读后台跑'),
+          })),
+        h('div', { 'data-dy-sec': '', key: 'simple-duty' },
+          h('div', { 'data-dy-h': '' }, '谷时自动刷'),
+          h(ToggleRow, {
+            label: '谷时自动刷 autoRun',
+            note: dutyNote,
+            on: autoRunOn, disabled: busy === 'autoRun',
+            onChange: (v) => patch('autoRun', v, '谷时自动刷'),
+          }),
+          h('div', { 'data-dy-row': '' },
+            h('button', {
+              'data-dy-btn': '', 'data-primary': '', 'data-dy-duty': 'run', disabled: dutyRunning,
+              onClick: runDuty,
+            }, dutyRunning ? '刷着呢…' : '现在刷一轮'),
+            h('div', { 'data-dy-note': '' }, '窗口与每日上限在详细版')),
+          dutyRunning
+            ? h('div', { 'data-dy-progress': '' }, '正在刷一轮…（后台跑着，跑完徽章会更新）')
+            : null),
         h('div', { 'data-dy-sec': '', key: 'simple-trans' },
           h('div', { 'data-dy-h': '' }, '转写'),
           h('div', { 'data-dy-row': '' },
             h('button', {
               'data-dy-btn': '', 'data-primary': '', disabled: busy === 'transcribe',
               onClick: () => run('transcribe', { limit: 1 }, '转写最近一条'),
-            }, busy === 'transcribe' ? '转着呢…' : '转写最近一条'),
-            h('div', { 'data-dy-note': '' }, '本地 SenseVoice，不联网'))),
+            }, busy === 'transcribe' ? '转着呢…' : '转写最近一条')),
+          h(ToggleRow, {
+            label: '刷完自动转写 autoTranscribe',
+            note: '关 = 只给清单，由你决定转哪条（推荐）',
+            on: on('autoTranscribe'), disabled: busy === 'autoTranscribe',
+            onChange: (v) => patch('autoTranscribe', v, '自动转写'),
+          })),
+        h('div', { 'data-dy-sec': '', key: 'simple-tiers' },
+          h('div', { 'data-dy-h': '' }, '能力等级'),
+          h('div', { 'data-dy-row': '' },
+            TIERS.map((t) => h('button', {
+              key: 'stier-' + t.key,
+              'data-dy-btn': '', 'data-primary': cfg[t.key] ? '' : undefined,
+              disabled: busy === t.key,
+              title: t.note,
+              onClick: () => patch(t.key, !cfg[t.key], t.title),
+            }, (cfg[t.key] ? '✓ ' : '✗ ') + t.title))),
+          h('div', { 'data-dy-note': '' }, '点一下即开/关；档位说明在详细版')),
         h('div', { 'data-dy-sec': '', key: 'simple-login' },
           h('div', { 'data-dy-h': '' }, '登录'),
           accountRow(),
@@ -2086,7 +2133,7 @@ const TIERS = [
             }, busy === 'login_start' ? '等你在窗口里登录…' : '登录 / 重新登录'))),
         out ? h('div', { 'data-dy-sec': '', key: 'simple-out' }, h('div', { 'data-dy-h': '' }, '最近一次结果'), out) : null,
         h('div', { 'data-dy-note': '' },
-          '简洁版只放最常用的三件事。改线程数、谷时窗口与额度、能力等级、视觉模型、浏览器通道、环境诊断这些，点顶栏「详细」。'))
+          '简洁版：刷 / 谷时 / 转写 / 能力开关 / 登录都在上面；逐项说明、谷时窗口与每日上限、线程数、视觉模型与人设、验证码兜底、浏览器通道、环境诊断留在「详细」。'))
 
       return useSimple ? renderSimple() : (useTabs ? renderTabs() : renderClassic())
     }
