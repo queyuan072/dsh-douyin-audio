@@ -21,6 +21,14 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.5.5 搜索也接口化（当初“需要签名”的判断是错的）
+
+- **真相**：`/aweme/v1/web/general/search/single/` **免签名**可用；之前返回 `status_code=0` 但 `data` 为空，是因为**少了四个参数**，不是缺 a_bogus：
+  `search_source=normal_search` / `query_correct_type=1` / `is_filter_search=0` / `need_filter_settings=1`。补齐后连续三次实测 `10/10/10` 条。
+- **实现**：`SEARCH_API_PATH` + `_search_api_items()`；`run()` 里 `search` 接口优先，失败回落浏览器。条目取 `data[].aweme_info`（desc / author.nickname / statistics.digg_count / aweme_id / duration）。
+- **同时修好的浏览器兜底路径**：结果卡片容器是 `.search-result-card`，卡内是按行排列的文本（[合集]? / 时长 / 点赞 / 标题 / @作者 / 时间），旧实现用 `[class*="title"]` 抓到了点赞数和时长（标题变成 `387`、`合集`、`1.3万`）。现在按行语义解析。
+- 调试工具：`--dump-dom PATH` 会等结果渲染后导出一份卡片结构探针（生产不传则完全不执行）。
+
 ## 1.5.1 视频/图文详情改走接口（免验证码）
 
 - **病灶**：`video` / `note` 走 Playwright + Edge，被抖音「验证码中间页」拦死（无头、可见窗口都拦；`verifyWait` 等满也过不去）。而 `notes` 走纯 HTTP 一直正常 —— 说明问题在浏览器链路，不在插件。

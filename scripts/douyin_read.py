@@ -1895,7 +1895,8 @@ def _search_api_items(args):
         try:
             raw_ms = info.get("duration") or ((info.get("video") or {}).get("duration"))
             secs = int(raw_ms) // 1000
-            dur = "{:02d}:{:02d}".format(secs // 60, secs % 60)
+            # 接口不给时长就别报 00:00（会误导成“零长度”），留空串如实表示未知
+            dur = "{:02d}:{:02d}".format(secs // 60, secs % 60) if secs > 0 else ""
         except (TypeError, ValueError):
             dur = ""
         items.append({
