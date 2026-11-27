@@ -1724,6 +1724,64 @@ def _api_item_or_none(args, command, url):
     log("{}: 接口直取成功（aweme_id={}，未开浏览器）".format(command, aweme_id))
     return _aweme_item(aweme, resolved)
 
+# 热榜接口（实测 2026-11-27：status_code=0，51 条，**免签名**；搜索接口虽然 status_code=0 但 items=0，仍需签名，故不动 search）
+HOT_API_PATH = "/aweme/v1/web/hot/search/list/"
+HOT_API_QS = AWEME_API_QS + "&detail_list=1&source=6&board_type=0&board_sub_type="
+
+
+def _hot_text(value):
+    """hot_value 数字 -> 页面同风格文本（亿/万）；取不到就给空串，不编。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    if n >= 100000000:
+        return "{:.1f}亿".format(n / 100000000.0)
+    if n >= 10000:
+        return "{:.1f}万".format(n / 10000.0)
+    return str(n)
+
+
+def _hot_api_items(args):
+    """热榜纯 HTTP 接口（免签名）。失败返回 None，调用方回落浏览器。"""
+    url = "{}{}?{}".format(DOUYIN_HOST, HOT_API_PATH, HOT_API_QS)
+    out = _notice_http_get(args, url)
+    if out["cls"] != "ok":
+        log("hot: 接口取数失败（{}），回落浏览器".format(out.get("error") or out["cls"]))
+        return None
+    words = ((out["data"].get("data") or {}).get("word_list")) or []
+    if not isinstance(words, list) or not words:
+        log("hot: 接口没返回 word_list，回落浏览器")
+        return None
+    items = []
+    used_ranks = set()
+    for i, it in enumerate(words[: args.limit]):
+        if not isinstance(it, dict):
+            continue
+        title = _clean(it.get("word"), 160)
+        if not title:
+            continue
+        try:
+            rank = int(it.get("position"))
+        except (TypeError, ValueError):
+            rank = 0
+        # 置顶条目没有 position（实测首条如此）：回退到序号，并保证名次不重复
+        if rank <= 0 or rank in used_ranks:
+            rank = i + 1
+            while rank in used_ranks:
+                rank += 1
+        used_ranks.add(rank)
+        sid = str(it.get("sentence_id") or "").strip()
+        items.append({"rank": rank, "title": title, "hot": _hot_text(it.get("hot_value")),
+                      "url": "{}/hot/{}".format(DOUYIN_HOST, sid) if sid else ""})
+    if not items:
+        return None
+    args.browser_used = "http"
+    log("hot: 接口直取成功（{} 条，未开浏览器）".format(len(items)))
+    return items
+
 def cmd_video(page, args):
     url = _video_url(args.url)
     _goto(page, url, args, "video")  # 被验证页挡住时抛 StepError，不做任何绕过
@@ -2526,6 +2584,10 @@ def run(args):
         return cmd_notes(None, args)
     if args.command == "messages":
         _require_login(args, "messages")  # 先查登录态，别白起一个浏览器
+    if args.command == "hot":
+        items = _hot_api_items(args)
+        if items is not None:
+            return items
     if args.command in ("video", "note"):
         # 接口优先：免签名、不开浏览器，绕开“验证码中间页”；失败再回落浏览器兜底
         item = _api_item_or_none(args, args.command, args.url)
