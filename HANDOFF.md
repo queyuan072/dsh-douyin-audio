@@ -21,6 +21,13 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.7.1 视觉能力加了一档闸门 `tierVision`（默认关）
+
+- 位置：设置页「能力等级」第 ⑤ 档「视觉（抽帧上传）」，与 ① 只读 / ② 通知 / ③A / ③B / ④ 并列。
+- 门控对象：`douyin_vision`（`requireTier('douyin_vision', 'vision')`）。`douyin_frames` 仍属 ① 只读——它只把帧存本地、不上传。
+- **默认 `false`**：上传图片到云端属于「离开本机」的动作，必须用户显式开启；关着时返回 `TIER_DISABLED(tier=vision)`。
+- 接线：`TIER_DEFAULTS`/`TIER_LABEL`/`TIER_KEY` 各加一项，`client.js` 的 `TIERS` 加一行，`selfcheck` 加两条断言（关着被挡 / 开着放行），实测 `✓ 预检通过：19 个工具`。
+
 ## 1.7.0 第 19 个工具 `douyin_vision`（抽帧 + 可选视觉描述）
 
 - 由来：`douyin_frames` 只产出图片，理解画面还得人来读。本工具把「抽帧 + 多模态描述」串起来。

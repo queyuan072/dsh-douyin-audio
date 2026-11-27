@@ -226,6 +226,7 @@ window.__ModuleLoader__.load({
       { key: 'tierReact', title: '③A 轻互动（点赞收藏）', note: '点赞、收藏、取消 —— 风险：会动你账号的互动记录，但可撤回', needRead: true },
       { key: 'tierComment', title: '③B 评论回复', note: '发评论、回复 —— 风险：会以你的账号公开发言，发出去收不回', needRead: true },
       { key: 'tierPublish', title: '④ 发布', note: '上传视频到抖音 —— 风险：会向你的账号上传视频', needRead: true },
+  { key: 'tierVision', title: '⑤ 视觉（抽帧上传）', note: 'douyin_vision 抽帧后把画面发给多模态模型描述 —— 风险：图片会离开本机上传到云端模型。不开也能用 douyin_frames 只在本地存图看' },
     ]
 
     /* 结果区：等宽字体，接口原样回什么就贴什么（出错时的原因也一起贴，别只剩一句"失败了"） */
@@ -1268,7 +1269,7 @@ window.__ModuleLoader__.load({
             onChange: (v) => patch(t.key, v, t.title),
           })),
           h('div', { 'data-dy-note': '' },
-            '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这五个开关只负责把选择存进配置，'
+            '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
         h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
           h('div', { 'data-dy-h': '' }, '登录'),

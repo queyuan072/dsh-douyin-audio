@@ -210,7 +210,8 @@ for (const t of registered) {
 }
 
 /* ───────── ⑤ 能力等级闸门（tierRead 默认开；③④ 打开时 ① 视为生效） ───────── */
-const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note', 'douyin_fetch', 'douyin_frames', 'douyin_vision']
+const READ_TOOLS = ['douyin_hot', 'douyin_search', 'douyin_video', 'douyin_comments', 'douyin_note', 'douyin_fetch', 'douyin_frames']
+const VISION_TOOLS = ['douyin_vision']
 const NOTIFY_TOOLS = ['douyin_notes', 'douyin_messages']
 const byName = new Map(registered.map((t) => [t && t.name, t]))
 /** 直接写沙箱里的 config.json（$DSH_HOME 已指到临时目录，不碰真家目录） */
@@ -253,6 +254,21 @@ writeCfg({ tierRead: false, tierComment: true })
 const hotDerived2 = await callTool('douyin_hot', { limit: 99 })
 if (hotDerived2 && hotDerived2.code !== 'TIER_DISABLED') ok('tierComment(③B)=true 时 tierRead 视为生效')
 else problem('tierComment=true 没让 tierRead 自动生效：' + JSON.stringify(hotDerived2))
+
+// ⑤-1 tierVision 关着：douyin_vision 必须被「视觉」档挡住（即使 tierRead 开着）
+writeCfg({ tierRead: true, tierVision: false })
+for (const n of VISION_TOOLS) {
+  const r = await callTool(n, { url: 'https://www.douyin.com/video/1', count: 2, describe: true })
+  if (r && r.code === 'TIER_DISABLED' && r.tier === 'vision' && typeof r.reason === 'string' && typeof r.hint === 'string') {
+    ok(n + ' 被等级闸门挡住（TIER_DISABLED / tier=vision）')
+  } else problem(n + ' 在 tierVision=false 时没被挡住：' + JSON.stringify(r))
+}
+
+// ⑤-2 tierVision 开回来 → 放行（拿 url 校验当探针：它排在闸门之后、跑脚本之前）
+writeCfg({ tierRead: true, tierVision: true })
+const visionOpen = await callTool('douyin_vision', { count: 2 })
+if (visionOpen && visionOpen.code !== 'TIER_DISABLED' && /url/.test(String(visionOpen.reason || ''))) ok('tierVision=true 放行 douyin_vision（走到 url 校验这一步）')
+else problem('tierVision=true 时没放行：' + JSON.stringify(visionOpen))
 
 // ⑤ tierNotify 关着：两个通知工具都必须被闸门挡住（② 通知独立于 ① 只读）
 writeCfg({ tierRead: true, tierNotify: false })

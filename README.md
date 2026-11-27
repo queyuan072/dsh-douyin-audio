@@ -282,15 +282,17 @@ venv 建在**插件的安装目录里**，所以：
 | `tierReact` | boolean | `false` | **③A 轻互动**：解锁 `douyin_react`——点赞 / 取消赞 / 收藏 / 取消收藏（见 1.6）。**默认关**；这一档**真的会写**：以你的账号点赞、收藏（可撤回，但会动你的互动记录）。关着时 `douyin_react` 返回 `TIER_DISABLED(tier=react)` |
 | `tierComment` | boolean | `false` | **③B 评论回复**：发评论 / 回复（预留；会以你的账号公开发言，发出后收不回） |
 | `tierPublish` | boolean | `false` | **④ 发布**：上传视频到抖音（预留；会向你的账号投稿） |
+| `tierVision` | boolean | `false` | **⑤ 视觉（抽帧上传）**：解锁 `douyin_vision`——抽帧后可把画面发给多模态模型描述。**默认关**，因为图片会离开本机上传到云端模型；只想要本地图片路径时用 `douyin_frames`（属 ① 只读，不上传）。关着时 `douyin_vision` 返回 `TIER_DISABLED(tier=vision)` |
 
-**能力等级（五个开关）**
+**能力等级（六个开关）**
 
-五个 `tier*` 键就是「能力等级」开关，**只能在设置页的「能力等级」那一节由用户自己点**。
+六个 `tier*` 键就是「能力等级」开关，**只能在设置页的「能力等级」那一节由用户自己点**。
 `douyin_config` 会明确拒绝改 `tier*`（返回 `{ok:false, error:"能力等级只能由用户在设置页修改"}`）——
 让 agent 能自己解锁，闸门就等于没设。设置页走的是 `POST /api/douyin-audio/config`（要过同源门那一条，
 见第 5 节），那条路照旧能写 `tier*`，因为那是你自己点的开关。
 
 - 基础四件（`douyin_scroll` / `douyin_transcribe` / `douyin_status` / `douyin_config`）**不受等级限制**——它们不碰抖音的写接口。
+- **⑤ 视觉为什么单独一档**：`douyin_frames` 只把帧存到本地（属 ① 只读），而 `douyin_vision` 在 `describe=true` 时会把图片上传到云端模型——「离开本机」是另一类风险，所以给了独立开关，且默认关。
 - **依赖规则**：`tierReact` / `tierComment` / `tierPublish` 任一为真时，`tierRead` 在判断上视为真（**不会改写你存的值**）。
 - **③ 为什么拆两档**：点赞收藏可撤回，评论回复公开且不可撤回——风控强度差一个量级，所以给了两个独立开关。
 - 等级没开时，对应工具不报错也不崩，返回：
