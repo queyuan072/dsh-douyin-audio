@@ -1620,6 +1620,110 @@ def _video_item(page, args, url, step="video"):
     }
 
 
+# ==========================================================================
+# 视频/图文详情：纯 HTTP 接口优先（免签名），浏览器只作兜底
+# ==========================================================================
+# 实测（本机 cookie，2026-11-27）：
+#   * /aweme/v1/web/aweme/detail/         -> 403 Blocked by ArgusSecurityPlugin Uifid Not Found
+#   * /aweme/v1/web/multi/aweme/detail/   -> status_code=0 + 真实数据，**不需要任何签名**
+# 现状：浏览器链路（Playwright + Edge）经常被“验证码中间页”拦，接口链路不受影响。
+# 因此 video / note 先走接口；接口任何一类失败都回落浏览器（老行为），并如实回报 resolvedBy。
+AWEME_API_PATH = "/aweme/v1/web/multi/aweme/detail/"
+AWEME_API_QS = ("device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1"
+                "&version_code=190500&version_name=19.5.0&cookie_enabled=true&platform=PC")
+
+
+def _aweme_id_of(url, step):
+    """从（可能还是短链的）地址取 aweme id：短链先用 urllib 跟随跳转，再匹配 /video/ 或 /note/。"""
+    raw = (url or "").strip()
+    resolved = _resolve_short_url(raw) or raw
+    for pattern in (_VIDEO_ID_RE, _NOTE_ID_RE):
+        m = pattern.search(resolved) or pattern.search(raw)
+        if m:
+            return m.group(1), resolved
+    return None, resolved
+
+
+def _aweme_api_fetch(args, aweme_id):
+    """调 multi/aweme/detail 取一条作品（纯 HTTP）。返回 (aweme|None, reason)。"""
+    url = "{}?aweme_ids={}&{}".format(DOUYIN_HOST + AWEME_API_PATH,
+                                      urllib.parse.quote("[{}]".format(aweme_id), safe=""),
+                                      AWEME_API_QS)
+    out = _notice_http_get(args, url)
+    if out["cls"] != "ok":
+        return None, "{}（{}）".format(out["cls"], out.get("error") or "")
+    data = out["data"]
+    try:
+        sc = int(data.get("status_code") or 0)
+    except (TypeError, ValueError):
+        return None, "接口缺 status_code（结构可能已变）"
+    if sc != 0:
+        return None, "status_code={}（{}）".format(sc, data.get("status_msg") or "")
+    details = data.get("aweme_details")
+    if not isinstance(details, list) or not details or not isinstance(details[0], dict):
+        return None, "status_code=0 但没有 aweme_details（作品可能已删/不可见）"
+    return details[0], None
+
+
+def _aweme_item(aweme, page_url):
+    """接口作品 -> 与浏览器路径同形的条目（字段缺失就给空，绝不编）。"""
+    stats = aweme.get("statistics") or {}
+    author = aweme.get("author") or {}
+    music = aweme.get("music") or {}
+    desc = _clean(aweme.get("desc"), 600)
+    images = []
+    for img in (aweme.get("images") or [])[:20]:
+        urls = (img or {}).get("url_list") or []
+        if urls:
+            images.append(urls[0])
+    sec_uid = str(author.get("sec_uid") or "")
+    tags = []
+    for t in (aweme.get("text_extra") or []):
+        name = _clean((t or {}).get("hashtag_name"), 32)
+        if name:
+            tags.append(name)
+    return {
+        "title": _clean(desc.split("\n")[0] if desc else "", 200),
+        "author": _clean(author.get("nickname"), 60),
+        "desc": desc,
+        "like": parse_count(stats.get("digg_count")),
+        "comment": parse_count(stats.get("comment_count")),
+        "share": parse_count(stats.get("share_count")),
+        "collect": parse_count(stats.get("collect_count")),
+        "publishTime": _fmt_notice_time(aweme.get("create_time")),
+        "duration": aweme.get("duration"),
+        "url": ("https://www.douyin.com/user/{}".format(sec_uid) if sec_uid else (page_url or "")),
+        "tags": tags[:20],
+        "music": ({"name": _clean(music.get("title"), 120),
+                    "author": _clean(music.get("author"), 60)} if music.get("title") else None),
+        "musicNote": "" if music.get("title") else "接口未返回音乐信息",
+        "type": "note" if images else "video",
+        "images": images,
+        "resolvedBy": "api",
+    }
+
+
+def _api_item_or_none(args, command, url):
+    """接口优先：成功返回条目；失败返回 None，由调用方回落浏览器（原因写 stderr）。"""
+    if getattr(args, "no_api", False):
+        log("{}: 指定 --no-api，跳过接口直接走浏览器".format(command))
+        return None
+    try:
+        _assert_douyin_url(url, command)
+    except StepError:
+        return None  # 非抖音域名：交给浏览器路径报同样的人话错误
+    aweme_id, resolved = _aweme_id_of(url, command)
+    if not aweme_id:
+        log("{}: 地址里取不到 aweme id（{}），走浏览器".format(command, (resolved or url)[:100]))
+        return None
+    aweme, reason = _aweme_api_fetch(args, aweme_id)
+    if aweme is None:
+        log("{}: 接口取数失败（{}），回落浏览器".format(command, reason))
+        return None
+    args.browser_used = "http"
+    log("{}: 接口直取成功（aweme_id={}，未开浏览器）".format(command, aweme_id))
+    return _aweme_item(aweme, resolved)
+
 def cmd_video(page, args):
     url = _video_url(args.url)
     _goto(page, url, args, "video")  # 被验证页挡住时抛 StepError，不做任何绕过
@@ -2422,6 +2526,11 @@ def run(args):
         return cmd_notes(None, args)
     if args.command == "messages":
         _require_login(args, "messages")  # 先查登录态，别白起一个浏览器
+    if args.command in ("video", "note"):
+        # 接口优先：免签名、不开浏览器，绕开“验证码中间页”；失败再回落浏览器兜底
+        item = _api_item_or_none(args, args.command, args.url)
+        if item is not None:
+            return [item]
     with _browser_page(args) as page:
         return handler(page, args)
 
@@ -2452,6 +2561,8 @@ def _common_parser():
                          "不回退；路径不存在直接报错）")
     ap.add_argument("--timeout", type=float, default=30.0, metavar="SEC",
                     help="单步超时秒数，默认 30")
+    ap.add_argument("--no-api", dest="no_api", action="store_true",
+                    help="video/note 跳过纯 HTTP 接口，强制走浏览器（调试用；默认接口优先）")
     ap.add_argument("--json", action="store_true",
                     help="stdout 只输出一行 JSON（进度信息走 stderr）")
     return ap

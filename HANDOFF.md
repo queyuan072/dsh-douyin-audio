@@ -21,6 +21,16 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.5.1 视频/图文详情改走接口（免验证码）
+
+- **病灶**：`video` / `note` 走 Playwright + Edge，被抖音「验证码中间页」拦死（无头、可见窗口都拦；`verifyWait` 等满也过不去）。而 `notes` 走纯 HTTP 一直正常 —— 说明问题在浏览器链路，不在插件。
+- **实测结论（本机 cookie）**：
+  - `/aweme/v1/web/aweme/detail/` → **403** `Blocked by ArgusSecurityPlugin Uifid Not Found`（单条详情接口要 uifid，走不通）
+  - `/aweme/v1/web/multi/aweme/detail/?aweme_ids=[<id>]&…` → **status_code=0 + 真实数据，不需要任何签名**
+- **实现**：`scripts/douyin_read.py` 新增 `AWEME_API_PATH`/`AWEME_API_QS`、`_aweme_id_of`（短链先 `_resolve_short_url` 再取 id）、`_aweme_api_fetch`、`_aweme_item`、`_api_item_or_none`；`run()` 里 `video`/`note` **接口优先**，任何一类失败都回落浏览器（老行为），CLI 新增 `--no-api` 强制浏览器。
+- **诚实回报**：条目里 `resolvedBy: "api"|"browser"`；顶层 `browser: "http"` 表示本次没开浏览器。
+- **真机实测**：`douyin_video` 0.72s、`douyin_note` 0.39s（图文 6 张图），均 `browser: http`，字段与页面一致（点赞 6750 / 评论 823 / 分享 1304 / 收藏 3393，发布时间 2025-07-24 21:47:49）。
+- ⚠️ **仍走浏览器、仍可能被验证码拦**：`hot` / `search` / `comments` / `messages`（这四个还没接口化）。要彻底免验证码，下一步就是把它们也换成接口（comments 接口通常要签名，成本更高）。
 ## 2. 本轮成果
 
 ### 2.1 通知接口已打通（本轮最大成果）
