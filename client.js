@@ -341,6 +341,10 @@ const TIERS = [
       const [scanRes, setScanRes] = React.useState(null)        // setup_scan 的原样返回（inventory 小表）
       const [advOpen, setAdvOpen] = React.useState(false)       // 「高级选项」展开没（默认收起）
       const [advMode, setAdvMode] = React.useState('minimal')   // 高级选项里的精简 / 完整
+      const [visionOpen, setVisionOpen] = React.useState(null)  // null = 跟随配置；true/false = 用户点过了
+      // 已经配了非 agent 的模型时默认展开（免得用户以为设置丢了），但点过按钮就听用户的
+      const visionHasCustom = Boolean(cfg && cfg.visionModel && cfg.visionModel !== 'agent')
+      const visionExpanded = visionOpen === null ? visionHasCustom : visionOpen
       const [forceVenv, setForceVenv] = React.useState(false)   // 强制新建 venv（不复用已有 Python）
       const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
       const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
@@ -1275,16 +1279,25 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型：默认「让肥鱼大人看」= 不调外部模型；其余由用户自己填模型 id / 接口地址 / key */
+          /* 视觉模型：两个按钮；默认只露「让肥鱼大人看」，点「用其他模型看」才展开三行输入 */
           h('div', { 'data-dy-row': '', key: 'vision-models' },
             h('button', {
               key: 'vision-agent',
               'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
               disabled: busy === 'visionModel',
               title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
-              onClick: () => { if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型') },
-            }, '让肥鱼大人看（默认）')),
-          ...Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
+              onClick: () => {
+                setVisionOpen(false)
+                if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型')
+              },
+            }, '让肥鱼大人看（默认）'),
+            h('button', {
+              key: 'vision-custom',
+              'data-dy-btn': '', 'data-primary': visionExpanded ? '' : undefined,
+              title: '填你自己的模型 id、接口地址和 key',
+              onClick: () => setVisionOpen(!visionExpanded),
+            }, visionExpanded ? '收起自定义模型' : '用其他模型看')),
+          ...(visionExpanded ? Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
             h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
             h('input', {
               'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
@@ -1292,7 +1305,7 @@ const TIERS = [
               placeholder: VISION_FIELDS[k].ph,
               onChange: (e) => editPath(k, e.target.value, true),
               onBlur: (e) => editPath(k, e.target.value, false),
-            }))),
+            }))) : []),
           h('div', { 'data-dy-note': '' },
             '视觉模型默认「让肥鱼大人看」= 不调用外部模型、不上传图片；填成任意 OpenAI 兼容模型（含你自己的接口地址与 key）后，还要 ⑤ 视觉开启且 douyin_vision 传 describe=true 才会把帧发出去。'
             + '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
@@ -1881,16 +1894,25 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型：默认「让肥鱼大人看」= 不调外部模型；其余由用户自己填模型 id / 接口地址 / key */
+          /* 视觉模型：两个按钮；默认只露「让肥鱼大人看」，点「用其他模型看」才展开三行输入 */
           h('div', { 'data-dy-row': '', key: 'vision-models' },
             h('button', {
               key: 'vision-agent',
               'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
               disabled: busy === 'visionModel',
               title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
-              onClick: () => { if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型') },
-            }, '让肥鱼大人看（默认）')),
-          ...Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
+              onClick: () => {
+                setVisionOpen(false)
+                if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型')
+              },
+            }, '让肥鱼大人看（默认）'),
+            h('button', {
+              key: 'vision-custom',
+              'data-dy-btn': '', 'data-primary': visionExpanded ? '' : undefined,
+              title: '填你自己的模型 id、接口地址和 key',
+              onClick: () => setVisionOpen(!visionExpanded),
+            }, visionExpanded ? '收起自定义模型' : '用其他模型看')),
+          ...(visionExpanded ? Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
             h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
             h('input', {
               'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
@@ -1898,7 +1920,7 @@ const TIERS = [
               placeholder: VISION_FIELDS[k].ph,
               onChange: (e) => editPath(k, e.target.value, true),
               onBlur: (e) => editPath(k, e.target.value, false),
-            }))),
+            }))) : []),
           h('div', { 'data-dy-note': '' },
             '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这五个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
