@@ -21,9 +21,16 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
-## 1.8.0 视觉模型可选，默认 `agent`（= 我自己看，不调外部模型）
+## 1.9.0 视觉模型改成「用户自己填」，默认档叫「让肥鱼大人看」
 
-- 设置页「能力等级」下面多一行三选一：**我自己看（默认）/ 千问 omni-flash / 智谱 glm-4.5v**，写 `visionModel`。
+- 设置页原来写死的「千问 / 智谱」两个按钮已删掉，改成三个输入框：`visionModel`（模型 id）/ `visionBaseUrl`（OpenAI 兼容的 `/chat/completions`）/ `visionApiKey`（直接给 key，空则读 key 文件）。
+- 保留一个按钮「**让肥鱼大人看（默认）**」= `visionModel=agent`：不调外部模型、不上传图片，只返回本地帧路径。
+- 脚本侧 `--vision-base-url` 覆盖端点、`--vision-api-key` 覆盖 key；key 文件前缀匹配不上时回落到第一条可用 key，所以自定义厂商也能直接用。
+- 实测：显式传 `--vision-base-url` 走 DashScope 成功出描述（帧 1 张）。
+
+## 1.8.0 视觉模型可选，默认 `agent`（= 让肥鱼大人看，不调外部模型）
+
+- 设置页「能力等级」下面多一行（1.9.0 起改为通用输入框，见上一节），写 `visionModel`。
 - `visionModel=agent`（默认）：`douyin_vision` 只抽帧返回本地路径，**不调用任何外部模型、不上传图片**，由调用方（agent/人）自己看图；返回里带 `describeSkipped:true` 与 `visionNote`。
 - 切到 qwen/智谱后仍受 ⑤ 视觉档 + `describe=true` 双重前置：三处都满足才会把帧发到云端。
 - 依据：本机 key 文件只有千问/智谱两家；DSH 自己的 `deepseek-account` 是宿主托管的会话账号，插件拿不到它的 key，所以「用你」在实现上 = 「不调用外部模型，由当前 agent 读图」。

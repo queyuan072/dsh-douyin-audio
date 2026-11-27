@@ -717,12 +717,24 @@ VISION_PROMPT = "用一到两句中文描述这张图的画面内容：谁、在
 
 
 def _vision_provider(model: str) -> str:
-    """模型名 -> 提供方。qwen* 走 DashScope（key 以 sk- 开头），其余按智谱处理。"""
-    return "qwen" if model.strip().lower().startswith("qwen") else "zhipu"
+    """模型名 -> 默认提供方（仅在没给 --vision-base-url 时用来兜底）。"""
+    low = model.strip().lower()
+    if low.startswith("qwen") or low.startswith("qwen"):
+        return "qwen"
+    return "zhipu"
 
 
-def _vision_key(model: str, key_file: str | None) -> str:
-    """从 key 文件里挑出与该模型匹配的那个 key（qwen 要 sk- 前缀，智谱反过来）。"""
+def _vision_endpoint(model: str, base_url: str | None) -> str:
+    """接口地址：给了 --vision-base-url 就用它（OpenAI 兼容的 .../chat/completions），否则按模型名猜默认端点。"""
+    if base_url and base_url.strip():
+        return base_url.strip()
+    return VISION_ENDPOINTS[_vision_provider(model)]
+
+
+def _vision_key(model: str, key_file: str | None, api_key: str | None = None) -> str:
+    """取 key：显式 --vision-api-key 优先；否则从 key 文件挑（先按前缀匹配，匹配不到就用第一条）。"""
+    if api_key and api_key.strip():
+        return api_key.strip()
     path = key_file or VISION_DEFAULT_KEY_FILE
     want_sk = _vision_provider(model) == "qwen"
     try:
@@ -730,13 +742,17 @@ def _vision_key(model: str, key_file: str | None) -> str:
             keys = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
     except OSError as exc:
         raise FetchError("视觉描述", "读不到 key 文件 {}（{}）".format(path, td.one_line(exc, 120)))
-    for k in keys:
-        if len(k) >= 20 and k.startswith("sk-") == want_sk:
+    usable = [k for k in keys if len(k) >= 20]
+    for k in usable:
+        if k.startswith("sk-") == want_sk:
             return k
-    raise FetchError("视觉描述", "{} 里没有适配 {} 的 key".format(path, model))
+    if usable:  # 自定义端点：前缀对不上也让它用上，别因为命名规则拒绝用户自己的 key
+        return usable[0]
+    raise FetchError("视觉描述", "{} 里没有可用的 key（>=20 字符）".format(path))
 
 
-def describe_image(key: str, model: str, image_path: str, prompt: str, timeout: int = 120) -> str:
+def describe_image(key: str, model: str, image_path: str, prompt: str, timeout: int = 120,
+                   base_url: str | None = None) -> str:
     """把一张图发给多模态模型，返回描述文本。失败抛 FetchError。"""
     try:
         with open(image_path, "rb") as fh:
@@ -752,7 +768,7 @@ def describe_image(key: str, model: str, image_path: str, prompt: str, timeout: 
         "max_tokens": 300,
     }
     req = urllib.request.Request(
-        VISION_ENDPOINTS[_vision_provider(model)],
+        _vision_endpoint(model, base_url),
         data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
     try:
@@ -885,7 +901,7 @@ def run_frames(args, started: float) -> int:
     if args.describe:
         # 描述失败不推翻抽帧结果：帧照旧返回，失败原因逐帧记在 describeError 里
         try:
-            key = _vision_key(args.vision_model, args.vision_key_file)
+            key = _vision_key(args.vision_model, args.vision_key_file, args.vision_api_key)
         except FetchError as exc:
             return emit(0, ok=True, duration=round(duration, 2), mediaPath=media,
                         framesDir=out_dir, frames=frames, describeError=exc.reason())
@@ -893,7 +909,8 @@ def run_frames(args, started: float) -> int:
         done = 0
         for f in frames:
             try:
-                f["description"] = describe_image(key, args.vision_model, f["path"], prompt, args.timeout)
+                f["description"] = describe_image(key, args.vision_model, f["path"], prompt, args.timeout,
+                                                  args.vision_base_url)
                 done += 1
                 td.eprint("[视觉] 第 {} 帧：{}".format(f["index"], td.one_line(f["description"], 90)))
             except FetchError as exc:
@@ -973,6 +990,10 @@ def run(argv: list[str] | None = None) -> int:
                     help=f"视觉模型 id（默认 {VISION_DEFAULT_MODEL}；qwen* 走 DashScope，其它按智谱处理）")
     ap.add_argument("--vision-key-file", dest="vision_key_file", default=None, metavar="FILE",
                     help=f"视觉模型的 key 文件（默认 {VISION_DEFAULT_KEY_FILE}）")
+    ap.add_argument("--vision-base-url", dest="vision_base_url", default=None, metavar="URL",
+                    help="视觉模型的接口地址（OpenAI 兼容的 /chat/completions）；给了就不按模型名猜默认端点")
+    ap.add_argument("--vision-api-key", dest="vision_api_key", default=None, metavar="KEY",
+                    help="视觉模型的 key；给了就优先用它，不再读 key 文件")
     ap.add_argument("--vision-prompt", dest="vision_prompt", default=None, metavar="TEXT",
                     help="自定义描述提示词（默认要求只描述看到的内容、不猜测）")
     ap.add_argument("--frames", dest="frames", type=int, default=0, metavar="N",

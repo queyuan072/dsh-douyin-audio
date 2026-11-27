@@ -220,11 +220,13 @@ window.__ModuleLoader__.load({
     }
 
     /* 四个能力的定义（顺序 = 等级顺序；needRead = 依赖 ① 只读） */
-    const VISION_MODELS = [
-  { key: 'agent', title: '我自己看（默认）', note: '不调用任何外部模型、不上传图片，只返回本地帧路径' },
-  { key: 'qwen3.8-omni-flash', title: '千问 omni-flash', note: 'DashScope 多模态（实测可用）；会把帧图片上传到云端' },
-  { key: 'glm-4.5v', title: '智谱 glm-4.5v', note: '智谱多模态；会把帧图片上传到云端' },
-]
+    /* 视觉模型三个字段：模型 id / 接口地址 / key —— 用户自己填，不写死任何厂商 */
+const VISION_FIELDS = {
+  visionModel: { label: '视觉模型 visionModel（模型 id；留空或 agent = 让肥鱼大人看，不调用任何外部模型）', type: 'text', ph: 'agent / gpt-4o-mini / qwen-vl-max / glm-4.5v …' },
+  visionBaseUrl: { label: '接口地址 visionBaseUrl（OpenAI 兼容的 /chat/completions；空 = 按模型名猜 DashScope / 智谱）', type: 'text', ph: 'https://api.openai.com/v1/chat/completions' },
+  visionApiKey: { label: 'API Key visionApiKey（空 = 读 key 文件 ~/.dsh/ai/key.txt）', type: 'password', ph: '留空则用 key 文件里的第一把可用 key' },
+}
+
 const TIERS = [
       { key: 'tierRead', title: '① 只读', note: '看热榜、搜视频、读视频详情和评论列表 —— 只读不写，不动你账号里的任何东西' },
       { key: 'tierNotify', title: '② 通知', note: '读私信、拉通知摘要 —— 风险：能看到你账号收到的私信内容' },
@@ -1273,17 +1275,26 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型选择：只在 ⑤ 视觉 + describe=true 时才会真的调用 */
+          /* 视觉模型：默认「让肥鱼大人看」= 不调外部模型；其余由用户自己填模型 id / 接口地址 / key */
           h('div', { 'data-dy-row': '', key: 'vision-models' },
-            ...VISION_MODELS.map((m) => h('button', {
-              key: m.key,
-              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === m.key ? '' : undefined,
+            h('button', {
+              key: 'vision-agent',
+              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
               disabled: busy === 'visionModel',
-              title: m.note,
-              onClick: () => { if ((cfg.visionModel || 'agent') !== m.key) patch('visionModel', m.key, '视觉模型') },
-            }, m.title))),
+              title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
+              onClick: () => { if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型') },
+            }, '让肥鱼大人看（默认）')),
+          ...Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
+            h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
+            h('input', {
+              'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
+              value: cfg[k] == null ? '' : String(cfg[k]), disabled: busy === k,
+              placeholder: VISION_FIELDS[k].ph,
+              onChange: (e) => editPath(k, e.target.value, true),
+              onBlur: (e) => editPath(k, e.target.value, false),
+            }))),
           h('div', { 'data-dy-note': '' },
-            '视觉模型默认「我自己看」= 不调用外部模型、不上传图片；切到千问/智谱后，只有 ⑤ 视觉开启且 douyin_vision 传 describe=true 才会把帧发出去。'
+            '视觉模型默认「让肥鱼大人看」= 不调用外部模型、不上传图片；填成任意 OpenAI 兼容模型（含你自己的接口地址与 key）后，还要 ⑤ 视觉开启且 douyin_vision 传 describe=true 才会把帧发出去。'
             + '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
         h('div', { 'data-dy-sec': '', key: 'perms-login', ref: loginRef },
@@ -1870,15 +1881,24 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型选择：只在 ⑤ 视觉 + describe=true 时才会真的调用 */
+          /* 视觉模型：默认「让肥鱼大人看」= 不调外部模型；其余由用户自己填模型 id / 接口地址 / key */
           h('div', { 'data-dy-row': '', key: 'vision-models' },
-            ...VISION_MODELS.map((m) => h('button', {
-              key: m.key,
-              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === m.key ? '' : undefined,
+            h('button', {
+              key: 'vision-agent',
+              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
               disabled: busy === 'visionModel',
-              title: m.note,
-              onClick: () => { if ((cfg.visionModel || 'agent') !== m.key) patch('visionModel', m.key, '视觉模型') },
-            }, m.title))),
+              title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
+              onClick: () => { if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型') },
+            }, '让肥鱼大人看（默认）')),
+          ...Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
+            h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
+            h('input', {
+              'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
+              value: cfg[k] == null ? '' : String(cfg[k]), disabled: busy === k,
+              placeholder: VISION_FIELDS[k].ph,
+              onChange: (e) => editPath(k, e.target.value, true),
+              onBlur: (e) => editPath(k, e.target.value, false),
+            }))),
           h('div', { 'data-dy-note': '' },
             '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这五个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),

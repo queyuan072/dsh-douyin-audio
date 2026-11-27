@@ -46,6 +46,8 @@ export const Config = !z ? undefined : z.object({
   captchaFallback: z.string().default('hint').extra('volatile', true),
   // 视觉描述（douyin_vision 的 describe=true 才用）：模型 id 与 key 文件
   visionModel: z.string().default('agent').extra('volatile', true),
+  visionBaseUrl: z.string().default('').extra('volatile', true),
+  visionApiKey: z.string().default('').extra('volatile', true),
   visionKeyFile: z.string().default('').extra('volatile', true),
   // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
   browserChannel: z.string().default('msedge').extra('volatile', true),
@@ -65,7 +67,7 @@ export const Config = !z ? undefined : z.object({
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
 const EXTRA_DEFAULTS = {
   asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
-  captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '',
+  captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '', visionBaseUrl: '', visionApiKey: '',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
@@ -1607,7 +1609,7 @@ export function apply(ctx, config = {}) {
   const merged = () => {
     const base = cfgAll()
     const over = {}
-    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile',
+    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile', 'visionBaseUrl', 'visionApiKey',
       'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
@@ -2275,6 +2277,10 @@ export function apply(ctx, config = {}) {
     if (prompt) argv.push('--vision-prompt', prompt)
     const keyFile = typeof cfg.visionKeyFile === 'string' ? cfg.visionKeyFile.trim() : ''
     if (keyFile) argv.push('--vision-key-file', keyFile)
+    const baseUrl = typeof cfg.visionBaseUrl === 'string' ? cfg.visionBaseUrl.trim() : ''
+    if (baseUrl) argv.push('--vision-base-url', baseUrl)
+    const apiKey = typeof cfg.visionApiKey === 'string' ? cfg.visionApiKey.trim() : ''
+    if (apiKey) argv.push('--vision-api-key', apiKey)
     if (framesDir) argv.push('--frames-dir', framesDir)
     if (cfg.readHeadless === false) argv.push('--window-offscreen')
     const r = await fetchDeps.run(python, fetchDeps.script, argv, { timeoutSec: VISION_TIMEOUT_SEC, log })
@@ -2842,7 +2848,7 @@ export function apply(ctx, config = {}) {
     description: '读取或修改抖音插件配置（存于状态目录 config.json）。action=get 返回当前配置；action=set 改一个键。',
     parameters: {
       action: { type: 'string', description: 'get 或 set' },
-      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / visionModel（douyin_vision 的默认视觉模型，默认 qwen3.8-omni-flash）/ visionKeyFile（视觉模型 key 文件，空 = ~/.dsh/ai/key.txt）/ loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
+      key: { type: 'string', description: 'set 时必填：count / delay / headless / saveAll / downloadTimeout / pythonPath / asrThreads / autoTranscribe / visionModel（douyin_vision 的视觉模型 id，默认 agent = 不调用外部模型由调用方自己看；也可填 gpt-4o-mini / qwen-vl-max / glm-4.5v 等任意 OpenAI 兼容模型）/ visionBaseUrl（该模型的 /chat/completions 地址，空 = 按模型名猜 DashScope/智谱）/ visionApiKey（直接给 key，空 = 读 key 文件）/ visionKeyFile（key 文件，空 = ~/.dsh/ai/key.txt）/ loginMode（window 或 qr）/ readHeadless（只读工具是否后台运行，默认 true）/ verifyWait（命中验证时最多等多少秒，默认 0）/ captchaFallback（撞验证码时：hint 只提示配置项（默认）/ browser 额外给出可交给 DSH 自带浏览器的链接）/ autoRun（谷时自动刷，默认 false）/ dutyWindow（谷时窗口，默认 12:00-14:00,18:00-23:59）/ dailyLimit（每天最多几屏，默认 5）/ dutyIntervalMin（两次自动刷最少间隔分钟，默认 30）/ uiLayout（界面布局：classic 平铺 / tabs 四标签页，默认 classic）/ browserChannel（浏览器通道：msedge 默认 Edge / chrome 本机 Chrome / chromium 内置 / firefox / webkit / 自定义项 id；后两者要先 npx playwright install）/ browserExtras（手动添加的浏览器，JSON 数组字符串 [{"id","label","path"}]）' },
       value: { type: 'string', description: 'set 时必填：新值（布尔用 true/false，数字直接写）' },
     },
     async execute(args) {
