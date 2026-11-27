@@ -6,6 +6,7 @@
 ## 0. 2026-11-25 复检（工作区曾被清空后的恢复记录）
 
 - 本地仓库与插件曾随工作区清空一起消失。恢复路径：从 **gitcode**（GitHub 当时不可达）克隆 → `dsh plugin --profile desktop add 'file:D:/大肥鱼/工作区/dsh-douyin'` → 安装副本里 `node selfcheck.mjs`（EXIT=0、17 工具）。
+- 🔴 **工具名冲突会让整个插件不激活（2026-11-26 实录）**：`dsh-douyin-scroll`（单工具老插件）与本插件都注册 `douyin_scroll`，DSH 全局工具名唯一 → 本插件注册时抛 `tool "douyin_scroll" is already registered`，于是**整个插件被标异常**、其余 16 个工具一起不生效（表现为 `douyin.log` 从不被写、`apply` 没跑）。排查顺序：插件页看红字原因 → 确认同名工具来自哪个插件 → 卸掉其一。本机已卸 `dsh-douyin-scroll`，保留本插件（功能是超集）。
 - ⚠️ 半途踩过的坑：**直接把目录拷进 profile 的 node_modules 不够** —— 那只建了普通目录，没进 `node_modules/.modules.yaml`，DSH 加载器不认，工具不会出现；必须走 pnpm（`dsh plugin ... add`）注册。对照证据：能加载的 `dsh-cookie-guard` 是 pnpm junction 且在 .modules.yaml 里。
 - `_diag/notes-probe/notice-schema.md` 原版在原清空中丢失（根因：`_diag/` 被 `.gitignore` 忽略）。已按代码实测注释**重建**并挪到被跟踪的 `docs/notice-api.md`（标题标明「重建版」，冲突以代码为准）。
 
