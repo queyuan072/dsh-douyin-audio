@@ -403,7 +403,7 @@ def _browser_page(args):
             launch_kwargs["args"] = ["--autoplay-policy=no-user-gesture-required", "--mute-audio"]
         elif getattr(args, "window_offscreen", False):
             # 真机实测：headless 打开抖音必吃验证码；可见窗口（且移出屏幕）能过风控。
-            launch_kwargs["args"] = ["--window-position=-3000,-3000", "--window-size=1200,900"]
+            launch_kwargs["args"] = ["--window-position=-3000,-3000", "--window-size=1200,900", "--mute-audio"]
         try:
             browser, channel = launch_browser(pw, args.browser_channel, launch_kwargs,
                                               executable=getattr(args, "browser_executable", None))
