@@ -400,7 +400,7 @@ def _browser_page(args):
             raise StepError("browser", "playwright 启动失败: {}".format(_brief(exc)))
         launch_kwargs = {"headless": bool(args.headless)}
         if args.headless:
-            launch_kwargs["args"] = ["--autoplay-policy=no-user-gesture-required"]
+            launch_kwargs["args"] = ["--autoplay-policy=no-user-gesture-required", "--mute-audio"]
         elif getattr(args, "window_offscreen", False):
             # 真机实测：headless 打开抖音必吃验证码；可见窗口（且移出屏幕）能过风控。
             launch_kwargs["args"] = ["--window-position=-3000,-3000", "--window-size=1200,900"]

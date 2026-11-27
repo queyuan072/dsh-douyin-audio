@@ -418,7 +418,7 @@ def launch_browser(pw, headless, extra_args=None, browser_channel="msedge", brow
     if extra_args:
         extra = list(extra_args)
     else:
-        extra = ["--autoplay-policy=no-user-gesture-required"] if headless else ["--start-maximized"]
+        extra = (["--autoplay-policy=no-user-gesture-required"] if headless else ["--start-maximized"]) + ["--mute-audio"]
     custom = _require_executable(browser_executable)
     if custom:
         # executable_path 与 channel 互斥；自选浏览器默认按 Chromium 家族处理

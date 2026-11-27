@@ -494,7 +494,7 @@ def desensitize_media_url(url: str) -> str:
 def _browser_args(headless: bool, window_offscreen: bool) -> list[str]:
     """启动参数：沿用 douyin_scroller / douyin_read 里真机验证过的两组开关"""
     if headless:
-        return ["--autoplay-policy=no-user-gesture-required"]
+        return ["--autoplay-policy=no-user-gesture-required", "--mute-audio"]
     if window_offscreen:
         # 真机实测：headless 开抖音容易吃验证码，可见窗口移到屏幕外能过风控
         return ["--window-position=-3000,-3000", "--window-size=1200,900"]

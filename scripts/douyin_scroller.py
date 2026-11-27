@@ -764,7 +764,7 @@ def main():
         with sync_playwright() as p:
             browser, browser_channel = launch_browser(
                 p, args.browser_channel, args.headless,
-                extra_args=["--autoplay-policy=no-user-gesture-required"] if args.headless else None,
+                extra_args=["--autoplay-policy=no-user-gesture-required", "--mute-audio"] if args.headless else ["--mute-audio"],
                 executable=getattr(args, "browser_executable", None),
             )
             ctx = open_context(browser, args.headless, browser_channel)
