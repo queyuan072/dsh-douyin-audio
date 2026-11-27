@@ -21,6 +21,13 @@
 | tag | v1.2.0 ~ **v1.5.0** 已打 | git tag -l |
 | 工作树 | 干净（HEAD=`83f64a2`，1.5.0 已发布；`node selfcheck.mjs` 复检 EXIT=0 / 17 工具） | git status / selfcheck |
 
+## 1.10.0 视觉模型支持多套预设（`visionPresets` / `visionActive`）
+
+- 配置：`visionPresets`（JSON 数组：`[{name,model,baseUrl,apiKey}]`）+ `visionActive`（选中的 name）。设置页「用其他模型看」展开后可「存为预设」「用 ××」「删 ××」。
+- 解析优先级：**调用时传 `model` > 选中预设 > 单套三字段**；调用时点名模型会让地址/key 回落到「按名字猜 + key 文件」。
+- `selfcheck` 加两条断言（选中「预设B」→ argv 用它那套；调用时点名 model → 预设让位），实测 `✓ 预检通过：19 个工具`。
+- 实测补充：智谱那把 key 当前**额度耗尽**（`HTTP 429 / code 1113 余额不足`），千问那条正常；所以第二套预设要能用，得先有额度。
+
 ## 1.9.0 视觉模型改成「用户自己填」，默认档叫「让肥鱼大人看」
 
 - 设置页原来写死的「千问 / 智谱」两个按钮已删掉，改成三个输入框：`visionModel`（模型 id）/ `visionBaseUrl`（OpenAI 兼容的 `/chat/completions`）/ `visionApiKey`（直接给 key，空则读 key 文件）。

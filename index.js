@@ -47,6 +47,9 @@ export const Config = !z ? undefined : z.object({
   // 视觉描述（douyin_vision 的 describe=true 才用）：模型 id 与 key 文件
   visionModel: z.string().default('agent').extra('volatile', true),
   visionBaseUrl: z.string().default('').extra('volatile', true),
+  // 多套视觉模型：visionPresets 是 JSON 数组字符串 [{"name","model","baseUrl","apiKey"}]，visionActive 是选中的 name
+  visionPresets: z.string().default('[]').extra('volatile', true),
+  visionActive: z.string().default('').extra('volatile', true),
   visionApiKey: z.string().default('').extra('volatile', true),
   visionKeyFile: z.string().default('').extra('volatile', true),
   // 浏览器通道：msedge（默认）/ chrome / 内置 chromium / firefox / webkit / 自定义项 id（custom-N）
@@ -67,7 +70,7 @@ export const Config = !z ? undefined : z.object({
  *  readHeadless=true / verifyWait=0 就是历史的「一律无头、不等验证」，默认行为不变 */
 const EXTRA_DEFAULTS = {
   asrThreads: 8, autoTranscribe: false, loginMode: 'window', readHeadless: true, verifyWait: 0,
-  captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '', visionBaseUrl: '', visionApiKey: '',
+  captchaFallback: 'hint', visionModel: 'agent', visionKeyFile: '', visionBaseUrl: '', visionApiKey: '', visionPresets: '[]', visionActive: '',
   // 谷时自动刷四键：与 lib/state.mjs 的 DEFAULTS 一致，这里再留一份防旧 lib / 旧 config.json
   autoRun: false, dutyWindow: '12:00-14:00,18:00-23:59', dailyLimit: 5, dutyIntervalMin: 30,
   uiLayout: 'classic',
@@ -1609,7 +1612,7 @@ export function apply(ctx, config = {}) {
   const merged = () => {
     const base = cfgAll()
     const over = {}
-    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile', 'visionBaseUrl', 'visionApiKey',
+    for (const k of ['count', 'delay', 'headless', 'saveAll', 'downloadTimeout', 'pythonPath', 'asrThreads', 'autoTranscribe', 'loginMode', 'readHeadless', 'verifyWait', 'captchaFallback', 'visionModel', 'visionKeyFile', 'visionBaseUrl', 'visionApiKey', 'visionPresets', 'visionActive',
       'autoRun', 'dutyWindow', 'dailyLimit', 'dutyIntervalMin', 'uiLayout', 'browserChannel', 'browserExtras']) {
       let v = config ? config[k] : undefined
       if (v && typeof v === 'object' && 'value' in v) v = v.value
@@ -2266,8 +2269,21 @@ export function apply(ctx, config = {}) {
   // ── 4g. 抽帧 + 视觉描述（只读，但 describe=true 时会把图片上传到云端模型）───────
   const VISION_TIMEOUT_SEC = 600
 
+  /** 当前选中的视觉预设（visionPresets 里按 visionActive 找一套）；没有/解析失败返回 null */
+  function activeVisionPreset(cfg) {
+    let list = []
+    try { list = JSON.parse(cfg.visionPresets || '[]') } catch { return null }
+    if (!Array.isArray(list) || !list.length) return null
+    const want = String(cfg.visionActive || '').trim()
+    if (!want) return null
+    const hit = list.find((p) => p && String(p.name || '').trim() === want)
+    if (!hit) return null
+    return { name: String(hit.name || ''), model: String(hit.model || '').trim(),
+      baseUrl: String(hit.baseUrl || '').trim(), apiKey: String(hit.apiKey || '').trim() }
+  }
+
   /** 调 douyin_fetch.py 的 frames(+describe) 模式：解析约定同 runFetch，脚本 ok:false 原样带回 */
-  async function runVision({ url, count, describe, model, prompt, framesDir }) {
+  async function runVision({ url, count, describe, model, prompt, framesDir, baseUrl: presetBase, apiKey: presetKey }) {
     if (!existsSync(fetchDeps.script)) return { ok: false, reason: '抓取脚本不存在: ' + fetchDeps.script }
     const cfg = merged()
     const python = await fetchDeps.python(log, 'playwright', typeof cfg.pythonPath === 'string' ? cfg.pythonPath : '')
@@ -2277,9 +2293,10 @@ export function apply(ctx, config = {}) {
     if (prompt) argv.push('--vision-prompt', prompt)
     const keyFile = typeof cfg.visionKeyFile === 'string' ? cfg.visionKeyFile.trim() : ''
     if (keyFile) argv.push('--vision-key-file', keyFile)
-    const baseUrl = typeof cfg.visionBaseUrl === 'string' ? cfg.visionBaseUrl.trim() : ''
+    // 预设里填了的优先，否则用单套三字段
+    const baseUrl = (presetBase && presetBase.trim()) || (typeof cfg.visionBaseUrl === 'string' ? cfg.visionBaseUrl.trim() : '')
     if (baseUrl) argv.push('--vision-base-url', baseUrl)
-    const apiKey = typeof cfg.visionApiKey === 'string' ? cfg.visionApiKey.trim() : ''
+    const apiKey = (presetKey && presetKey.trim()) || (typeof cfg.visionApiKey === 'string' ? cfg.visionApiKey.trim() : '')
     if (apiKey) argv.push('--vision-api-key', apiKey)
     if (framesDir) argv.push('--frames-dir', framesDir)
     if (cfg.readHeadless === false) argv.push('--window-offscreen')
@@ -2323,9 +2340,12 @@ export function apply(ctx, config = {}) {
       const n = args.count === undefined ? 4 : Number(args.count)
       if (!Number.isInteger(n) || n < 1 || n > 20) return { ok: false, reason: 'count 需是 1-20 的整数，收到 ' + JSON.stringify(args.count) }
       const cfg = merged()
-      const model = (args.model !== undefined && args.model !== null && String(args.model).trim() !== '')
-        ? String(args.model).trim()
-        : (typeof cfg.visionModel === 'string' && cfg.visionModel.trim() ? cfg.visionModel.trim() : 'agent')
+      const callModel = (args.model !== undefined && args.model !== null && String(args.model).trim() !== '')
+        ? String(args.model).trim() : ''
+      // 优先级：调用时指定的 model > 设置页选中的预设 > 单套三字段。调用时点名叫了模型，就让地址/key 回落到「按名字猜 + key 文件」
+      const preset = callModel ? null : activeVisionPreset(cfg)
+      const model = callModel || (preset && preset.model) ||
+        (typeof cfg.visionModel === 'string' && cfg.visionModel.trim() ? cfg.visionModel.trim() : 'agent')
       let dir = null
       if (args.framesDir !== undefined && args.framesDir !== null && String(args.framesDir).trim() !== '') dir = resolve(String(args.framesDir).trim())
       // visionModel=agent：不调用任何外部模型，只抽帧返回本地路径，由调用方自己看图
@@ -2335,7 +2355,8 @@ export function apply(ctx, config = {}) {
           visionNote: 'visionModel=agent：未调用任何外部模型、未上传图片；帧图片在 frames[].path，调用方自己看即可。' }
         return r
       }
-      return runVision({ url: u.value, count: n, describe: !!args.describe, model, prompt: args.prompt, framesDir: dir })
+      return runVision({ url: u.value, count: n, describe: !!args.describe, model, prompt: args.prompt, framesDir: dir,
+        baseUrl: preset ? preset.baseUrl : '', apiKey: preset ? preset.apiKey : '' })
     },
   })
   // ── 4e. 通知摘要（② 通知，只读）─────────────────────────────

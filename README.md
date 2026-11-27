@@ -284,6 +284,8 @@ venv 建在**插件的安装目录里**，所以：
 | `tierPublish` | boolean | `false` | **④ 发布**：上传视频到抖音（预留；会向你的账号投稿） |
 | `visionModel` | string | `agent` | `douyin_vision` 用的视觉模型：`agent`（默认，**不调用外部模型、不上传图片**，只返回本地帧路径由调用方自己看）/ `qwen3.8-omni-flash`（DashScope）/ `glm-4.5v`（智谱）/ 自定义模型 id。只有 ⑤ 视觉开启且 `describe=true` 时才会真的调用 |
 | `visionKeyFile` | string | `""` | 视觉模型的 key 文件；空 = `~/.dsh/ai/key.txt`（按前缀挑：qwen 认 `sk-`，智谱反向） |
+| `visionPresets` | string | `"[]"` | 多套视觉模型预设（JSON 数组字符串）：`[{"name","model","baseUrl","apiKey"}]`；设置页「用其他模型看」里可保存/删除，点「用 ××」切换 |
+| `visionActive` | string | `""` | 当前选中的预设名；空 = 用单套三字段（`visionModel`/`visionBaseUrl`/`visionApiKey`） |
 | `tierVision` | boolean | `false` | **⑤ 视觉（抽帧上传）**：解锁 `douyin_vision`——抽帧后可把画面发给多模态模型描述。**默认关**，因为图片会离开本机上传到云端模型；只想要本地图片路径时用 `douyin_frames`（属 ① 只读，不上传）。关着时 `douyin_vision` 返回 `TIER_DISABLED(tier=vision)` |
 
 **能力等级（六个开关）**
@@ -294,6 +296,7 @@ venv 建在**插件的安装目录里**，所以：
 见第 5 节），那条路照旧能写 `tier*`，因为那是你自己点的开关。
 
 - 基础四件（`douyin_scroll` / `douyin_transcribe` / `douyin_status` / `douyin_config`）**不受等级限制**——它们不碰抖音的写接口。
+- **多套视觉模型**：`visionPresets` 存多套「名称 + 模型 id + 接口地址 + key」，`visionActive` 指哪套生效；调用时传 `model` 参数会让预设让位（地址回落到按名字猜 + key 文件）。
 - **⑤ 视觉为什么单独一档**：`douyin_frames` 只把帧存到本地（属 ① 只读），而 `douyin_vision` 在 `describe=true` 时会把图片上传到云端模型——「离开本机」是另一类风险，所以给了独立开关，且默认关。
 - **依赖规则**：`tierReact` / `tierComment` / `tierPublish` 任一为真时，`tierRead` 在判断上视为真（**不会改写你存的值**）。
 - **③ 为什么拆两档**：点赞收藏可撤回，评论回复公开且不可撤回——风控强度差一个量级，所以给了两个独立开关。

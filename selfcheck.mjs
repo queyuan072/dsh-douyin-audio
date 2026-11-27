@@ -1310,6 +1310,31 @@ else {
     if (bothOff && bothOff.ok === false && /两条路都关了/.test(String(bothOff.reason))) ok('preferSubtitle=false + asr=false 直接拒（不白跑脚本）')
     else problem('两条路都关掉时没拒：' + JSON.stringify(bothOff))
 
+    // f) 视觉预设：选中哪套，model/baseUrl/key 就从那套来（桩掉子进程，只看 argv）
+    writeCfg({
+      tierRead: true, tierVision: true, visionModel: 'agent', visionActive: '预设B',
+      visionPresets: JSON.stringify([
+        { name: '预设A', model: 'glm-4.5v', baseUrl: 'https://a.example/v1/chat/completions', apiKey: 'kA-1234567890' },
+        { name: '预设B', model: 'qwen3.8-omni-flash', baseUrl: 'https://b.example/v1/chat/completions', apiKey: 'kB-1234567890' },
+      ]),
+    })
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, frames: [], duration: 1, described: 0 }) }
+    const vpRes = await callTool('douyin_vision', { url: FETCH_URL, count: 1, describe: true })
+    const vpArgv = lastFetchArgv()
+    if (vpRes && vpRes.ok === true && argOf(vpArgv, '--vision-model') === 'qwen3.8-omni-flash'
+      && argOf(vpArgv, '--vision-base-url') === 'https://b.example/v1/chat/completions'
+      && argOf(vpArgv, '--vision-api-key') === 'kB-1234567890') {
+      ok('视觉预设生效：选中「预设B」→ argv 用它那套 model/baseUrl/apiKey')
+    } else problem('视觉预设没生效：' + JSON.stringify({ argv: vpArgv, ok: vpRes && vpRes.ok }))
+
+    // 调用时点名 model：预设让位（地址/key 回落到配置与 key 文件）
+    fetchNext = { ok: true, code: 0, stderr: '', stdout: JSON.stringify({ ok: true, frames: [], duration: 1 }) }
+    await callTool('douyin_vision', { url: FETCH_URL, count: 1, describe: true, model: 'gpt-4o-mini' })
+    const callArgv = lastFetchArgv()
+    if (argOf(callArgv, '--vision-model') === 'gpt-4o-mini' && !callArgv.includes('--vision-base-url')) {
+      ok('调用时指定 model 覆盖预设：argv 只有 --vision-model，地址回落成按名字猜')
+    } else problem('调用时指定 model 没覆盖预设：' + JSON.stringify(callArgv))
+
     // 复位测试缝：生产路径回到 scripts/douyin_fetch.py + findPython + runPython
     const fetchRestored = setFetchDeps({ script: null, python: null, run: null })
     if (fetchRestored && fetchRestored.stubbed === false && /douyin_fetch\.py$/.test(String(fetchRestored.script))) {

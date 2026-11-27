@@ -345,6 +345,7 @@ const TIERS = [
       // 已经配了非 agent 的模型时默认展开（免得用户以为设置丢了），但点过按钮就听用户的
       const visionHasCustom = Boolean(cfg && cfg.visionModel && cfg.visionModel !== 'agent')
       const visionExpanded = visionOpen === null ? visionHasCustom : visionOpen
+      const [presetDraft, setPresetDraft] = React.useState({ name: '' })  // 「存为预设」的草稿名称
       const [forceVenv, setForceVenv] = React.useState(false)   // 强制新建 venv（不复用已有 Python）
       const [installMsg, setInstallMsg] = React.useState('')    // 「安装中…（几分钟）」
       const [logOpen, setLogOpen] = React.useState(false)       // setup.log 展开没
@@ -1099,6 +1100,83 @@ const TIERS = [
             ? '下一个窗口 ' + duty.nextWindowAt
             : '现在不在谷时窗口'
 
+      /* 视觉模型区：默认只露「让肥鱼大人看」；点「用其他模型看」才展开三格 + 预设列表 */
+      const visionPresetsOf = () => {
+        try { const v = JSON.parse(cfg.visionPresets || '[]'); return Array.isArray(v) ? v : [] } catch { return [] }
+      }
+      const savePresets = (list) => patch('visionPresets', JSON.stringify(list), '视觉预设')
+      const visionSection = () => {
+        const presets = visionPresetsOf()
+        const active = String(cfg.visionActive || '')
+        const draftName = String(presetDraft.name || '').trim()
+        return [
+          h('div', { 'data-dy-row': '', key: 'vision-models' },
+            h('button', {
+              key: 'vision-agent',
+              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' && !presets.length ? '' : undefined,
+              disabled: busy === 'visionModel',
+              title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
+              onClick: () => {
+                setVisionOpen(false)
+                if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型')
+              },
+            }, '让肥鱼大人看（默认）'),
+            h('button', {
+              key: 'vision-custom',
+              'data-dy-btn': '', 'data-primary': visionExpanded ? '' : undefined,
+              title: '填你自己的模型 id、接口地址和 key，可存成多套预设',
+              onClick: () => setVisionOpen(!visionExpanded),
+            }, visionExpanded ? '收起自定义模型' : '用其他模型看'),
+            presets.map((p, i) => h('button', {
+              key: 'vpre-' + i,
+              'data-dy-btn': '', 'data-primary': active === String(p.name || '') ? '' : undefined,
+              disabled: busy === 'visionActive',
+              title: (p.model || '？（没填模型）') + (p.baseUrl ? '   ' + p.baseUrl : ''),
+              onClick: () => patch('visionActive', String(p.name || ''), '视觉预设'),
+            }, '用 ' + String(p.name || '未命名')))),
+          presets.length ? h('div', { 'data-dy-row': '', key: 'vision-preset-del' },
+            presets.map((p, i) => h('button', {
+              key: 'vpdel-' + i,
+              'data-dy-btn': '', disabled: busy === 'visionPresets',
+              title: '删除预设「' + String(p.name || '') + '」',
+              onClick: () => savePresets(presets.filter((_, k) => k !== i)),
+            }, '删 ' + String(p.name || '未命名')))) : null,
+          ...(visionExpanded
+            ? [
+              ...Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
+                h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
+                h('input', {
+                  'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
+                  value: cfg[k] == null ? '' : String(cfg[k]), disabled: busy === k,
+                  placeholder: VISION_FIELDS[k].ph,
+                  onChange: (e) => editPath(k, e.target.value, true),
+                  onBlur: (e) => editPath(k, e.target.value, false),
+                }))),
+              h('div', { 'data-dy-sec': '', key: 'vin-save' },
+                h('div', { 'data-dy-label': '' }, '把上面这套存成预设（名称必填），存完点上面的「用 ××」切换'),
+                h('div', { 'data-dy-row': '' },
+                  h('input', {
+                    'data-dy-input': '', type: 'text', spellCheck: false,
+                    placeholder: '预设名称，如 千问 / 智谱 / 我的中转',
+                    value: presetDraft.name,
+                    onChange: (e) => setPresetDraft({ name: e.target.value }),
+                  }),
+                  h('button', {
+                    'data-dy-btn': '', disabled: !draftName || busy === 'visionPresets',
+                    onClick: () => {
+                      const model = String(cfg.visionModel || '').trim()
+                      if (!draftName || !model) return
+                      const next = presets.filter((p) => String(p.name || '') !== draftName)
+                      next.push({ name: draftName, model, baseUrl: String(cfg.visionBaseUrl || '').trim(), apiKey: String(cfg.visionApiKey || '').trim() })
+                      patch('visionPresets', JSON.stringify(next), '视觉预设')
+                      patch('visionActive', draftName, '视觉预设')
+                      setPresetDraft({ name: '' })
+                    },
+                  }, '存为预设'))),
+            ]
+            : []),
+        ]
+      }
       /* 数字输入框：本地草稿 + 失焦提交（别每敲一个字符就 POST 一次） */
       const numField = (key, label, extra) => h('div', { 'data-dy-sec': '', key: 'nf-' + key },
         h('div', { 'data-dy-label': '' }, label),
@@ -1279,33 +1357,7 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型：两个按钮；默认只露「让肥鱼大人看」，点「用其他模型看」才展开三行输入 */
-          h('div', { 'data-dy-row': '', key: 'vision-models' },
-            h('button', {
-              key: 'vision-agent',
-              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
-              disabled: busy === 'visionModel',
-              title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
-              onClick: () => {
-                setVisionOpen(false)
-                if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型')
-              },
-            }, '让肥鱼大人看（默认）'),
-            h('button', {
-              key: 'vision-custom',
-              'data-dy-btn': '', 'data-primary': visionExpanded ? '' : undefined,
-              title: '填你自己的模型 id、接口地址和 key',
-              onClick: () => setVisionOpen(!visionExpanded),
-            }, visionExpanded ? '收起自定义模型' : '用其他模型看')),
-          ...(visionExpanded ? Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
-            h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
-            h('input', {
-              'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
-              value: cfg[k] == null ? '' : String(cfg[k]), disabled: busy === k,
-              placeholder: VISION_FIELDS[k].ph,
-              onChange: (e) => editPath(k, e.target.value, true),
-              onBlur: (e) => editPath(k, e.target.value, false),
-            }))) : []),
+          ...visionSection(),
           h('div', { 'data-dy-note': '' },
             '视觉模型默认「让肥鱼大人看」= 不调用外部模型、不上传图片；填成任意 OpenAI 兼容模型（含你自己的接口地址与 key）后，还要 ⑤ 视觉开启且 douyin_vision 传 describe=true 才会把帧发出去。'
             + '基础功能（刷屏 / 转写 / 自检 / 配置 / 定时刷）不受等级限制。这六个开关只负责把选择存进配置，'
@@ -1894,33 +1946,7 @@ const TIERS = [
               : null,
             onChange: (v) => patch(t.key, v, t.title),
           })),
-          /* 视觉模型：两个按钮；默认只露「让肥鱼大人看」，点「用其他模型看」才展开三行输入 */
-          h('div', { 'data-dy-row': '', key: 'vision-models' },
-            h('button', {
-              key: 'vision-agent',
-              'data-dy-btn': '', 'data-primary': (cfg.visionModel || 'agent') === 'agent' ? '' : undefined,
-              disabled: busy === 'visionModel',
-              title: '不调用任何外部模型、不上传图片，只返回本地帧路径',
-              onClick: () => {
-                setVisionOpen(false)
-                if ((cfg.visionModel || 'agent') !== 'agent') patch('visionModel', 'agent', '视觉模型')
-              },
-            }, '让肥鱼大人看（默认）'),
-            h('button', {
-              key: 'vision-custom',
-              'data-dy-btn': '', 'data-primary': visionExpanded ? '' : undefined,
-              title: '填你自己的模型 id、接口地址和 key',
-              onClick: () => setVisionOpen(!visionExpanded),
-            }, visionExpanded ? '收起自定义模型' : '用其他模型看')),
-          ...(visionExpanded ? Object.keys(VISION_FIELDS).map((k) => h('div', { 'data-dy-sec': '', key: 'vin-' + k },
-            h('div', { 'data-dy-label': '' }, VISION_FIELDS[k].label),
-            h('input', {
-              'data-dy-input': '', 'data-dy-field': k, type: VISION_FIELDS[k].type, spellCheck: false,
-              value: cfg[k] == null ? '' : String(cfg[k]), disabled: busy === k,
-              placeholder: VISION_FIELDS[k].ph,
-              onChange: (e) => editPath(k, e.target.value, true),
-              onBlur: (e) => editPath(k, e.target.value, false),
-            }))) : []),
+          ...visionSection(),
           h('div', { 'data-dy-note': '' },
             '基础功能（刷屏 / 转写 / 自检 / 配置）不受等级限制。这五个开关只负责把选择存进配置，'
             + '具体哪些操作真会被拦住，以宿主（index.js）的闸门接线为准。')),
