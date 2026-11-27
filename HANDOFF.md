@@ -30,7 +30,9 @@
 - **实现**：`scripts/douyin_read.py` 新增 `AWEME_API_PATH`/`AWEME_API_QS`、`_aweme_id_of`（短链先 `_resolve_short_url` 再取 id）、`_aweme_api_fetch`、`_aweme_item`、`_api_item_or_none`；`run()` 里 `video`/`note` **接口优先**，任何一类失败都回落浏览器（老行为），CLI 新增 `--no-api` 强制浏览器。
 - **诚实回报**：条目里 `resolvedBy: "api"|"browser"`；顶层 `browser: "http"` 表示本次没开浏览器。
 - **真机实测**：`douyin_video` 0.72s、`douyin_note` 0.39s（图文 6 张图），均 `browser: http`，字段与页面一致（点赞 6750 / 评论 823 / 分享 1304 / 收藏 3393，发布时间 2025-07-24 21:47:49）。
-- ⚠️ **仍走浏览器、仍可能被验证码拦**：`hot` / `search` / `comments` / `messages`（这四个还没接口化）。要彻底免验证码，下一步就是把它们也换成接口（comments 接口通常要签名，成本更高）。
+- **热榜同样接口化（同轮）**：`/aweme/v1/web/hot/search/list/` 实测 `status_code=0` + 51 条 `word_list`，**免签名**；`cmd_hot` 改为接口优先（`_hot_api_items`），名次用 `position`、置顶条目无 position 时按序号回退并去重，热度 `hot_value` 格式化成亿/万。真机：`douyin_hot` 0.4s、`browser: http`、名次 1..5。
+- **搜索探过了、没走通**：`/aweme/v1/web/general/search/single/` 与 `/aweme/v1/web/search/item/` 都返回 `status_code=0` 但 **`items/aweme_list` 为空** —— 说明仍需 a_bogus 类签名，故 `search` 保持浏览器路径。
+- ⚠️ **仍走浏览器、仍可能被验证码拦**：`search` / `comments` / `messages`（这三个还没接口化；comments 与 search 同族，通常也要签名）。
 ## 2. 本轮成果
 
 ### 2.1 通知接口已打通（本轮最大成果）
